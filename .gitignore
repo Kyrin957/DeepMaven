@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.eggs/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Qt / PySide
+*.qmlc
+*.qmetatype
+
+# Ultralytics / YOLO 训练产物
+runs/
+datasets/
+*.pt
+!*.pt   # 若需保留预训练权重可调整
+
+# 数据与模型导出
+*.onnx
+weights/
+output/
+
+# 本地运行产物（SQLite 数据库、日志）
+data/
+
+# 日志与缓存
+*.log
+Thumbs.db
+.DS_Store

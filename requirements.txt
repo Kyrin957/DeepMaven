@@ -1,0 +1,49 @@
+# ============================================================
+# DeepMaven —— 基于 PySide6 的深度学习缺陷检测系统
+# Python 3.14 环境依赖清单
+#
+# 安装方式（Windows）:
+#   py -3.14 -m venv .venv
+#   .venv\Scripts\activate
+#   pip install -U pip
+#   pip install -r requirements.txt
+#
+# 如需 GPU (CUDA) 加速训练，请先卸载 CPU 版 torch 后参照
+# requirements-gpu.txt 安装 CUDA 版 PyTorch，再安装其余依赖：
+#   pip uninstall torch torchvision
+#   pip install torch torchvision --index-url <CUDA 源>
+#   pip install -r requirements.txt
+# ============================================================
+
+# ---------- GUI 框架（PySide6 官方绑定） ----------
+PySide6==6.11.1
+PySide6-Addons==6.11.1
+PySide6-Essentials==6.11.1
+shiboken6==6.11.1
+
+# ---------- Fluent Design 组件库（QFluentWidgets） ----------
+# 注意：必须安装 PySide6 后端包「PySide6-Fluent-Widgets」，
+#       它与 PyQt5 后端包「PyQt-Fluent-Widgets」共用 qfluentwidgets 模块名，
+#       二者不可共存。若误装了 PyQt5 版会导致混合绑定崩溃（退出码 127），
+#       请先卸载：pip uninstall PyQt-Fluent-Widgets
+PySide6-Fluent-Widgets==1.11.3
+
+# ---------- 图像处理 ----------
+opencv-python==5.0.0.93
+numpy==2.5.2
+pillow==12.3.0
+
+# ---------- 深度学习框架（CPU 版，默认从 PyPI 安装） ----------
+torch==2.13.0
+torchvision==0.28.0
+
+# ---------- YOLO 系列目标检测（Ultralytics，支持 YOLOv26） ----------
+ultralytics==8.4.117
+ultralytics-thop==2.1.6
+
+# ---------- 可视化与工具 ----------
+matplotlib==3.11.1
+pyyaml==6.0.3
+requests==2.34.2
+polars==1.43.2
+openpyxl==3.1.5        # Excel 结果导出（可选）

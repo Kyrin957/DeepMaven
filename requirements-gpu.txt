@@ -1,0 +1,18 @@
+# ============================================================
+# DeepMaven —— GPU (CUDA) 版 PyTorch 依赖
+#
+# 说明：requirements.txt 默认安装 CPU 版 PyTorch。
+# 如需使用 NVIDIA GPU 加速训练/推理，请先卸载 CPU 版，
+# 再按本文件安装 CUDA 版 PyTorch，最后安装其余依赖。
+#
+# 安装步骤：
+#   pip uninstall torch torchvision
+#   pip install -r requirements-gpu.txt
+#   pip install -r requirements.txt
+#
+# CUDA 源（PyTorch 官方 index，按需选择 cu118 / cu121 / cu128 等）：
+#   https://download.pytorch.org/whl/cu128
+# ============================================================
+
+torch==2.13.0+cu128
+torchvision==0.28.0+cu128
