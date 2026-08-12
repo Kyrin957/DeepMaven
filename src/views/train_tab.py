@@ -27,11 +27,7 @@ class TrainTab(BasePage):
     """模型训练页：训练参数配置与训练监控。"""
 
     def __init__(self, vm: TrainViewModel, parent=None):
-        super().__init__(
-            "模型训练",
-            "配置训练参数，启动/停止训练，实时监控损失曲线与 mAP 指标",
-            parent,
-        )
+        super().__init__(parent)
         self._vm = vm
         self._build_ui()
         self._bind()

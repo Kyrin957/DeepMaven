@@ -29,11 +29,7 @@ class DataTab(BasePage):
     """数据管理页：展示数据集统计、支持划分与预览。"""
 
     def __init__(self, vm: DatasetViewModel, parent=None):
-        super().__init__(
-            "数据管理",
-            "导入图片数据集、查看统计信息、划分训练/验证/测试集",
-            parent,
-        )
+        super().__init__(parent)
         self._vm = vm
         self._build_ui()
         self._bind()

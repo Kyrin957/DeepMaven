@@ -53,3 +53,18 @@ class Dataset:
             "split_test": self.split_test,
             "created_at": self.created_at,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Dataset":
+        return cls(
+            name=data.get("name", "未命名数据集"),
+            source_path=data.get("source_path", ""),
+            image_count=data.get("image_count", 0),
+            label_count=data.get("label_count", 0),
+            class_names=data.get("class_names", []),
+            class_counts=data.get("class_counts", {}),
+            split_train=data.get("split_train", 0.7),
+            split_val=data.get("split_val", 0.2),
+            split_test=data.get("split_test", 0.1),
+            created_at=data.get("created_at", _now_iso()),
+        )

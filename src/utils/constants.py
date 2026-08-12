@@ -11,12 +11,22 @@ ORG_NAME = "DeepMaven"
 
 # 项目根目录（src/ 的上级）
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-# 数据目录（数据库、缓存等本地产物）
+# 数据目录（缓存、日志等本地产物）
 DATA_DIR = PROJECT_ROOT / "data"
 # 运行产物（训练结果、导出模型等）
 RUNS_DIR = PROJECT_ROOT / "runs"
-# 本地 SQLite 数据库文件
-SQLITE_DB_PATH = DATA_DIR / "deepmaven.db"
+
+# ---------------------------------------------------------------
+# 单文件项目 (.mprj)
+# ---------------------------------------------------------------
+# 自定义文件头魔数（确保通用解压/识别工具无法直接打开）
+PROJECT_MAGIC = b"DMJPRJ"
+# 容器格式版本号
+PROJECT_VERSION = 1
+# 支持的扩展名
+PROJECT_EXTS = {".mprj"}
+# 文件对话框过滤器
+PROJECT_FILE_FILTER = "DeepMaven 项目 (*.mprj)"
 
 # ---------------------------------------------------------------
 # 界面

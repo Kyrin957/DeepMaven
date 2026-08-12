@@ -53,7 +53,40 @@ class TrainingConfig:
             "seed": self.seed,
             "resume": self.resume,
             "project_dir": self.project_dir,
+            "status": self.status,
+            "progress": self.progress,
+            "current_epoch": self.current_epoch,
+            "loss": self.loss,
+            "mAP50": self.mAP50,
+            "precision": self.precision,
+            "recall": self.recall,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "TrainingConfig":
+        return cls(
+            task_type=data.get("task_type", "detect"),
+            model_key=data.get("model_key", "yolo11n"),
+            weights_path=data.get("weights_path", ""),
+            data_yaml=data.get("data_yaml", ""),
+            epochs=data.get("epochs", 100),
+            batch=data.get("batch", 16),
+            lr=data.get("lr", 0.01),
+            imgsz=data.get("imgsz", 640),
+            optimizer=data.get("optimizer", "auto"),
+            device=data.get("device", "auto"),
+            workers=data.get("workers", 4),
+            seed=data.get("seed", 0),
+            resume=data.get("resume", False),
+            project_dir=data.get("project_dir", ""),
+            status=data.get("status", "idle"),
+            progress=data.get("progress", 0.0),
+            current_epoch=data.get("current_epoch", 0),
+            loss=data.get("loss", 0.0),
+            mAP50=data.get("mAP50", 0.0),
+            precision=data.get("precision", 0.0),
+            recall=data.get("recall", 0.0),
+        )
 
 
 @dataclass
@@ -65,6 +98,25 @@ class EvaluationConfig:
     confidence: float = 0.25           # 置信度阈值
     iou: float = 0.45                  # IOU 阈值
     device: str = "auto"
+
+    def to_dict(self) -> dict:
+        return {
+            "weights_path": self.weights_path,
+            "source_type": self.source_type,
+            "confidence": self.confidence,
+            "iou": self.iou,
+            "device": self.device,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "EvaluationConfig":
+        return cls(
+            weights_path=data.get("weights_path", ""),
+            source_type=data.get("source_type", "image"),
+            confidence=data.get("confidence", 0.25),
+            iou=data.get("iou", 0.45),
+            device=data.get("device", "auto"),
+        )
 
 
 @dataclass
@@ -78,3 +130,26 @@ class ExportConfig:
     opset: int = 12
     dynamic: bool = False              # 动态尺寸
     simplify: bool = True              # ONNX 图精简
+
+    def to_dict(self) -> dict:
+        return {
+            "weights_path": self.weights_path,
+            "format": self.format,
+            "output_dir": self.output_dir,
+            "imgsz": self.imgsz,
+            "opset": self.opset,
+            "dynamic": self.dynamic,
+            "simplify": self.simplify,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ExportConfig":
+        return cls(
+            weights_path=data.get("weights_path", ""),
+            format=data.get("format", "onnx"),
+            output_dir=data.get("output_dir", ""),
+            imgsz=data.get("imgsz", 640),
+            opset=data.get("opset", 12),
+            dynamic=data.get("dynamic", False),
+            simplify=data.get("simplify", True),
+        )

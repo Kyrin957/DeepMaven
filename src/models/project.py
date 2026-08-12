@@ -1,7 +1,12 @@
 """项目数据模型。
 
-Project 为纯数据模型，定义项目在磁盘上所需的最小元数据；
-持久化到 SQLite 的职责由 services 层的 ProjectService 承担。
+Project 为项目的完整数据容器，承载项目全部数据：
+    元信息（名称、模型类型、描述、时间、状态）
+    子模块配置（数据集、训练、评估、导出、预训练模型）
+    文件索引（图像、标注、模型、运行产物等，见 ProjectFile）
+
+持久化为单一 .mprj 文件（加密 manifest + ZIP 载荷）的职责由
+services 层的 ProjectService / ProjectContainer 承担。
 """
 
 from __future__ import annotations
@@ -10,6 +15,15 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from src.models.dataset import Dataset
+from src.models.project_file import ClassDef, ProjectFile
+from src.models.training import (
+    EvaluationConfig,
+    ExportConfig,
+    TrainingConfig,
+)
+from src.utils.constants import APP_VERSION
+
 
 def _now_iso() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -17,37 +31,77 @@ def _now_iso() -> str:
 
 @dataclass
 class Project:
-    """一个 DeepMaven 项目。
+    """一个 DeepMaven 项目（全部数据）。
 
     Attributes:
         name: 项目名称。
-        work_dir: 项目工作目录（保存图片、标注、模型等）。
-        model_type: 模型类型（如 detect / segment / classify）。
+        model_type: 模型类型（detect / segment / classify）。
         description: 项目描述。
         created_at: 创建时间（ISO 字符串）。
         updated_at: 最近修改时间。
         status: 项目状态（draft / ready / training / finished）。
+        app_version: 生成该项目的程序版本。
+        dataset: 数据集配置与统计。
+        training: 训练参数与实时状态。
+        evaluation: 评估（推理）参数。
+        export: 导出参数。
+        model: 预训练模型信息。
+        classes: 缺陷类别列表。
+        params: 过程/扩展参数。
+        files: 项目内文件索引。
     """
 
     name: str = "未命名项目"
-    work_dir: str = ""
     model_type: str = "detect"
     description: str = ""
     created_at: str = field(default_factory=_now_iso)
     updated_at: str = field(default_factory=_now_iso)
     status: str = "draft"
+    app_version: str = APP_VERSION
+
+    dataset: Dataset = field(default_factory=Dataset)
+    training: TrainingConfig = field(default_factory=TrainingConfig)
+    evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
+    export: ExportConfig = field(default_factory=ExportConfig)
+    model: dict = field(default_factory=dict)
+    classes: list[ClassDef] = field(default_factory=list)
+    params: dict = field(default_factory=dict)
+    files: list[ProjectFile] = field(default_factory=list)
+
+    # 内存态：是否有未保存的变更（不参与序列化）
+    _dirty: bool = field(default=False, compare=False, repr=False)
 
     # -----------------------------------------------------------
     # 便捷属性
     # -----------------------------------------------------------
     @property
-    def path(self) -> Path:
-        return Path(self.work_dir)
+    def file_count(self) -> int:
+        return len(self.files)
 
     @property
-    def is_valid(self) -> bool:
-        """项目是否具备有效的工作目录。"""
-        return bool(self.work_dir) and Path(self.work_dir).is_dir()
+    def dirty(self) -> bool:
+        """是否有未保存的变更。"""
+        return self._dirty
+
+    def find_file(self, virtual_path: str) -> ProjectFile | None:
+        """按真实路径查找文件记录。"""
+        for f in self.files:
+            if f.virtual_path == virtual_path:
+                return f
+        return None
+
+    def find_by_kind(self, kind: str) -> list[ProjectFile]:
+        """按种类返回文件记录列表。"""
+        return [f for f in self.files if f.kind == kind]
+
+    def touch(self) -> None:
+        """标记项目已修改。"""
+        self.updated_at = _now_iso()
+        self._dirty = True
+
+    def mark_saved(self) -> None:
+        """标记已保存（清除未保存变更标记）。"""
+        self._dirty = False
 
     # -----------------------------------------------------------
     # 序列化
@@ -55,26 +109,47 @@ class Project:
     def to_dict(self) -> dict:
         return {
             "name": self.name,
-            "work_dir": self.work_dir,
             "model_type": self.model_type,
             "description": self.description,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "status": self.status,
+            "app_version": self.app_version,
+            "dataset": self.dataset.to_dict(),
+            "training": self.training.to_dict(),
+            "evaluation": self.evaluation.to_dict(),
+            "export": self.export.to_dict(),
+            "model": self.model,
+            "classes": [c.to_dict() for c in self.classes],
+            "params": self.params,
+            "files": [f.to_dict() for f in self.files],
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "Project":
         return cls(
             name=data.get("name", "未命名项目"),
-            work_dir=data.get("work_dir", ""),
             model_type=data.get("model_type", "detect"),
             description=data.get("description", ""),
             created_at=data.get("created_at", _now_iso()),
             updated_at=data.get("updated_at", _now_iso()),
             status=data.get("status", "draft"),
+            app_version=data.get("app_version", APP_VERSION),
+            dataset=Dataset.from_dict(data.get("dataset", {})),
+            training=TrainingConfig.from_dict(data.get("training", {})),
+            evaluation=EvaluationConfig.from_dict(data.get("evaluation", {})),
+            export=ExportConfig.from_dict(data.get("export", {})),
+            model=data.get("model", {}),
+            classes=[ClassDef.from_dict(c) for c in data.get("classes", [])],
+            params=data.get("params", {}),
+            files=[ProjectFile.from_dict(f) for f in data.get("files", [])],
         )
 
-    def touch(self) -> None:
-        """标记项目已修改。"""
-        self.updated_at = _now_iso()
+    # 兼容旧接口：保留 path 属性（指向 .mprj 文件）
+    @property
+    def path(self) -> Path:
+        return Path(self.params.get("path", "")) if self.params.get("path") else Path()
+
+    @property
+    def is_valid(self) -> bool:
+        return self.path.is_file()

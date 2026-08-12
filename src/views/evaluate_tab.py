@@ -29,11 +29,7 @@ class EvaluateTab(BasePage):
     """模型评估页：加载模型、选择输入源、实时检测、结果展示与导出。"""
 
     def __init__(self, vm: EvaluateViewModel, parent=None):
-        super().__init__(
-            "模型评估",
-            "加载训练模型，对图片、视频或相机画面进行实时的缺陷检测",
-            parent,
-        )
+        super().__init__(parent)
         self._vm = vm
         self._build_ui()
         self._bind()

@@ -24,11 +24,7 @@ class ExportTab(BasePage):
     """模型导出页：选择导出格式与路径，执行导出并显示进度。"""
 
     def __init__(self, vm: ExportViewModel, parent=None):
-        super().__init__(
-            "模型导出",
-            "将训练完成的模型导出为 PT / ONNX / TorchScript 等部署格式",
-            parent,
-        )
+        super().__init__(parent)
         self._vm = vm
         self._build_ui()
         self._bind()

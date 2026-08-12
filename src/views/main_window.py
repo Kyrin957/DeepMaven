@@ -13,6 +13,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -30,7 +31,7 @@ from qfluentwidgets import (
     Theme,
 )
 
-from src.utils.constants import APP_NAME, APP_VERSION, BRAND_COLOR
+from src.utils.constants import APP_NAME, APP_VERSION, BRAND_COLOR, PROJECT_FILE_FILTER
 from src.utils.logger import get_logger
 from src.viewmodels import (
     DatasetViewModel,
@@ -150,7 +151,7 @@ class MainWindow(FluentWindow):
         file_menu.addSeparator()
         file_menu.addAction(exit_action)
         new_action.triggered.connect(self._nav_to_project)
-        open_action.triggered.connect(self._nav_to_project)
+        open_action.triggered.connect(self._open_project_dialog)
         save_action.triggered.connect(lambda: self.project_vm.save_project())
         exit_action.triggered.connect(self.close)
 
@@ -195,6 +196,13 @@ class MainWindow(FluentWindow):
 
     def _set_status(self, text: str) -> None:
         self.status_label.setText(text)
+
+    def _on_project_changed_status(self, project) -> None:
+        """状态栏显示当前项目。"""
+        if project is None:
+            self._set_status(f"就绪  ·  {APP_NAME} v{APP_VERSION}")
+        else:
+            self._set_status(f"当前项目：{project.name}  ·  {project.params.get('path', '')}")
 
     # -----------------------------------------------------------
     # 导航页注册
@@ -253,6 +261,8 @@ class MainWindow(FluentWindow):
         ]
         for vm in vms:
             vm.message.connect(self._show_message)
+        # 当前项目变化时更新状态栏
+        self.project_vm.projectChanged.connect(self._on_project_changed_status)
 
     def _show_message(self, level: str, text: str) -> None:
         """在窗口右上角弹出 InfoBar。level: success / error / warning / info。"""
@@ -281,6 +291,14 @@ class MainWindow(FluentWindow):
 
     def _nav_to_project(self) -> None:
         self.navigationInterface.setCurrentItem(self.project_tab.objectName())
+
+    def _open_project_dialog(self) -> None:
+        """弹出 .mprj 文件选择对话框并打开项目。"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "打开项目文件", "", PROJECT_FILE_FILTER
+        )
+        if path:
+            self.project_vm.open_project(path)
 
     def _show_about(self) -> None:
         InfoBar.info(

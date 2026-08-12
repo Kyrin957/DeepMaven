@@ -22,11 +22,7 @@ class ModelTab(BasePage):
     """模型管理页：选择 YOLO 变体、导入预训练权重、展示模型信息。"""
 
     def __init__(self, vm: ModelViewModel, parent=None):
-        super().__init__(
-            "模型管理",
-            "选择 YOLO 模型变体（YOLO11 / YOLO26），导入官方或自定义预训练权重",
-            parent,
-        )
+        super().__init__(parent)
         self._vm = vm
         self._build_ui()
         self._bind()

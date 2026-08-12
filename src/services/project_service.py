@@ -1,111 +1,218 @@
-"""项目服务：SQLite 持久化项目元数据 + 项目目录创建。"""
+"""项目服务：单一 .mprj 文件的创建、打开、保存与内部文件管理。
+
+持有当前项目的内存态（ProjectContainer），负责：
+    * create_project / open_project / save
+    * 向归档添加/读取/移除文件（图像、标注、模型、运行产物等）
+    * 将归档释放为目录（供 YOLO 训练等外部工具使用）
+最近项目列表由 ConfigManager(QSettings) 按路径记录。
+"""
 
 from __future__ import annotations
 
-import sqlite3
 from pathlib import Path
 
 from src.models.project import Project
-from src.utils.constants import DATA_DIR, SQLITE_DB_PATH
+from src.models.project_file import ENTRY_KIND, ProjectFile
+from src.services.project_format import (
+    ProjectContainer,
+    ProjectFormatError,
+    sha256_bytes,
+    to_entry_id,
+)
+from src.utils.config import ConfigManager
 from src.utils.logger import get_logger
 
 logger = get_logger("project")
 
 
 class ProjectService:
-    """项目元数据的增删改查与磁盘目录管理。"""
+    """.mprj 项目文件的管理。"""
 
-    def __init__(self, db_path: str | Path | None = None):
-        self._db_path = Path(db_path) if db_path else SQLITE_DB_PATH
-        self._init_db()
-
-    # -----------------------------------------------------------
-    # 数据库初始化
-    # -----------------------------------------------------------
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
-
-    def _init_db(self) -> None:
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS projects (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name        TEXT NOT NULL,
-                    work_dir    TEXT NOT NULL,
-                    model_type  TEXT NOT NULL DEFAULT 'detect',
-                    description TEXT DEFAULT '',
-                    created_at  TEXT,
-                    updated_at  TEXT,
-                    status      TEXT DEFAULT 'draft'
-                )
-                """
-            )
+    def __init__(self, config: ConfigManager | None = None):
+        self._config = config or ConfigManager()
+        self._container: ProjectContainer | None = None
 
     # -----------------------------------------------------------
-    # CRUD
+    # 当前项目状态
     # -----------------------------------------------------------
-    def create(self, project: Project) -> int:
-        """落库并返回项目 id。"""
-        with self._connect() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO projects (name, work_dir, model_type, description,
-                                      created_at, updated_at, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    project.name, project.work_dir, project.model_type,
-                    project.description, project.created_at,
-                    project.updated_at, project.status,
-                ),
-            )
-            return int(cur.lastrowid)
+    @property
+    def project(self) -> Project | None:
+        return self._container.project if self._container else None
 
-    def get(self, project_id: int) -> Project | None:
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM projects WHERE id = ?", (project_id,)
-            ).fetchone()
-        return Project.from_dict(dict(row)) if row else None
+    @property
+    def current_path(self) -> str:
+        return self.project.params.get("path", "") if self.project else ""
 
-    def list_all(self) -> list[Project]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM projects ORDER BY updated_at DESC"
-            ).fetchall()
-        return [Project.from_dict(dict(r)) for r in rows]
-
-    def update(self, project_id: int, project: Project) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                UPDATE projects SET name=?, work_dir=?, model_type=?,
-                       description=?, updated_at=?, status=?
-                WHERE id=?
-                """,
-                (
-                    project.name, project.work_dir, project.model_type,
-                    project.description, project.updated_at, project.status,
-                    project_id,
-                ),
-            )
-
-    def delete(self, project_id: int) -> None:
-        with self._connect() as conn:
-            conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+    def has_project(self) -> bool:
+        return self._container is not None
 
     # -----------------------------------------------------------
-    # 项目目录
+    # 创建 / 打开 / 保存
     # -----------------------------------------------------------
+    def create_project(
+        self,
+        path: str | Path,
+        name: str,
+        model_type: str = "detect",
+        description: str = "",
+    ) -> Project:
+        """新建项目并写入 .mprj 文件。"""
+        path = self._ensure_mprj(path)
+        project = Project(
+            name=name or Path(path).stem,
+            model_type=model_type,
+            description=description,
+        )
+        project.params["path"] = str(path)
+        self._container = ProjectContainer.create(project, {})
+        self._write(path, self._container.data)
+        self._config.add_recent_project(str(path), project.name)
+        logger.info("新建项目: %s (%s)", project.name, path)
+        return project
+
+    def open_project(self, path: str | Path) -> Project:
+        """打开 .mprj 项目并校验。"""
+        path = Path(path)
+        if not path.is_file():
+            raise ProjectFormatError(f"项目文件不存在: {path}")
+        container = ProjectContainer.open(path.read_bytes())
+        container.project.params["path"] = str(path)
+        self._container = container
+        self._config.add_recent_project(str(path), container.project.name)
+        logger.info("打开项目: %s", path)
+        return container.project
+
+    def save(self, project: Project | None = None) -> None:
+        """将当前项目重新打包写回 .mprj。"""
+        project = project or self.project
+        if project is None or not project.params.get("path"):
+            raise ValueError("当前无项目可保存")
+        if self._container is None:
+            self._container = ProjectContainer.create(project, {})
+        project.touch()
+        self._container = self._container.rebuild(project)
+        self._write(project.params["path"], self._container.data)
+        project.mark_saved()
+        logger.info("已保存项目: %s", project.params["path"])
+
+    # -----------------------------------------------------------
+    # 归档内部文件管理
+    # -----------------------------------------------------------
+    def add_file(
+        self,
+        project: Project | None,
+        kind: str,
+        virtual_path: str,
+        data: bytes,
+        save: bool = True,
+    ) -> ProjectFile:
+        """向项目添加一个文件并登记索引。
+
+        Args:
+            project: 目标项目（默认当前项目）。
+            kind: 条目种类（见 project_file.ENTRY_KIND）。
+            virtual_path: 项目内真实路径，如 "images/train/a.jpg"。
+            data: 文件字节。
+            save: 是否立即写回磁盘。
+        """
+        if kind not in ENTRY_KIND:
+            raise ValueError(f"未知条目种类: {kind}")
+        project = project or self.project
+        if project is None:
+            raise ValueError("当前无项目")
+
+        entry_id = to_entry_id(data)
+        record = ProjectFile(
+            kind=kind,
+            virtual_path=virtual_path,
+            entry_id=entry_id,
+            size=len(data),
+            sha256=sha256_bytes(data),
+        )
+        project.files.append(record)
+        project.touch()
+
+        # 重打包：读取既有文件字节 + 新文件
+        files = self._collect_file_bytes(project, extra={entry_id: data})
+        self._container = ProjectContainer.create(project, files)
+        if save:
+            self._write(project.params["path"], self._container.data)
+        return record
+
+    def get_file_bytes(self, entry_id: str) -> bytes:
+        if self._container is None:
+            raise ValueError("当前无项目")
+        return self._container.get_file_bytes(entry_id)
+
+    def read_file(self, project: Project | None, virtual_path: str) -> bytes:
+        """按真实路径读取文件内容。"""
+        project = project or self.project
+        record = project.find_file(virtual_path)
+        if record is None:
+            raise KeyError(f"项目内不存在: {virtual_path}")
+        return self._container.get_file_bytes(record.entry_id)
+
+    def remove_file(self, project: Project | None, virtual_path: str) -> None:
+        """移除一条文件记录并重打包。"""
+        project = project or self.project
+        target = project.find_file(virtual_path)
+        if target is None:
+            return
+        project.files = [f for f in project.files if f is not target]
+        project.touch()
+        files = self._collect_file_bytes(project, extra={})
+        self._container = ProjectContainer.create(project, files)
+        self._write(project.params["path"], self._container.data)
+
+    def extract_to_dir(self, project: Project | None, dest: str | Path) -> Path:
+        """将归档内文件释放为目录（按虚拟路径还原）。"""
+        project = project or self.project
+        if project is None:
+            raise ValueError("当前无项目")
+        dest = Path(dest)
+        for record in project.files:
+            bytes_ = self._container.get_file_bytes(record.entry_id)
+            out = dest / record.virtual_path
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(bytes_)
+        logger.info("项目已释放到: %s", dest)
+        return dest
+
+    # -----------------------------------------------------------
+    # 最近项目
+    # -----------------------------------------------------------
+    def recent_projects(self) -> list[dict]:
+        """最近项目列表（按路径，来自 QSettings）。"""
+        return self._config.recent_projects()
+
+    # -----------------------------------------------------------
+    # 内部
+    # -----------------------------------------------------------
+    def _collect_file_bytes(
+        self, project: Project, extra: dict[str, bytes]
+    ) -> dict[str, bytes]:
+        """收集 project.files 引用的全部字节（extra 优先，用于注入新文件）。"""
+        files: dict[str, bytes] = {}
+        if self._container is not None:
+            with self._container._open_zip(self._container._zip_bytes()) as zf:
+                for entry_id in {f.entry_id for f in project.files}:
+                    if entry_id in extra:
+                        files[entry_id] = extra[entry_id]
+                    else:
+                        files[entry_id] = zf.read(entry_id)
+        for entry_id, content in extra.items():
+            files.setdefault(entry_id, content)
+        return files
+
     @staticmethod
-    def create_project_dir(base_dir: str | Path, name: str) -> Path:
-        """在 base_dir 下创建项目目录结构并返回路径。"""
-        project_dir = Path(base_dir) / name
-        for sub in ("images", "labels", "runs", "config"):
-            (project_dir / sub).mkdir(parents=True, exist_ok=True)
-        logger.info("创建项目目录: %s", project_dir)
-        return project_dir
+    def _write(path: str | Path, data: bytes) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+
+    @staticmethod
+    def _ensure_mprj(path: str | Path) -> Path:
+        path = Path(path)
+        if path.suffix.lower() != ".mprj":
+            path = path.with_suffix(".mprj")
+        return path
