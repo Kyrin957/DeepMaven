@@ -34,6 +34,8 @@ from qfluentwidgets import (
 from src.utils.constants import APP_NAME, APP_VERSION, BRAND_COLOR, PROJECT_FILE_FILTER
 from src.utils.logger import get_logger
 from src.viewmodels import (
+    AnnotateViewModel,
+    CategoryViewModel,
     DatasetViewModel,
     EvaluateViewModel,
     ExportViewModel,
@@ -42,6 +44,7 @@ from src.viewmodels import (
     TrainViewModel,
 )
 from src.views import (
+    AnnotateTab,
     DataTab,
     EvaluateTab,
     ExportTab,
@@ -66,10 +69,12 @@ class MainWindow(FluentWindow):
 
         # ViewModel 层（业务逻辑）
         self.project_vm = ProjectViewModel(self)
-        self.dataset_vm = DatasetViewModel(self)
+        self.dataset_vm = DatasetViewModel(self.project_vm, self)
+        self.category_vm = CategoryViewModel(self.project_vm, self)
+        self.annotate_vm = AnnotateViewModel(self.dataset_vm, self.project_vm, self)
         self.model_vm = ModelViewModel(self)
-        self.train_vm = TrainViewModel(self)
-        self.evaluate_vm = EvaluateViewModel(self)
+        self.train_vm = TrainViewModel(self.project_vm, self)
+        self.evaluate_vm = EvaluateViewModel(self.project_vm, self)
         self.export_vm = ExportViewModel(self)
 
         # 隐藏导航栏顶部的「返回」后退按钮
@@ -204,6 +209,10 @@ class MainWindow(FluentWindow):
         else:
             self._set_status(f"当前项目：{project.name}  ·  {project.params.get('path', '')}")
 
+    def _on_dataset_ready(self, yaml_path: str) -> None:
+        """数据集划分完成后，把 data.yaml 交给训练页。"""
+        self.train_vm.update_config(data_yaml=yaml_path)
+
     # -----------------------------------------------------------
     # 导航页注册
     # -----------------------------------------------------------
@@ -215,10 +224,17 @@ class MainWindow(FluentWindow):
             position=NavigationItemPosition.TOP,
         )
 
-        self.data_tab = DataTab(self.dataset_vm, self)
+        self.data_tab = DataTab(self.dataset_vm, self.category_vm, self)
         self.data_tab.setObjectName("dataTab")
         self.addSubInterface(
             self.data_tab, FluentIcon.LIBRARY, "数据管理",
+            position=NavigationItemPosition.TOP,
+        )
+
+        self.annotate_tab = AnnotateTab(self.annotate_vm, self.category_vm, self)
+        self.annotate_tab.setObjectName("annotateTab")
+        self.addSubInterface(
+            self.annotate_tab, FluentIcon.BRUSH, "图像标注",
             position=NavigationItemPosition.TOP,
         )
 
@@ -256,13 +272,15 @@ class MainWindow(FluentWindow):
     def _wire_messages(self) -> None:
         """将各 ViewModel 的 message 信号统一转为 InfoBar 提示。"""
         vms = [
-            self.project_vm, self.dataset_vm, self.model_vm,
-            self.train_vm, self.evaluate_vm, self.export_vm,
+            self.project_vm, self.dataset_vm, self.category_vm, self.annotate_vm,
+            self.model_vm, self.train_vm, self.evaluate_vm, self.export_vm,
         ]
         for vm in vms:
             vm.message.connect(self._show_message)
         # 当前项目变化时更新状态栏
         self.project_vm.projectChanged.connect(self._on_project_changed_status)
+        # 数据集划分完成后，把 data.yaml 交给训练页
+        self.dataset_vm.datasetReady.connect(self._on_dataset_ready)
 
     def _show_message(self, level: str, text: str) -> None:
         """在窗口右上角弹出 InfoBar。level: success / error / warning / info。"""

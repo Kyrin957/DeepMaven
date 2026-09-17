@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QFormLayout, QHBoxLayout, QVBoxLayout
+from PySide6.QtWidgets import (
+    QFileDialog,
+    QFormLayout,
+    QHBoxLayout,
+    QVBoxLayout,
+    QWidget,
+)
 from qfluentwidgets import (
     BodyLabel,
     CaptionLabel,
     CardWidget,
+    CheckBox,
     ComboBox,
     LineEdit,
     PrimaryPushButton,
@@ -18,6 +25,7 @@ from qfluentwidgets import (
     TextEdit,
 )
 
+from src.services.anomalib_service import AnomalibService
 from src.utils.constants import OPTIMIZERS, TASK_TYPES, YOLO_MODEL_VARIANTS
 from src.viewmodels.train_vm import TrainViewModel
 from src.views.base_page import BasePage
@@ -42,14 +50,13 @@ class TrainTab(BasePage):
         card, layout = self.add_card("训练参数配置")
 
         form = QFormLayout()
+        self._form = form
         self.task_combo = ComboBox(card)
         for item in TASK_TYPES:
-            self.task_combo.addItem(item["label"], item["key"])
+            self.task_combo.addItem(item["label"], userData=item["key"])
         form.addRow("任务类型：", self.task_combo)
 
         self.model_combo = ComboBox(card)
-        for variant in YOLO_MODEL_VARIANTS:
-            self.model_combo.addItem(variant["label"], variant["key"])
         form.addRow("模型：", self.model_combo)
 
         self.epochs_spin = SpinBox(card)
@@ -77,6 +84,27 @@ class TrainTab(BasePage):
         self.device_combo = ComboBox(card)
         self.device_combo.addItems(["auto", "cpu", "cuda:0"])
         form.addRow("设备：", self.device_combo)
+
+        self._row_dataset = form.rowCount()
+        self.dataset_label = BodyLabel("—", card)
+        self.dataset_label.setWordWrap(True)
+        form.addRow("数据集配置：", self.dataset_label)
+
+        self._row_anomaly = form.rowCount()
+        anomaly_row = QWidget(card)
+        anomaly_layout = QHBoxLayout(anomaly_row)
+        anomaly_layout.setContentsMargins(0, 0, 0, 0)
+        self.anomaly_edit = LineEdit(anomaly_row)
+        self.anomaly_edit.setPlaceholderText("含 normal/ 与 abnormal/ 的目录")
+        anomaly_layout.addWidget(self.anomaly_edit, 1)
+        anomaly_btn = PushButton("浏览…", anomaly_row)
+        anomaly_btn.clicked.connect(self._on_browse_anomaly)
+        anomaly_layout.addWidget(anomaly_btn)
+        self.anomaly_pretrained_check = CheckBox("预训练权重", anomaly_row)
+        self.anomaly_pretrained_check.setChecked(True)
+        anomaly_layout.addWidget(self.anomaly_pretrained_check)
+        form.addRow("异常数据目录：", anomaly_row)
+
         layout.addLayout(form)
 
         btn_row = QHBoxLayout()
@@ -104,16 +132,17 @@ class TrainTab(BasePage):
 
         # 指标
         metric_row = QHBoxLayout()
+        self.epoch_label = BodyLabel("Epoch：—", card)
         self.loss_label = BodyLabel("Loss：—", card)
         self.map_label = BodyLabel("mAP50：—", card)
         self.prec_label = BodyLabel("Precision：—", card)
         self.recall_label = BodyLabel("Recall：—", card)
-        for lbl in (self.loss_label, self.map_label, self.prec_label, self.recall_label):
+        self.auroc_label = BodyLabel("AUROC：—", card)
+        for lbl in (self.epoch_label, self.loss_label, self.map_label,
+                    self.prec_label, self.recall_label, self.auroc_label):
             metric_row.addWidget(lbl)
         metric_row.addStretch(1)
         layout.addLayout(metric_row)
-
-        layout.addWidget(CaptionLabel("损失曲线与 mAP 曲线将使用 Matplotlib 绘制", card))
 
     def _build_log_card(self) -> None:
         card, layout = self.add_card("训练日志")
@@ -125,19 +154,41 @@ class TrainTab(BasePage):
     # -----------------------------------------------------------
     # 交互
     # -----------------------------------------------------------
+    def _on_task_changed(self, _index=None) -> None:
+        """任务类型切换时刷新模型列表与专属参数行。"""
+        task = self.task_combo.currentData()
+        self.model_combo.clear()
+        if task == "anomaly":
+            for name in AnomalibService.available_models():
+                self.model_combo.addItem(name, userData=name)
+        else:
+            for variant in YOLO_MODEL_VARIANTS:
+                self.model_combo.addItem(variant["label"], userData=variant["key"])
+        is_anomaly = task == "anomaly"
+        self._form.setRowVisible(self._row_anomaly, is_anomaly)
+        self._form.setRowVisible(self._row_dataset, not is_anomaly)
+
+    def _on_browse_anomaly(self) -> None:
+        directory = QFileDialog.getExistingDirectory(self, "选择异常检测数据目录")
+        if directory:
+            self.anomaly_edit.setText(directory)
+
     def _on_start(self) -> None:
         self._vm.update_config(
             task_type=self.task_combo.currentData(),
-            model_key=self.model_combo.currentData(),
+            model_key=self.model_combo.currentData() or "",
             epochs=self.epochs_spin.value(),
             batch=self.batch_spin.value(),
             lr=self.lr_double.value(),
             optimizer=self.opt_combo.currentText(),
             device=self.device_combo.currentText(),
+            anomaly_root=self.anomaly_edit.text().strip(),
+            anomaly_pretrained=self.anomaly_pretrained_check.isChecked(),
         )
         self._vm.start()
 
     def _bind(self) -> None:
+        self.task_combo.currentIndexChanged.connect(self._on_task_changed)
         self.start_btn.clicked.connect(self._on_start)
         self.stop_btn.clicked.connect(self._vm.stop)
         self.reset_btn.clicked.connect(self._vm.reset)
@@ -145,19 +196,32 @@ class TrainTab(BasePage):
         self._vm.progressChanged.connect(self._on_progress)
         self._vm.metricsChanged.connect(self._on_metrics)
         self._vm.logAppended.connect(self._on_log)
+        self._vm.configChanged.connect(self._on_config)
+        self._on_status(self._vm.config.status)
+        self._on_task_changed()
+
+    def _on_config(self, config) -> None:
+        self.dataset_label.setText(config.data_yaml or "—")
 
     def _on_status(self, status: str) -> None:
-        self.start_btn.setEnabled(status != "running")
+        running = status == "running"
+        self.start_btn.setEnabled(not running)
+        self.stop_btn.setEnabled(running)
 
     def _on_progress(self, value: float) -> None:
         self.progress_bar.setValue(int(value * 100))
         self.progress_label.setText(f"进度：{value * 100:.0f}%")
 
     def _on_metrics(self, metrics: dict) -> None:
+        epoch = metrics.get("epoch")
+        if epoch:
+            self.epoch_label.setText(f"Epoch：{epoch} / {metrics.get('total', '—')}")
         self.loss_label.setText(f"Loss：{metrics.get('loss', '—')}")
         self.map_label.setText(f"mAP50：{metrics.get('mAP50', '—')}")
         self.prec_label.setText(f"Precision：{metrics.get('precision', '—')}")
         self.recall_label.setText(f"Recall：{metrics.get('recall', '—')}")
+        if metrics.get("auroc") is not None:
+            self.auroc_label.setText(f"AUROC：{metrics['auroc']}")
 
     def _on_log(self, line: str) -> None:
         self.log_edit.append(line)

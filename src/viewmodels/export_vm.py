@@ -1,12 +1,15 @@
-"""模型导出 ViewModel：格式选择与导出执行。"""
+"""模型导出 ViewModel：格式选择与后台导出执行。"""
 
 from __future__ import annotations
+
+from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
 
 from src.models.training import ExportConfig
 from src.services.export_service import ExportService
 from src.utils.logger import get_logger
+from src.utils.workers import FunctionWorker
 
 logger = get_logger("export_vm")
 
@@ -17,20 +20,26 @@ class ExportViewModel(QObject):
     configChanged = Signal(object)       # ExportConfig
     exportStarted = Signal()
     exportFinished = Signal(str)         # 导出文件路径
-    progressChanged = Signal(float)      # 0~1
+    taskStarted = Signal(str)
+    taskProgress = Signal(int, str)
+    taskFinished = Signal(str)
+    taskFailed = Signal(str)
     message = Signal(str, str)           # level, text
 
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
         self._config = ExportConfig(output_dir="runs/export")
-        self._service = None
+        self._worker: FunctionWorker | None = None
 
     @property
     def config(self) -> ExportConfig:
         return self._config
 
+    def is_busy(self) -> bool:
+        return self._worker is not None and self._worker.isRunning()
+
     # -----------------------------------------------------------
-    # 命令
+    # 配置
     # -----------------------------------------------------------
     def set_format(self, fmt: str) -> None:
         self._config.format = fmt
@@ -44,16 +53,76 @@ class ExportViewModel(QObject):
         self._config.output_dir = path
         self.configChanged.emit(self._config)
 
+    def set_imgsz(self, value: int) -> None:
+        self._config.imgsz = int(value)
+        self.configChanged.emit(self._config)
+
+    def set_opset(self, value: int) -> None:
+        self._config.opset = int(value)
+        self.configChanged.emit(self._config)
+
+    def set_dynamic(self, enabled: bool) -> None:
+        self._config.dynamic = bool(enabled)
+        self.configChanged.emit(self._config)
+
+    def set_simplify(self, enabled: bool) -> None:
+        self._config.simplify = bool(enabled)
+        self.configChanged.emit(self._config)
+
+    # -----------------------------------------------------------
+    # 执行
+    # -----------------------------------------------------------
     def export(self) -> None:
-        """执行导出。骨架阶段校验参数并记录意图。"""
+        """在后台线程执行模型导出。"""
+        if self.is_busy():
+            self.message.emit("warning", "已有任务在运行")
+            return
         if not self._config.weights_path:
             self.message.emit("warning", "请先选择待导出的模型权重")
             return
-        logger.info("导出配置: %s", self._config.to_dict() if hasattr(self._config, "to_dict") else self._config)
+        if not Path(self._config.weights_path).is_file():
+            self.message.emit("error", f"权重文件不存在：{self._config.weights_path}")
+            return
+
+        config = self._config
         self.exportStarted.emit()
-        self.progressChanged.emit(0.5)
-        self.exportFinished.emit(
-            f"runs/export/{self._config.weights_path.rsplit('/', 1)[-1].rsplit('.', 1)[0]}.{self._config.format}"
+
+        def job(progress, _is_cancelled):
+            progress(10, f"导出为 {config.format}")
+            return ExportService().export(config)
+
+        def done(path):
+            self.exportFinished.emit(str(path))
+            self.message.emit("success", f"导出完成：{path}")
+
+        self._start_worker(job, "模型导出", on_done=done)
+
+    # -----------------------------------------------------------
+    # 内部
+    # -----------------------------------------------------------
+    def _start_worker(self, job, name: str, on_done=None) -> None:
+        worker = FunctionWorker(job, self)
+        worker.progress.connect(self.taskProgress.emit)
+        worker.finishedOk.connect(
+            lambda payload: self._on_task_done(name, payload, on_done)
         )
-        self.progressChanged.emit(1.0)
-        self.message.emit("success", "导出完成（骨架阶段模拟）")
+        worker.failed.connect(lambda error: self._on_task_failed(name, error))
+        self._worker = worker
+        self.taskStarted.emit(name)
+        worker.start()
+
+    def _on_task_done(self, name: str, payload, on_done) -> None:
+        if on_done is not None:
+            try:
+                on_done(payload)
+            except Exception as exc:  # noqa: BLE001 - 结果应用异常需回传界面
+                logger.warning("%s结果应用失败: %s", name, exc)
+                self.taskFailed.emit(f"{name}失败：{exc}")
+                return
+            self.taskFinished.emit(f"{name}完成")
+        else:
+            self.taskFinished.emit(str(payload) if payload else f"{name}完成")
+
+    def _on_task_failed(self, name: str, error: str) -> None:
+        logger.warning("%s失败: %s", name, error)
+        self.taskFailed.emit(f"{name}失败：{error}")

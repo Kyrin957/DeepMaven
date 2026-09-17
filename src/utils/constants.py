@@ -60,7 +60,12 @@ TASK_TYPES = [
     {"key": "detect", "label": "目标检测 (Detect)"},
     {"key": "segment", "label": "实例分割 (Segment)"},
     {"key": "classify", "label": "图像分类 (Classify)"},
+    {"key": "anomaly", "label": "异常检测 (Anomaly)"},
 ]
+
+# 异常检测（Anomalib）数据目录约定
+ANOMALY_NORMAL_DIR = "normal"
+ANOMALY_ABNORMAL_DIR = "abnormal"
 
 # 优化器
 OPTIMIZERS = ["auto", "SGD", "Adam", "AdamW", "RMSProp"]

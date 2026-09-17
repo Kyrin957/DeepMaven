@@ -37,6 +37,11 @@ class ProjectViewModel(QObject):
     # 查询
     # -----------------------------------------------------------
     @property
+    def service(self) -> ProjectService:
+        """底层项目服务（供其它 ViewModel 共享同一项目状态）。"""
+        return self._service
+
+    @property
     def project(self) -> Project | None:
         return self._service.project
 
@@ -93,6 +98,11 @@ class ProjectViewModel(QObject):
             self.message.emit("error", f"保存失败：{exc}")
             return
         self.message.emit("success", "项目已保存")
+
+    def notify_changed(self) -> None:
+        """外部修改了当前项目（如数据集归档）后刷新界面。"""
+        if self._service.project is not None:
+            self.projectChanged.emit(self._service.project)
 
     def delete_recent(self, project_path: str) -> None:
         """从最近列表中移除一条记录。"""

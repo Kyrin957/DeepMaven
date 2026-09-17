@@ -40,7 +40,8 @@ class ModelTab(BasePage):
         self.variant_combo = ComboBox(card)
         for variant in self._vm.variants:
             self.variant_combo.addItem(
-                f"{variant['label']}  —  {variant['desc']}", variant["key"],
+                f"{variant['label']}  —  {variant['desc']}",
+                userData=variant["key"],
             )
         form.addRow("模型变体：", self.variant_combo)
         layout.addLayout(form)
@@ -63,6 +64,9 @@ class ModelTab(BasePage):
         import_btn.clicked.connect(self._on_import_weights)
         layout.addWidget(import_btn)
 
+        self.status_label = CaptionLabel("", card)
+        layout.addWidget(self.status_label)
+
     def _build_info_card(self) -> None:
         card, layout = self.add_card("模型信息")
         self.info_label = CaptionLabel("导入权重后在此显示模型基础信息", card)
@@ -84,6 +88,7 @@ class ModelTab(BasePage):
             self._vm.import_weights(path)
         else:
             self._vm.select_variant(self.variant_combo.currentData())
+            self._vm.prepare_variant()
 
     def _on_selected(self, variant: dict) -> None:
         self.variant_desc.setText(
@@ -92,13 +97,31 @@ class ModelTab(BasePage):
 
     def _on_model_info(self, info: dict) -> None:
         if not info:
-            self.info_label.setText("前权重为空，将使用官方预训练权重")
+            self.info_label.setText("—")
             return
+        names = info.get("names") or {}
+        labels = list(names.values()) if isinstance(names, dict) else list(names)
         self.info_label.setText(
             f"权重路径：{info.get('weights', '—')}\n"
             f"任务类型：{info.get('task', '—')}\n"
-            f"类别：{list(info.get('names', {}).values()) or '—'}"
+            f"类别数量：{len(labels)}\n"
+            f"类别列表：{'、'.join(str(item) for item in labels) or '—'}\n"
+            f"参数量：{int(info.get('params', 0)):,}\n"
+            f"网络层数：{int(info.get('layers', 0))}"
         )
+
+    def _on_task_started(self, name: str) -> None:
+        self.status_label.setText(f"{name}…")
+
+    def _on_task_progress(self, _percent: int, text: str) -> None:
+        if text:
+            self.status_label.setText(text)
+
+    def _on_task_finished(self, text: str) -> None:
+        self.status_label.setText(text)
+
+    def _on_task_failed(self, text: str) -> None:
+        self.status_label.setText(text)
 
     def _bind(self) -> None:
         self.variant_combo.currentIndexChanged.connect(
@@ -106,3 +129,7 @@ class ModelTab(BasePage):
         )
         self._vm.modelSelected.connect(self._on_selected)
         self._vm.modelInfo.connect(self._on_model_info)
+        self._vm.taskStarted.connect(self._on_task_started)
+        self._vm.taskProgress.connect(self._on_task_progress)
+        self._vm.taskFinished.connect(self._on_task_finished)
+        self._vm.taskFailed.connect(self._on_task_failed)

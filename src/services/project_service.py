@@ -139,6 +139,62 @@ class ProjectService:
             self._write(project.params["path"], self._container.data)
         return record
 
+    def add_files(
+        self,
+        project: Project | None,
+        items: list[tuple[str, str, bytes]],
+        save: bool = True,
+    ) -> list[ProjectFile]:
+        """批量添加文件（单次重打包）。
+
+        相比逐个调用 add_file，本方法把所有新文件一次性打包写回，
+        避免每加一个文件就重打包一次（O(n²)）。
+
+        Args:
+            project: 目标项目（默认当前项目）。
+            items: (kind, virtual_path, data) 序列。
+            save: 是否立即写回磁盘。
+
+        Returns:
+            新增的文件记录列表。
+        """
+        project = project or self.project
+        if project is None:
+            raise ValueError("当前无项目")
+
+        by_path = {f.virtual_path: f for f in project.files}
+        new_bytes: dict[str, bytes] = {}
+        records: list[ProjectFile] = []
+        for kind, virtual_path, data in items:
+            if kind not in ENTRY_KIND:
+                raise ValueError(f"未知条目种类: {kind}")
+            entry_id = to_entry_id(data)
+            record = ProjectFile(
+                kind=kind,
+                virtual_path=virtual_path,
+                entry_id=entry_id,
+                size=len(data),
+                sha256=sha256_bytes(data),
+            )
+            # 同一路径重复写入时替换旧记录（如重新划分数据集）
+            old = by_path.get(virtual_path)
+            if old is not None:
+                project.files = [f for f in project.files if f is not old]
+            project.files.append(record)
+            by_path[virtual_path] = record
+            new_bytes[entry_id] = data
+            records.append(record)
+
+        if not records:
+            return records
+        project.touch()
+        files = self._collect_file_bytes(project, extra=new_bytes)
+        self._container = ProjectContainer.create(project, files)
+        if save and project.params.get("path"):
+            self._write(project.params["path"], self._container.data)
+        logger.info("批量写入项目文件 %s 个", len(records))
+        return records
+
     def get_file_bytes(self, entry_id: str) -> bytes:
         if self._container is None:
             raise ValueError("当前无项目")

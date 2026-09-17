@@ -110,14 +110,22 @@ class YOLOService:
     # 模型信息
     # -----------------------------------------------------------
     def info(self) -> dict:
-        """返回模型的基础信息（任务类型、参数量等，尽力而为）。"""
+        """返回模型的基础信息（任务类型、类别、参数量、层数）。"""
+        result = {
+            "weights": self._weights,
+            "task": "unknown",
+            "names": {},
+            "params": 0,
+            "layers": 0,
+        }
         try:
-            m = self.model
-            return {
-                "weights": self._weights,
-                "task": getattr(m, "task", "unknown"),
-                "names": getattr(m, "names", {}),
-            }
-        except Exception as exc:  # noqa: BLE001
+            model = self.model
+            result["task"] = getattr(model, "task", "unknown")
+            result["names"] = dict(getattr(model, "names", {}) or {})
+            net = getattr(model, "model", None)
+            if net is not None and hasattr(net, "parameters"):
+                result["params"] = int(sum(p.numel() for p in net.parameters()))
+                result["layers"] = int(sum(1 for _ in net.modules()))
+        except Exception as exc:  # noqa: BLE001 - 权重缺失/损坏等
             logger.warning("获取模型信息失败: %s", exc)
-            return {"weights": self._weights, "task": "unknown", "names": {}}
+        return result

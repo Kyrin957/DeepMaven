@@ -41,6 +41,12 @@ torchvision==0.28.0
 ultralytics==8.4.117
 ultralytics-thop==2.1.6
 
+# ---------- 数据增强（Albumentations） ----------
+albumentations==2.0.8
+
+# ---------- 异常检测（Anomalib，可选任务类型） ----------
+anomalib==2.6.2
+
 # ---------- 可视化与工具 ----------
 matplotlib==3.11.1
 pyyaml==6.0.3

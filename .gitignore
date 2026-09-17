@@ -19,11 +19,11 @@ env/
 *.qmlc
 *.qmetatype
 
-# Ultralytics / YOLO 训练产物
+# Ultralytics / YOLO 训练产物与模型权重
 runs/
 datasets/
 *.pt
-!*.pt   # 若需保留预训练权重可调整
+*.ckpt
 
 # 数据与模型导出
 *.onnx

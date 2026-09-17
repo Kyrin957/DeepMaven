@@ -94,6 +94,25 @@ class Project:
         """按种类返回文件记录列表。"""
         return [f for f in self.files if f.kind == kind]
 
+    # -----------------------------------------------------------
+    # 缺陷类别操作
+    # -----------------------------------------------------------
+    @property
+    def class_names(self) -> list[str]:
+        """按类别 id 升序返回类别名。"""
+        return [c.name for c in sorted(self.classes, key=lambda c: c.cls_id)]
+
+    def next_class_id(self) -> int:
+        """返回下一个可用的类别 id。"""
+        return max((c.cls_id for c in self.classes), default=-1) + 1
+
+    def find_class(self, cls_id: int) -> ClassDef | None:
+        """按 id 查找类别定义。"""
+        for c in self.classes:
+            if c.cls_id == cls_id:
+                return c
+        return None
+
     def touch(self) -> None:
         """标记项目已修改。"""
         self.updated_at = _now_iso()

@@ -58,7 +58,7 @@ class ProjectTab(BasePage):
         layout.addWidget(BodyLabel("模型类型"))
         self.model_type_combo = ComboBox(card)
         for item in TASK_TYPES:
-            self.model_type_combo.addItem(item["label"], item["key"])
+            self.model_type_combo.addItem(item["label"], userData=item["key"])
         layout.addWidget(self.model_type_combo)
 
         self.create_btn = PrimaryPushButton("创建项目", card)
