@@ -12,6 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from src.models.project import Project
+from src.utils.constants import COVER_ENTRY_NAME
 from src.models.project_file import ENTRY_KIND, ProjectFile
 from src.services.project_format import (
     ProjectContainer,
@@ -94,6 +95,76 @@ class ProjectService:
         self._write(project.params["path"], self._container.data)
         project.mark_saved()
         logger.info("已保存项目: %s", project.params["path"])
+
+    def save_as(self, new_path: str | Path, project: Project | None = None) -> Path:
+        """把当前项目另存为新的 .mprj，并把当前项目切换到新位置。
+
+        Returns:
+            实际写入的项目文件路径。
+        """
+        project = project or self.project
+        if project is None:
+            raise ValueError("当前无项目可另存")
+        if self._container is None:
+            self._container = ProjectContainer.create(project, {})
+
+        target = self._ensure_mprj(new_path)
+        previous = str(project.params.get("path", "") or "")
+        project.params["path"] = str(target)
+        project.touch()
+        self._container = self._container.rebuild(project)
+        try:
+            self._write(target, self._container.data)
+        except OSError:
+            # 写入失败则回滚，避免当前项目指向一个不存在的文件
+            project.params["path"] = previous
+            raise
+        project.mark_saved()
+        self._config.add_recent_project(str(target), project.name)
+        logger.info("项目另存为: %s -> %s", previous, target)
+        return target
+
+    def close(self) -> None:
+        """关闭当前项目（只清空内存状态，不删除文件）。"""
+        self._container = None
+        logger.info("已关闭当前项目")
+
+    @staticmethod
+    def delete_project(path: str | Path) -> None:
+        """删除 .mprj 项目文件。"""
+        target = Path(path)
+        if target.is_file():
+            target.unlink()
+            logger.info("已删除项目文件: %s", target)
+
+    @staticmethod
+    def peek_project(path: str | Path) -> tuple[Project | None, bytes]:
+        """轻量读取项目清单与封面（跳过逐文件哈希校验），供最近项目预览。
+
+        Returns:
+            (Project 或 None, 封面 JPEG 字节)。
+        """
+        try:
+            target = Path(path)
+            if not target.is_file():
+                return None, b""
+            container = ProjectContainer.open(target.read_bytes(), verify=False)
+            project = container.project
+            project.params["path"] = str(target)
+            cover = b""
+            record = project.find_file(COVER_ENTRY_NAME)
+            if record is not None:
+                cover = container.get_file_bytes(record.entry_id)
+            return project, cover
+        except (ProjectFormatError, OSError, KeyError, ValueError, TypeError) as exc:
+            logger.warning("读取项目信息失败 %s: %s", path, exc)
+            return None, b""
+
+    @classmethod
+    def peek_cover(cls, path: str | Path) -> bytes:
+        """只读取项目内的封面缩略图，失败返回空字节。"""
+        _project, cover = cls.peek_project(path)
+        return cover
 
     # -----------------------------------------------------------
     # 归档内部文件管理
@@ -207,6 +278,21 @@ class ProjectService:
         if record is None:
             raise KeyError(f"项目内不存在: {virtual_path}")
         return self._container.get_file_bytes(record.entry_id)
+
+    def read_files(
+        self, project: Project | None, virtual_paths: list[str]
+    ) -> dict[str, bytes]:
+        """批量按真实路径读取内容（用于从归档恢复数据集）。"""
+        project = project or self.project
+        if project is None:
+            raise ValueError("当前无项目")
+        entry_of: dict[str, str] = {}
+        for path in virtual_paths:
+            record = project.find_file(path)
+            if record is not None:
+                entry_of[record.entry_id] = path
+        raw = self._container.get_files_bytes(list(entry_of))
+        return {virtual: raw[entry_id] for entry_id, virtual in entry_of.items()}
 
     def remove_file(self, project: Project | None, virtual_path: str) -> None:
         """移除一条文件记录并重打包。"""

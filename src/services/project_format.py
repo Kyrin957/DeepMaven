@@ -107,8 +107,13 @@ class ProjectContainer:
     # 解析
     # -----------------------------------------------------------
     @classmethod
-    def open(cls, data: bytes) -> "ProjectContainer":
-        """解析容器字节并校验魔数/版本/文件哈希，返回容器。"""
+    def open(cls, data: bytes, verify: bool = True) -> "ProjectContainer":
+        """解析容器字节并校验魔数 / 版本 / 文件哈希，返回容器。
+
+        Args:
+            verify: 是否逐条校验归档文件哈希。最近项目预览等只读场景可传
+                False 以加快速度（容器级哈希仍需通过）。
+        """
         if len(data) < _HEADER_SIZE:
             raise ProjectFormatError("文件过短，不是有效的 .mprj 项目")
 
@@ -143,14 +148,19 @@ class ProjectContainer:
         container = cls(data, project)
 
         # 校验归档内每条文件哈希
-        with cls._open_zip(zip_bytes) as zf:
-            for f in project.files:
-                try:
-                    raw = zf.read(f.entry_id)
-                except KeyError as exc:
-                    raise ProjectFormatError(f"归档缺少文件: {f.virtual_path}") from exc
-                if sha256_bytes(raw) != f.sha256:
-                    raise ProjectFormatError(f"文件校验失败（已被篡改或损坏）: {f.virtual_path}")
+        if verify:
+            with cls._open_zip(zip_bytes) as zf:
+                for f in project.files:
+                    try:
+                        raw = zf.read(f.entry_id)
+                    except KeyError as exc:
+                        raise ProjectFormatError(
+                            f"归档缺少文件: {f.virtual_path}"
+                        ) from exc
+                    if sha256_bytes(raw) != f.sha256:
+                        raise ProjectFormatError(
+                            f"文件校验失败（已被篡改或损坏）: {f.virtual_path}"
+                        )
 
         logger.info("打开项目「%s」：%s 个文件", project.name, project.file_count)
         return container
@@ -179,6 +189,19 @@ class ProjectContainer:
             except KeyError as exc:
                 raise KeyError(f"归档中不存在条目: {entry_id}") from exc
         return raw
+
+    def get_files_bytes(self, entry_ids: list[str]) -> dict[str, bytes]:
+        """批量读取条目（只打开一次归档，避免逐条重复解析）。"""
+        result: dict[str, bytes] = {}
+        if not entry_ids:
+            return result
+        with self._open_zip(self._zip_bytes()) as zf:
+            for entry_id in entry_ids:
+                try:
+                    result[entry_id] = zf.read(entry_id)
+                except KeyError as exc:
+                    raise KeyError(f"归档中不存在条目: {entry_id}") from exc
+        return result
 
     # -----------------------------------------------------------
     # 内部

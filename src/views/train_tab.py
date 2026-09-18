@@ -26,7 +26,12 @@ from qfluentwidgets import (
 )
 
 from src.services.anomalib_service import AnomalibService
-from src.utils.constants import OPTIMIZERS, TASK_TYPES, YOLO_MODEL_VARIANTS
+from src.utils.constants import (
+    OPTIMIZERS,
+    TASK_MODEL_SUFFIX,
+    TASK_TYPES,
+    YOLO_MODEL_VARIANTS,
+)
 from src.viewmodels.train_vm import TrainViewModel
 from src.views.base_page import BasePage
 
@@ -137,9 +142,8 @@ class TrainTab(BasePage):
         self.map_label = BodyLabel("mAP50：—", card)
         self.prec_label = BodyLabel("Precision：—", card)
         self.recall_label = BodyLabel("Recall：—", card)
-        self.auroc_label = BodyLabel("AUROC：—", card)
         for lbl in (self.epoch_label, self.loss_label, self.map_label,
-                    self.prec_label, self.recall_label, self.auroc_label):
+                    self.prec_label, self.recall_label):
             metric_row.addWidget(lbl)
         metric_row.addStretch(1)
         layout.addLayout(metric_row)
@@ -162,8 +166,12 @@ class TrainTab(BasePage):
             for name in AnomalibService.available_models():
                 self.model_combo.addItem(name, userData=name)
         else:
+            suffix = TASK_MODEL_SUFFIX.get(task, "")
             for variant in YOLO_MODEL_VARIANTS:
-                self.model_combo.addItem(variant["label"], userData=variant["key"])
+                self.model_combo.addItem(
+                    f"{variant['label']}{suffix}",
+                    userData=f"{variant['key']}{suffix}",
+                )
         is_anomaly = task == "anomaly"
         self._form.setRowVisible(self._row_anomaly, is_anomaly)
         self._form.setRowVisible(self._row_dataset, not is_anomaly)
@@ -202,6 +210,22 @@ class TrainTab(BasePage):
 
     def _on_config(self, config) -> None:
         self.dataset_label.setText(config.data_yaml or "—")
+        self.sync_from_config()
+
+    def sync_from_config(self) -> None:
+        """按训练配置同步任务类型与模型下拉（项目类型变化时调用）。"""
+        config = self._vm.config
+        index = self.task_combo.findData(config.task_type)
+        if index >= 0 and self.task_combo.currentIndex() != index:
+            self.task_combo.blockSignals(True)
+            self.task_combo.setCurrentIndex(index)
+            self.task_combo.blockSignals(False)
+            self._on_task_changed()
+        model_index = self.model_combo.findData(config.model_key)
+        if model_index >= 0:
+            self.model_combo.blockSignals(True)
+            self.model_combo.setCurrentIndex(model_index)
+            self.model_combo.blockSignals(False)
 
     def _on_status(self, status: str) -> None:
         running = status == "running"
@@ -213,15 +237,22 @@ class TrainTab(BasePage):
         self.progress_label.setText(f"进度：{value * 100:.0f}%")
 
     def _on_metrics(self, metrics: dict) -> None:
+        """按任务类型显示对应指标：检测/分割看 mAP，分类看准确率，异常检测看 AUROC。"""
         epoch = metrics.get("epoch")
         if epoch:
             self.epoch_label.setText(f"Epoch：{epoch} / {metrics.get('total', '—')}")
         self.loss_label.setText(f"Loss：{metrics.get('loss', '—')}")
-        self.map_label.setText(f"mAP50：{metrics.get('mAP50', '—')}")
-        self.prec_label.setText(f"Precision：{metrics.get('precision', '—')}")
-        self.recall_label.setText(f"Recall：{metrics.get('recall', '—')}")
-        if metrics.get("auroc") is not None:
-            self.auroc_label.setText(f"AUROC：{metrics['auroc']}")
+
+        if metrics.get("main_label"):
+            self.map_label.setText(
+                f"{metrics['main_label']}：{metrics.get('main_value', '—')}"
+            )
+        for label, prefix in ((self.prec_label, "sub1"), (self.recall_label, "sub2")):
+            text = metrics.get(f"{prefix}_label")
+            if text:
+                label.setText(f"{text}：{metrics.get(f'{prefix}_value', '—')}")
+            else:
+                label.setText("")
 
     def _on_log(self, line: str) -> None:
         self.log_edit.append(line)

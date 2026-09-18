@@ -68,6 +68,26 @@ def main(argv: list[str] | None = None) -> int:
                     metrics[str(key)] = float(value)
                 except (TypeError, ValueError):
                     continue
+            if "train/loss" not in metrics:
+                # 部分任务的 loss 不在 metrics 里，用 loss_items 兜底
+                # （分类返回 dict，检测返回张量，这里统一只累加数值项）
+                loss_items = getattr(trainer, "loss_items", None)
+                if isinstance(loss_items, dict):
+                    candidates = list(loss_items.values())
+                elif loss_items is None:
+                    candidates = []
+                elif hasattr(loss_items, "tolist"):
+                    candidates = loss_items.tolist()
+                else:
+                    candidates = list(loss_items)
+                numbers: list[float] = []
+                for item in candidates:
+                    try:
+                        numbers.append(float(item))
+                    except (TypeError, ValueError):
+                        continue
+                if numbers:
+                    metrics["train/loss"] = float(sum(numbers))
             emit({
                 "type": "epoch",
                 "epoch": int(getattr(trainer, "epoch", 0)) + 1,

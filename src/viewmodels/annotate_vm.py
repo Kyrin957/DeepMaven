@@ -19,6 +19,7 @@ from src.services.autolabel_service import (
     AutoLabelService,
 )
 from src.services.dataset_service import DatasetService
+from src.utils.constants import PROJECT_ANNOTATION
 from src.utils.logger import get_logger
 from src.utils.workers import FunctionWorker
 from src.viewmodels.dataset_vm import DatasetViewModel
@@ -33,6 +34,7 @@ class AnnotateViewModel(QObject):
     imageListChanged = Signal(list)      # list[Path]
     imageChanged = Signal(int)           # 当前图片索引
     annotationLoaded = Signal(object)    # ImageAnnotation（无图片时为 None）
+    noteLoaded = Signal(str)             # 当前图片的备注文本
     statusChanged = Signal(int, int)     # 已标注张数, 总张数
     taskStarted = Signal(str)            # 后台任务开始（任务名）
     taskProgress = Signal(int, str)      # 百分比, 描述
@@ -84,43 +86,110 @@ class AnnotateViewModel(QObject):
         return None
 
     def label_dir(self) -> Path | None:
-        """标签输出目录：<数据集来源>/labels。"""
-        dataset = self._dataset_vm.dataset if self._dataset_vm else None
-        if dataset is None or not dataset.source_path:
+        """标签输出目录：<数据集来源>/labels（源目录缺失时用归档恢复目录）。"""
+        if self._dataset_vm is None:
             return None
-        return Path(dataset.source_path) / "labels"
+        return self._dataset_vm.label_dir()
 
     def class_items(self) -> list:
         """当前项目的缺陷类别定义。"""
         project = self._project_vm.project if self._project_vm else None
         return list(project.classes) if project is not None else []
 
+    # -----------------------------------------------------------
+    # 备注（以 sidecar 文本落盘，避免每次编辑都重打包项目）
+    # -----------------------------------------------------------
+    def notes_dir(self) -> Path | None:
+        """备注目录：项目文件同级的 `notes/`。
+
+        不放在数据集来源目录里 —— 否则 `.txt` 备注会被数据集扫描当成
+        YOLO 标签文件，污染类别列表与标注判定。
+        """
+        project = self._project_vm.project if self._project_vm else None
+        if project is None:
+            return None
+        path = str(project.params.get("path", "") or "")
+        if not path:
+            return None
+        return Path(path).parent / "notes"
+
+    def load_note(self, image_path) -> str:
+        """读取某张图片的备注。"""
+        notes = self.notes_dir()
+        if notes is None or image_path is None:
+            return ""
+        file = notes / f"{Path(image_path).stem}.txt"
+        try:
+            return file.read_text(encoding="utf-8") if file.is_file() else ""
+        except OSError as exc:
+            logger.warning("读取备注失败: %s", exc)
+            return ""
+
+    def save_note(self, image_path, text: str) -> None:
+        """保存某张图片的备注（空内容则删除文件）。"""
+        notes = self.notes_dir()
+        if notes is None or image_path is None:
+            return
+        file = notes / f"{Path(image_path).stem}.txt"
+        try:
+            if text.strip():
+                notes.mkdir(parents=True, exist_ok=True)
+                file.write_text(text, encoding="utf-8")
+            elif file.is_file():
+                file.unlink()
+        except OSError as exc:
+            logger.warning("保存备注失败: %s", exc)
+
     def annotated_count(self) -> int:
+        """已标注张数（与图库 / 检查页共用同一判定口径）。"""
+        if self._dataset_vm is not None:
+            return self._dataset_vm.annotated_count()
         label_dir = self.label_dir()
         if label_dir is None:
             return 0
         return sum(
             1 for image in self._images
-            if AnnotationService.label_path_for(image, label_dir).is_file()
+            if DatasetService.label_has_content(
+                AnnotationService.label_path_for(image, label_dir)
+            )
         )
 
     def annotated_flags(self) -> list[bool]:
-        """每张图片是否已有标签文件（用于缩略图着色）。"""
+        """每张图片是否已标注（用于缩略图角标）。"""
+        if self._dataset_vm is not None:
+            return self._dataset_vm.annotated_flags()
         label_dir = self.label_dir()
         if label_dir is None:
             return [False] * len(self._images)
         return [
-            AnnotationService.label_path_for(image, label_dir).is_file()
+            DatasetService.label_has_content(
+                AnnotationService.label_path_for(image, label_dir)
+            )
             for image in self._images
         ]
+
+    def notify(self, text: str, level: str = "info") -> None:
+        """供界面反馈本地操作结果的提示通道。"""
+        self.message.emit(level, text)
+
+    def annotation_mode(self) -> str:
+        """当前项目的标注方式：none / box / obb / polygon。"""
+        project = self._project_vm.project if self._project_vm else None
+        if project is None:
+            return "box"
+        return PROJECT_ANNOTATION.get(project.model_type, "box")
+
+    def mark_dirty(self) -> None:
+        """画布等外部修改了标注内容后标记为待保存。"""
+        self._dirty = True
 
     # -----------------------------------------------------------
     # 命令
     # -----------------------------------------------------------
     def refresh(self) -> None:
-        """按当前数据集重建图片列表。"""
-        dataset = self._dataset_vm.dataset if self._dataset_vm else None
-        if dataset is None or not dataset.source_path:
+        """按当前数据集重建图片列表（源目录缺失时从项目归档恢复）。"""
+        source = self._dataset_vm.resolved_source() if self._dataset_vm else None
+        if source is None:
             self._images = []
             self._index = -1
             self._current = None
@@ -129,7 +198,11 @@ class AnnotateViewModel(QObject):
             self.statusChanged.emit(0, 0)
             return
 
-        self._images = DatasetService.scan_images(dataset.source_path)
+        self._images = (
+            self._dataset_vm.images(refresh=True)
+            if self._dataset_vm is not None
+            else DatasetService.scan_images(source)
+        )
         self.imageListChanged.emit(list(self._images))
         if not self._images:
             self._index = -1
@@ -139,6 +212,17 @@ class AnnotateViewModel(QObject):
             return
         self._index = -1
         self.set_current(0)
+
+    def set_image_by_path(self, path) -> int:
+        """按路径定位图片并切换过去；未找到返回 -1。"""
+        if path is None:
+            return -1
+        target = Path(path)
+        for index, image in enumerate(self._images):
+            if image == target:
+                self.set_current(index)
+                return index
+        return -1
 
     def set_current(self, index: int) -> None:
         """切换当前图片（自动保存上一张的未保存改动）。"""
@@ -163,6 +247,7 @@ class AnnotateViewModel(QObject):
         self._dirty = False
         self.imageChanged.emit(index)
         self.annotationLoaded.emit(annotation)
+        self.noteLoaded.emit(self.load_note(path))
         self._emit_status()
 
     def next_image(self) -> None:

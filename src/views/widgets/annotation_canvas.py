@@ -7,8 +7,18 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QPainter, QPen, QPixmap, QPolygonF
+import math
+
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QImage,
+    QPainter,
+    QPen,
+    QPixmap,
+    QPolygonF,
+)
 from PySide6.QtWidgets import (
     QGraphicsPolygonItem,
     QGraphicsRectItem,
@@ -30,8 +40,10 @@ class AnnotationCanvas(QGraphicsView):
     """标注画布。"""
 
     annotationAdded = Signal(int, str, list)   # cls_id, kind, 归一化点列
+    annotationChanged = Signal()               # 已有标注被修改（如旋转）
     deleteRequested = Signal()
     selectionChanged = Signal(int)             # 选中索引，-1 表示无
+    viewChanged = Signal()                     # 视口/缩放变化（供导航器同步）
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -46,6 +58,11 @@ class AnnotationCanvas(QGraphicsView):
 
         self._img_w = 0
         self._img_h = 0
+        self._pixmap_item = None
+        self._auto_fit = True        # 当前缩放是否由「自动适配」产生
+        self._source_image: QImage | None = None
+        self._brightness = 0
+        self._contrast = 0
         self._mode = MODE_BOX
         self._classes: list = []
         self._pending_class = 0
@@ -94,16 +111,81 @@ class AnnotationCanvas(QGraphicsView):
         self._shapes = []
         self._selected = -1
         self._poly_preview = None
+        self._pixmap_item = None
 
         pixmap = QPixmap(str(path))
         if pixmap.isNull():
             self._img_w = self._img_h = 0
+            self._source_image = None
             return
+        self._source_image = pixmap.toImage()
         self._img_w = pixmap.width()
         self._img_h = pixmap.height()
-        item = self._scene.addPixmap(pixmap)
+        self._pixmap_item = self._scene.addPixmap(pixmap)
         self._scene.setSceneRect(QRectF(pixmap.rect()))
-        self.fitInView(item, Qt.AspectRatioMode.KeepAspectRatio)
+        self._auto_fit = True
+        self._apply_adjust()
+        self._fit()
+
+    # -----------------------------------------------------------
+    # 亮度 / 对比度
+    # -----------------------------------------------------------
+    def set_brightness(self, value: int) -> None:
+        """亮度 -100 ~ 100（调整显示，不影响保存的像素）。"""
+        self._brightness = max(-100, min(100, int(value)))
+        self._apply_adjust()
+
+    def set_contrast(self, value: int) -> None:
+        """对比度 -100 ~ 100。"""
+        self._contrast = max(-100, min(100, int(value)))
+        self._apply_adjust()
+
+    def reset_adjust(self) -> None:
+        self._brightness = 0
+        self._contrast = 0
+        self._apply_adjust()
+
+    @property
+    def brightness(self) -> int:
+        return self._brightness
+
+    @property
+    def contrast(self) -> int:
+        return self._contrast
+
+    def _apply_adjust(self) -> None:
+        """把亮度/对比度作用到显示用位图（保持当前缩放与平移不变）。"""
+        if self._pixmap_item is None or self._source_image is None:
+            return
+        image = self._source_image
+        if self._brightness or self._contrast:
+            image = self._adjust_image(image)
+        self._pixmap_item.setPixmap(QPixmap.fromImage(image))
+
+    def _adjust_image(self, image: QImage) -> QImage:
+        try:
+            import cv2
+            import numpy as np
+        except ImportError:
+            return image
+        try:
+            width, height = image.width(), image.height()
+            converted = image.convertToFormat(QImage.Format.Format_RGB888)
+            bits = converted.constBits()
+            array = np.frombuffer(bits, dtype=np.uint8, count=converted.sizeInBytes())
+            array = array.reshape((height, converted.bytesPerLine()))[:, : width * 3]
+            array = array.reshape((height, width, 3))
+            alpha = 1.0 + self._contrast / 100.0
+            beta = float(self._brightness) * 2.0
+            adjusted = cv2.convertScaleAbs(array, alpha=alpha, beta=beta)
+            adjusted = np.ascontiguousarray(adjusted)
+            result = QImage(
+                adjusted.data, width, height, width * 3,
+                QImage.Format.Format_RGB888,
+            )
+            return result.copy()
+        except (cv2.error, ValueError):
+            return image
 
     def set_annotations(self, items: list) -> None:
         """重建标注图形。"""
@@ -196,12 +278,23 @@ class AnnotationCanvas(QGraphicsView):
     # -----------------------------------------------------------
     # 鼠标 / 键盘
     # -----------------------------------------------------------
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        super().showEvent(event)
+        if self._auto_fit:
+            QTimer.singleShot(0, self._fit)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        super().resizeEvent(event)
+        if self._auto_fit:
+            QTimer.singleShot(0, self._fit)
+
     def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         position = event.position().toPoint()
         scene_pos = self.mapToScene(position)
 
         if event.button() == Qt.MouseButton.MiddleButton:
             self._panning = True
+            self._auto_fit = False
             self._pan_start = position
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
             return
@@ -284,8 +377,40 @@ class AnnotationCanvas(QGraphicsView):
         super().mouseDoubleClickEvent(event)
 
     def wheelEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        self._auto_fit = False
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
         self.scale(factor, factor)
+        self.viewChanged.emit()
+
+    def scrollContentsBy(self, dx: int, dy: int) -> None:  # noqa: N802 - Qt 命名
+        super().scrollContentsBy(dx, dy)
+        self.viewChanged.emit()
+
+    # -----------------------------------------------------------
+    # 视口（供导航器使用）
+    # -----------------------------------------------------------
+    def visible_scene_rect_normalized(self) -> QRectF:
+        """当前可见区域在图片坐标系下的归一化矩形。"""
+        if not self._img_w or not self._img_h:
+            return QRectF()
+        rect = self.mapToScene(self.viewport().rect()).boundingRect()
+        return QRectF(
+            rect.left() / self._img_w,
+            rect.top() / self._img_h,
+            rect.width() / self._img_w,
+            rect.height() / self._img_h,
+        )
+
+    def center_on_normalized(self, x: float, y: float) -> None:
+        """把画布中心移动到指定归一化坐标。"""
+        if not self._img_w or not self._img_h:
+            return
+        self.centerOn(x * self._img_w, y * self._img_h)
+
+    def fit_to_view(self) -> None:
+        """恢复为「适应窗口」缩放。"""
+        self._auto_fit = True
+        self._fit()
 
     def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
@@ -300,6 +425,57 @@ class AnnotationCanvas(QGraphicsView):
     # -----------------------------------------------------------
     # 内部
     # -----------------------------------------------------------
+    def _fit(self) -> None:
+        """按当前视口尺寸适配图片。
+
+        标注页可能尚未显示（或刚创建、未完成布局）就载入了图片，此时视口尺寸
+        不正确，算出的缩放会明显偏小；因此适配会在 showEvent / resizeEvent
+        中重做，直到用户手动缩放或平移（`_auto_fit` 置 False）为止。
+        """
+        if self._pixmap_item is None:
+            return
+        if self.viewport().width() <= 1 or self.viewport().height() <= 1:
+            return
+        self.fitInView(self._pixmap_item, Qt.AspectRatioMode.KeepAspectRatio)
+        self.viewChanged.emit()
+
+    def rotate_selected(self, delta_deg: float) -> bool:
+        """把选中的标注绕自身中心旋转指定角度。
+
+        矩形会先转换为四点多边形 —— 这正好是 YOLO 旋转框（OBB）的标注格式，
+        因此旋转框任务无需额外的数据格式支持。
+        """
+        if not (0 <= self._selected < len(self._items)):
+            return False
+        item = self._items[self._selected]
+        if item.kind == BOX:
+            x1, y1, x2, y2 = item.bounds()
+            item.points = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+            item.kind = POLYGON
+        points = list(item.points)
+        if not points:
+            return False
+
+        center_x = sum(p[0] for p in points) / len(points)
+        center_y = sum(p[1] for p in points) / len(points)
+        radians = math.radians(float(delta_deg))
+        cos_a, sin_a = math.cos(radians), math.sin(radians)
+        item.points = [
+            (
+                min(max(center_x + (x - center_x) * cos_a - (y - center_y) * sin_a, 0.0), 1.0),
+                min(max(center_y + (x - center_x) * sin_a + (y - center_y) * cos_a, 0.0), 1.0),
+            )
+            for x, y in points
+        ]
+
+        self._scene.removeItem(self._shapes[self._selected])
+        shape = self._make_shape(item)
+        self._scene.addItem(shape)
+        self._shapes[self._selected] = shape
+        self._apply_selection()
+        self.annotationChanged.emit()
+        return True
+
     def _select_at(self, scene_pos: QPointF) -> None:
         for index in range(len(self._shapes) - 1, -1, -1):
             if self._shapes[index].contains(scene_pos):

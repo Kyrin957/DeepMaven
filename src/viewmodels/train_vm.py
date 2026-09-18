@@ -25,6 +25,15 @@ def _pick(metrics: dict, keys: tuple) -> float:
     return 0.0
 
 
+# 可训练的任务类型：项目类型直接对应训练任务，其余（如语义分割）回退为对象检测
+_TRAIN_TASKS = ("detect", "obb", "segment", "classify", "anomaly")
+
+
+def _task_of(model_type: str) -> str:
+    """项目类型 → 训练任务。"""
+    return model_type if model_type in _TRAIN_TASKS else "detect"
+
+
 class TrainViewModel(QObject):
     """模型训练页的业务逻辑。
 
@@ -54,6 +63,18 @@ class TrainViewModel(QObject):
         self._service.finished.connect(self._on_finished)
         self._service.failed.connect(self._on_failed)
 
+    def load_from_project(self, project) -> None:
+        """打开 / 新建项目后把配置绑定到项目：后续修改直接进入项目并随保存落盘。
+
+        项目类型会决定训练任务（分类 / 检测 / 旋转框 / 分割 / 异常检测）。
+        """
+        self._config = project.training if project is not None else TrainingConfig()
+        if project is not None:
+            self._config.task_type = _task_of(project.model_type)
+        self.configChanged.emit(self._config)
+        self.statusChanged.emit(self._config.status)
+        self.progressChanged.emit(self._config.progress)
+
     # -----------------------------------------------------------
     # 查询
     # -----------------------------------------------------------
@@ -71,7 +92,14 @@ class TrainViewModel(QObject):
         for key, value in kwargs.items():
             if hasattr(self._config, key):
                 setattr(self._config, key, value)
+        self._mark_dirty()
         self.configChanged.emit(self._config)
+
+    def _mark_dirty(self) -> None:
+        """配置已绑定到项目时，把项目标记为有未保存变更。"""
+        project = self._project_vm.project if self._project_vm else None
+        if project is not None and self._config is project.training:
+            project.touch()
 
     def set_task_type(self, task_type: str) -> None:
         self.update_config(task_type=task_type)
@@ -98,6 +126,10 @@ class TrainViewModel(QObject):
         elif not self._config.data_yaml:
             self.message.emit("warning", "请先在数据管理页完成划分，生成数据集配置")
             return
+
+        # 训练参数随项目持久化，避免程序重启后丢失
+        if self._project_vm is not None and self._project_vm.has_project():
+            self._project_vm.save_project()
 
         self._config.progress = 0.0
         self._config.current_epoch = 0
@@ -149,19 +181,28 @@ class TrainViewModel(QObject):
         """处理评估阶段汇总指标（异常检测的 AUROC 等）。"""
         auroc = _pick(metrics, ("image_AUROC", "image_AUROC_macro", "pixel_AUROC"))
         if auroc:
-            self.metricsChanged.emit({"auroc": round(auroc, 4)})
+            self.metricsChanged.emit({
+                "auroc": round(auroc, 4),
+                "main_label": "AUROC",
+                "main_value": round(auroc, 4),
+                "sub1_label": "",
+                "sub2_label": "",
+            })
             self.logAppended.emit(f"AUROC = {auroc:.4f}")
 
     def _apply_epoch(self, event: dict) -> None:
         epoch = int(event.get("epoch", 0))
         total = int(event.get("total", 0)) or 1
         metrics = event.get("metrics") or {}
+        task = self._config.task_type
 
         loss = _pick(metrics, ("train/box_loss", "train/loss", "val/box_loss"))
         mAP50 = _pick(metrics, ("metrics/mAP50(B)", "metrics/mAP50"))
         precision = _pick(metrics, ("metrics/precision(B)", "metrics/precision"))
         recall = _pick(metrics, ("metrics/recall(B)", "metrics/recall"))
         auroc = _pick(metrics, ("image_AUROC", "image_AUROC_macro", "pixel_AUROC"))
+        top1 = _pick(metrics, ("metrics/accuracy_top1",))
+        top5 = _pick(metrics, ("metrics/accuracy_top5",))
 
         self._config.current_epoch = epoch
         self._config.progress = min(epoch / total, 1.0)
@@ -170,7 +211,21 @@ class TrainViewModel(QObject):
         self._config.precision = precision
         self._config.recall = recall
 
-        self.progressChanged.emit(self._config.progress)
+        # 不同任务的评价指标不同：分类看 top1/top5，异常检测看 AUROC，检测/分割看 mAP
+        sub1: tuple | None
+        sub2: tuple | None
+        if task == "classify":
+            main: tuple = ("Top1 准确率", top1)
+            sub1 = ("Top5 准确率", top5) if top5 else None
+            sub2 = None
+        elif task == "anomaly":
+            main = ("AUROC", auroc)
+            sub1 = sub2 = None
+        else:
+            main = ("mAP50", mAP50)
+            sub1 = ("Precision", precision)
+            sub2 = ("Recall", recall)
+
         payload = {
             "epoch": epoch,
             "total": total,
@@ -178,12 +233,18 @@ class TrainViewModel(QObject):
             "mAP50": round(mAP50, 4),
             "precision": round(precision, 4),
             "recall": round(recall, 4),
+            "main_label": main[0],
+            "main_value": round(main[1], 4),
+            "sub1_label": sub1[0] if sub1 else "",
+            "sub1_value": round(sub1[1], 4) if sub1 else None,
+            "sub2_label": sub2[0] if sub2 else "",
+            "sub2_value": round(sub2[1], 4) if sub2 else None,
         }
-        if auroc:
-            payload["auroc"] = round(auroc, 4)
+
+        self.progressChanged.emit(self._config.progress)
         self.metricsChanged.emit(payload)
         self.logAppended.emit(
-            f"Epoch {epoch}/{total}  loss={loss:.4f}  mAP50={mAP50:.4f}"
+            f"Epoch {epoch}/{total}  loss={loss:.4f}  {main[0]}={main[1]:.4f}"
         )
 
     def _on_finished(self, code: int, summary: dict) -> None:
@@ -227,6 +288,15 @@ class TrainViewModel(QObject):
                 items.append(("run", "runs/results.csv", results.read_bytes()))
         if not items:
             return
+
+        # 训练产物同时作为「模型评估 / 模型导出」的默认权重，避免用户重复选择
+        best = str(summary.get("best") or "")
+        if best:
+            if not project.evaluation.weights_path:
+                project.evaluation.weights_path = best
+            if not project.export.weights_path:
+                project.export.weights_path = best
+            project.touch()
 
         try:
             self._project_vm.service.add_files(project, items, save=True)

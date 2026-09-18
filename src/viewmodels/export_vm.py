@@ -10,6 +10,7 @@ from src.models.training import ExportConfig
 from src.services.export_service import ExportService
 from src.utils.logger import get_logger
 from src.utils.workers import FunctionWorker
+from src.viewmodels.project_vm import ProjectViewModel
 
 logger = get_logger("export_vm")
 
@@ -26,10 +27,30 @@ class ExportViewModel(QObject):
     taskFailed = Signal(str)
     message = Signal(str, str)           # level, text
 
-    def __init__(self, parent: QObject | None = None):
+    def __init__(
+        self,
+        project_vm: ProjectViewModel | None = None,
+        parent: QObject | None = None,
+    ):
         super().__init__(parent)
+        self._project_vm = project_vm
         self._config = ExportConfig(output_dir="runs/export")
         self._worker: FunctionWorker | None = None
+
+    def load_from_project(self, project) -> None:
+        """打开 / 新建项目后把导出参数绑定到项目。"""
+        self._config = (
+            project.export if project is not None
+            else ExportConfig(output_dir="runs/export")
+        )
+        self.configChanged.emit(self._config)
+
+    def _emit(self) -> None:
+        """配置变更：标记项目待保存并广播。"""
+        project = self._project_vm.project if self._project_vm else None
+        if project is not None and self._config is project.export:
+            project.touch()
+        self.configChanged.emit(self._config)
 
     @property
     def config(self) -> ExportConfig:
@@ -43,31 +64,31 @@ class ExportViewModel(QObject):
     # -----------------------------------------------------------
     def set_format(self, fmt: str) -> None:
         self._config.format = fmt
-        self.configChanged.emit(self._config)
+        self._emit()
 
     def set_weights(self, path: str) -> None:
         self._config.weights_path = path
-        self.configChanged.emit(self._config)
+        self._emit()
 
     def set_output_dir(self, path: str) -> None:
         self._config.output_dir = path
-        self.configChanged.emit(self._config)
+        self._emit()
 
     def set_imgsz(self, value: int) -> None:
         self._config.imgsz = int(value)
-        self.configChanged.emit(self._config)
+        self._emit()
 
     def set_opset(self, value: int) -> None:
         self._config.opset = int(value)
-        self.configChanged.emit(self._config)
+        self._emit()
 
     def set_dynamic(self, enabled: bool) -> None:
         self._config.dynamic = bool(enabled)
-        self.configChanged.emit(self._config)
+        self._emit()
 
     def set_simplify(self, enabled: bool) -> None:
         self._config.simplify = bool(enabled)
-        self.configChanged.emit(self._config)
+        self._emit()
 
     # -----------------------------------------------------------
     # 执行

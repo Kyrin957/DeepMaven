@@ -13,6 +13,7 @@ from PySide6.QtCore import QObject, QProcess, Signal
 
 from src.models.training import TrainingConfig
 from src.utils.constants import PROJECT_ROOT
+from src.utils.device import normalize_device
 from src.utils.logger import get_logger
 
 logger = get_logger("train")
@@ -57,7 +58,8 @@ class TrainService(QObject):
                     f"异常检测数据目录不存在：{config.anomaly_root or '（未设置）'}"
                 )
                 return False
-        elif not config.data_yaml or not Path(config.data_yaml).is_file():
+        elif not config.data_yaml or not Path(config.data_yaml).exists():
+            # 检测/分割为 data.yaml 文件；分类任务直接使用数据集目录
             self.failed.emit(f"数据集配置不存在：{config.data_yaml or '（未设置）'}")
             return False
 
@@ -124,7 +126,7 @@ class TrainService(QObject):
             "--imgsz", str(config.imgsz),
             "--lr", str(config.lr),
             "--optimizer", config.optimizer,
-            "--device", config.device,
+            "--device", normalize_device(config.device),
             "--workers", str(config.workers),
             "--seed", str(config.seed),
             "--project", config.project_dir or str(PROJECT_ROOT / "runs"),

@@ -54,34 +54,48 @@ class EvaluateViewModel(QObject):
     def is_busy(self) -> bool:
         return self._worker is not None and self._worker.isRunning()
 
+    def load_from_project(self, project) -> None:
+        """打开 / 新建项目后把评估参数绑定到项目。"""
+        self._config = (
+            project.evaluation if project is not None else EvaluationConfig()
+        )
+        self.configChanged.emit(self._config)
+
+    def _emit(self) -> None:
+        """配置变更：标记项目待保存并广播。"""
+        project = self._project_vm.project if self._project_vm else None
+        if project is not None and self._config is project.evaluation:
+            project.touch()
+        self.configChanged.emit(self._config)
+
     # -----------------------------------------------------------
     # 配置
     # -----------------------------------------------------------
     def set_source(self, source_type: str) -> None:
         self._config.source_type = source_type
-        self.configChanged.emit(self._config)
+        self._emit()
 
     def set_weights(self, path: str) -> None:
         self._config.weights_path = path
-        self.configChanged.emit(self._config)
+        self._emit()
 
     def set_source_path(self, path: str) -> None:
         self._config.source_path = path
-        self.configChanged.emit(self._config)
+        self._emit()
 
     def set_thresholds(self, confidence: float, iou: float) -> None:
         self._config.confidence = confidence
         self._config.iou = iou
-        self.configChanged.emit(self._config)
+        self._emit()
 
     def set_device(self, device: str) -> None:
         self._config.device = device
-        self.configChanged.emit(self._config)
+        self._emit()
 
     def set_anomaly_model(self, name: str) -> None:
         if name:
             self._config.anomaly_model = name
-            self.configChanged.emit(self._config)
+            self._emit()
 
     # -----------------------------------------------------------
     # 异常检测（Anomalib）

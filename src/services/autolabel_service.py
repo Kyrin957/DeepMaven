@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Callable
 
 from src.models.annotation import BOX, Annotation
+from src.utils.device import normalize_device
 from src.utils.logger import get_logger
 
 logger = get_logger("autolabel")
@@ -79,7 +80,7 @@ class AutoLabelService:
             source=[str(p) for p in paths],
             conf=conf,
             iou=iou,
-            device=device,
+            device=normalize_device(device),
             verbose=False,
         )
 
@@ -88,7 +89,10 @@ class AutoLabelService:
         for index, result in enumerate(results):
             if is_cancelled():
                 break
-            output[Path(result.path).name] = AutoLabelService.boxes_to_annotations(result)
+            # Ultralytics 批量推理时 result.path 可能是 image0.jpg 这类序号名，
+            # 必须按「输入顺序」回填真实文件名，否则结果无法与图片对应。
+            name = paths[index].name if index < len(paths) else Path(result.path).name
+            output[name] = AutoLabelService.boxes_to_annotations(result)
             progress(5 + int(90 * (index + 1) / total), f"已处理 {index + 1}/{total}")
         progress(100, "预标注完成")
         return output

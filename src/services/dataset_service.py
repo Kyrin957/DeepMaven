@@ -8,7 +8,12 @@ import shutil
 from pathlib import Path
 
 from src.models.dataset import Dataset
-from src.utils.constants import IMAGE_EXTS, LABEL_EXTS, SPLIT_SUBDIRS
+from src.utils.constants import (
+    IMAGE_EXTS,
+    LABEL_EXTS,
+    SPLIT_SUBDIRS,
+    UNLABELED_LABEL,
+)
 from src.utils.logger import get_logger
 
 logger = get_logger("dataset")
@@ -43,11 +48,15 @@ class DatasetService:
 
     @staticmethod
     def scan_labels(directory: str | Path) -> list[Path]:
-        """扫描目录下的所有标签文件（.txt）。"""
+        """扫描目录下的所有标签文件（.txt）。
+
+        跳过 `notes/` 子目录：图片备注同样是 `.txt`，不应被当作 YOLO 标签。
+        """
         directory = Path(directory)
         return [
             p for p in sorted(directory.rglob("*"))
             if p.is_file() and p.suffix.lower() in LABEL_EXTS
+            and "notes" not in p.relative_to(directory).parts
         ]
 
     # -----------------------------------------------------------
@@ -103,13 +112,40 @@ class DatasetService:
                         stripped = line.strip()
                         if not stripped:
                             continue
-                        cls_id = stripped.split()[0]
+                        # 只认 YOLO 标签行（首字段为整数类别 id），
+                        # 其它 .txt（备注、说明等）一律忽略，避免污染类别列表
+                        try:
+                            cls_id = str(int(float(stripped.split()[0])))
+                        except ValueError:
+                            continue
                         class_counts[cls_id] = class_counts.get(cls_id, 0) + 1
                         if cls_id not in class_names:
                             class_names.append(cls_id)
             except OSError as exc:
                 logger.warning("读取标签失败 %s: %s", label, exc)
         return class_names, class_counts
+
+    @staticmethod
+    def child_class_dirs(directory: str | Path) -> dict[str, list[Path]]:
+        """分类数据集：把「含图片的直接子目录」识别为类别。
+
+        Returns:
+            {类别名: [该类别下的图片路径, ...]}，按类别名排序。
+        """
+        directory = Path(directory)
+        if not directory.is_dir():
+            return {}
+        result: dict[str, list[Path]] = {}
+        for child in sorted(directory.iterdir()):
+            if not child.is_dir():
+                continue
+            images = [
+                p for p in sorted(child.iterdir())
+                if p.is_file() and p.suffix.lower() in IMAGE_EXTS
+            ]
+            if images:
+                result[child.name] = images
+        return result
 
     # -----------------------------------------------------------
     # 导入统计
@@ -133,6 +169,15 @@ class DatasetService:
             duplicate_count=duplicate_count,
         )
         dataset.class_names, dataset.class_counts = DatasetService._accumulate_classes(labels)
+        if not dataset.class_names:
+            # 分类数据集没有标签文件，类别来自子目录名
+            folder_classes = DatasetService.child_class_dirs(directory)
+            if folder_classes:
+                dataset.class_names = list(folder_classes)
+                dataset.class_counts = {
+                    class_name: len(items)
+                    for class_name, items in folder_classes.items()
+                }
         return dataset
 
     @staticmethod
@@ -163,6 +208,13 @@ class DatasetService:
             duplicate_count=duplicate_count,
         )
         dataset.class_names, dataset.class_counts = DatasetService._accumulate_classes(labels)
+        if not dataset.class_names:
+            by_parent: dict[str, int] = {}
+            for image in images:
+                by_parent[image.parent.name] = by_parent.get(image.parent.name, 0) + 1
+            if len(by_parent) > 1:
+                dataset.class_names = sorted(by_parent)
+                dataset.class_counts = dict(sorted(by_parent.items()))
         return dataset
 
     # -----------------------------------------------------------
@@ -238,17 +290,28 @@ class DatasetService:
         return result
 
     @staticmethod
+    def _group_key(image: Path, label_index: dict, layout: str) -> tuple:
+        """分层抽样的分组键。
+
+        分类任务看图片所在的子目录名；检测/分割看标签里出现的类别组合。
+        """
+        if layout == "classify":
+            return (image.parent.name,)
+        return tuple(sorted(DatasetService._label_classes(label_index.get(image.stem))))
+
+    @staticmethod
     def split_members(
         images: list,
         label_index: dict,
         split: tuple[float, float, float] = (0.7, 0.2, 0.1),
         seed: int = 0,
         stratified: bool = True,
+        layout: str = "detect",
     ) -> dict[str, list[Path]]:
         """把图片分配到 train / val / test。
 
-        stratified=True 时按「类别组合」分层抽样，避免小类别整体落进同一子集；
-        样本数少于 3 的类别组合整体归入训练集，避免验证集出现单样本噪声。
+        stratified=True 时按分组键分层抽样，避免小类别整体落进同一子集；
+        样本数少于 3 的组整体归入训练集，避免验证集出现单样本噪声。
         """
         import random
 
@@ -268,9 +331,9 @@ class DatasetService:
             buckets["test"] = items[n_train + n_val:]
             return buckets
 
-        groups: dict[frozenset, list[Path]] = {}
+        groups: dict[tuple, list[Path]] = {}
         for image in items:
-            key = frozenset(DatasetService._label_classes(label_index.get(image.stem)))
+            key = DatasetService._group_key(image, label_index, layout)
             groups.setdefault(key, []).append(image)
 
         for key in sorted(groups, key=lambda k: sorted(k)):
@@ -301,30 +364,54 @@ class DatasetService:
         split: tuple[float, float, float] = (0.7, 0.2, 0.1),
         seed: int = 0,
         stratified: bool = True,
+        layout: str = "detect",
     ) -> dict:
-        """把图片（及同名标签）复制到 images + labels 的 train/val/test 结构。
+        """把图片（及同名标签）复制为可训练的 YOLO 数据集结构。
 
-        参照开发文档 6.2 节 YOLO 数据集结构：
-            dataset/images/{train,val,test}/
-            dataset/labels/{train,val,test}/
+        layout="detect"/"segment"（默认）：
+            dataset/images/{train,val,test}/ + dataset/labels/{train,val,test}/
+        layout="classify"：
+            dataset/{train,val,test}/<类别名>/  （Ultralytics 分类按目录扫描）
 
         Args:
-            stratified: 是否按类别分层抽样（默认开启）。
+            stratified: 是否分层抽样（分类任务恒按类别分层）。
+            layout: 数据集结构，detect / segment / classify。
 
         Returns:
-            统计字典：total 图片总数；train/val/test 各子集图片数；labels 已配对标签数。
+            统计字典：total / train / val / test / labels / layout。
         """
         source = Path(source_dir)
         target = Path(target_dir)
         images = DatasetService.scan_images(source)
-        stats = {"total": len(images), "train": 0, "val": 0, "test": 0, "labels": 0}
+        stats = {
+            "total": len(images), "train": 0, "val": 0, "test": 0,
+            "labels": 0, "linked": 0, "copied": 0, "layout": layout,
+        }
         if not images:
             logger.warning("无图片可划分: %s", source)
             return stats
 
+        if layout == "classify":
+            buckets = DatasetService.split_members(
+                images, {}, split=split, seed=seed,
+                stratified=True, layout="classify",
+            )
+            for sub in SPLIT_SUBDIRS:
+                for img in buckets[sub]:
+                    dest = target / sub / img.parent.name
+                    dest.mkdir(parents=True, exist_ok=True)
+                    DatasetService._count_place(stats, img, dest / img.name)
+                    stats[sub] += 1
+            logger.info(
+                "分类数据集划分完成 train=%s val=%s test=%s",
+                stats["train"], stats["val"], stats["test"],
+            )
+            return stats
+
         label_index = DatasetService.build_label_index(source)
         buckets = DatasetService.split_members(
-            images, label_index, split=split, seed=seed, stratified=stratified
+            images, label_index, split=split, seed=seed,
+            stratified=stratified, layout=layout,
         )
 
         for sub in SPLIT_SUBDIRS:
@@ -333,17 +420,162 @@ class DatasetService:
             img_dir.mkdir(parents=True, exist_ok=True)
             lab_dir.mkdir(parents=True, exist_ok=True)
             for img in buckets[sub]:
-                shutil.copy2(img, img_dir / img.name)
+                DatasetService._count_place(stats, img, img_dir / img.name)
                 stats[sub] += 1
                 label = label_index.get(img.stem)
                 if label is not None:
-                    shutil.copy2(label, lab_dir / label.name)
+                    DatasetService._place(label, lab_dir / label.name)
                     stats["labels"] += 1
         logger.info(
             "数据集划分完成（分层=%s）train=%s val=%s test=%s",
             stratified, stats["train"], stats["val"], stats["test"],
         )
         return stats
+
+    @staticmethod
+    def _place(source: Path, destination: Path) -> str:
+        """把文件放到目标位置：硬链接 → 软链接 → 复制（逐级回退）。
+
+        为什么不能只给一份「文件名清单」：
+            * **分类任务**：Ultralytics 的 `ClassificationDataset` 直接包装
+              `torchvision.datasets.ImageFolder`，只认 `root/<类别>/<图片>`
+              目录结构，传入 `.txt` 会被拒绝；
+            * **检测 / 分割**：虽然 `data.yaml` 接受 `.txt` 图片清单，但标签路径
+              由 `img2label_paths()` 从图片路径推导（`/images/` → `/labels/`），
+              并不读标签清单，因此仍需按 `images/ + labels/` 组织。
+
+        这里用链接代替复制：目录结构完整，但不额外占用磁盘
+        （跨盘且无法建链接时才回退为复制）。
+
+        Returns:
+            "linked" / "symlinked" / "copied"。
+        """
+        if destination.exists():
+            try:
+                destination.unlink()
+            except OSError:
+                pass
+        try:
+            os.link(source, destination)
+            return "linked"
+        except OSError:
+            pass
+        try:
+            os.symlink(source, destination)
+            return "symlinked"
+        except OSError:
+            shutil.copy2(source, destination)
+            return "copied"
+
+    @staticmethod
+    def _count_place(stats: dict, source: Path, destination: Path) -> None:
+        """放置文件并累计「链接 / 复制」计数。"""
+        mode = DatasetService._place(source, destination)
+        if mode == "copied":
+            stats["copied"] = stats.get("copied", 0) + 1
+        else:
+            stats["linked"] = stats.get("linked", 0) + 1
+
+    @staticmethod
+    def make_cover(image_path, size: int = 256, quality: int = 85) -> bytes | None:
+        """生成项目封面缩略图（JPEG 字节），失败返回 None。
+
+        服务层不依赖 Qt，因此用 PIL 实现。
+        """
+        try:
+            import io
+
+            from PIL import Image
+
+            with Image.open(image_path) as image:
+                image = image.convert("RGB")
+                image.thumbnail((size, size))
+                buffer = io.BytesIO()
+                image.save(buffer, "JPEG", quality=quality)
+            return buffer.getvalue()
+        except Exception as exc:  # noqa: BLE001 - 图片格式 / IO 异常类型较多
+            logger.warning("生成项目封面失败: %s", exc)
+            return None
+
+    @staticmethod
+    def label_has_content(path) -> bool:
+        """标签文件是否存在且非空。"""
+        try:
+            target = Path(path)
+            return target.is_file() and target.stat().st_size > 0
+        except OSError:
+            return False
+
+    @staticmethod
+    def image_class_name(image, label_index: dict, layout: str) -> str:
+        """图片所属类别名（分类看目录名，检测/分割看标签首个类别 id）。"""
+        return DatasetService._class_label_of(Path(image), label_index, layout)
+
+    @staticmethod
+    def _class_label_of(image: Path, label_index: dict, layout: str) -> str:
+        """图片所属类别名：分类看目录名，检测/分割看标签中的首个类别 id。"""
+        if layout == "classify":
+            return image.parent.name
+        label = label_index.get(image.stem)
+        if label is None:
+            return UNLABELED_LABEL
+        classes = DatasetService._label_classes(label)
+        if not classes:
+            return UNLABELED_LABEL
+        return str(sorted(classes)[0])
+
+    @staticmethod
+    def preview_split(
+        source_dir: str | Path,
+        split: tuple[float, float, float] = (0.7, 0.2, 0.1),
+        seed: int = 0,
+        stratified: bool = True,
+        layout: str = "detect",
+    ) -> dict:
+        """**不落盘**地计算划分结果，供界面预览（拆分页的饼图与类别分布）。
+
+        Returns:
+            {
+              "total": 图片总数,
+              "layout": 结构类型,
+              "subsets": {train/val/test: {"count": n, "classes": {类别: n}}},
+              "per_class": {类别: {"total": n, "train": n, "val": n, "test": n}},
+            }
+        """
+        source = Path(source_dir)
+        images = DatasetService.scan_images(source)
+        result: dict = {
+            "total": len(images), "layout": layout,
+            "subsets": {}, "per_class": {},
+        }
+        if not images:
+            return result
+
+        label_index = (
+            {} if layout == "classify"
+            else DatasetService.build_label_index(source)
+        )
+        buckets = DatasetService.split_members(
+            images, label_index, split=split, seed=seed,
+            stratified=stratified, layout=layout,
+        )
+
+        per_class: dict[str, dict] = {}
+        for sub in SPLIT_SUBDIRS:
+            counts: dict[str, int] = {}
+            for image in buckets[sub]:
+                name = DatasetService._class_label_of(image, label_index, layout)
+                counts[name] = counts.get(name, 0) + 1
+                entry = per_class.setdefault(
+                    name, {"total": 0, "train": 0, "val": 0, "test": 0}
+                )
+                entry["total"] += 1
+                entry[sub] += 1
+            result["subsets"][sub] = {
+                "count": len(buckets[sub]), "classes": counts,
+            }
+        result["per_class"] = per_class
+        return result
 
     # -----------------------------------------------------------
     # data.yaml 生成

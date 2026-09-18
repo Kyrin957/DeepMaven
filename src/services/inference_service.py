@@ -8,6 +8,7 @@ from __future__ import annotations
 import time
 from typing import Callable
 
+from src.utils.device import normalize_device
 from src.utils.logger import get_logger
 
 logger = get_logger("inference")
@@ -51,10 +52,10 @@ class InferenceService:
     # -----------------------------------------------------------
     @staticmethod
     def extract_records(result, frame: int | None = None) -> list[dict]:
-        """把推理结果中的检测框转为记录列表。"""
+        """把推理结果转为记录列表（同时支持检测框与分类概率）。"""
         boxes = getattr(result, "boxes", None)
         if boxes is None or len(boxes) == 0:
-            return []
+            return InferenceService.classification_records(result, frame)
 
         names = getattr(result, "names", {}) or {}
         xyxy = boxes.xyxy.cpu().numpy()
@@ -82,6 +83,68 @@ class InferenceService:
         return records
 
     @staticmethod
+    def classification_records(result, frame: int | None = None) -> list[dict]:
+        """分类结果：取 top1 类别与置信度。"""
+        probs = getattr(result, "probs", None)
+        if probs is None:
+            return []
+        names = getattr(result, "names", {}) or {}
+        try:
+            top1 = int(getattr(probs, "top1", 0))
+        except (TypeError, ValueError):
+            top1 = 0
+        try:
+            confidence = float(getattr(probs, "top1conf", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        record = {
+            "class_id": top1,
+            "class_name": names.get(top1, str(top1)),
+            "confidence": round(confidence, 4),
+        }
+        if frame is not None:
+            record["frame"] = frame
+        return [record]
+
+    @staticmethod
+    def classify_images(
+        weights: str, images: list, device: str = "auto",
+        progress: ProgressFn | None = None,
+        is_cancelled: CancelFn | None = None,
+    ) -> list[dict]:
+        """批量图像分类，返回 [{path, class_id, class_name, confidence}]。"""
+        progress = progress or _noop_progress
+        is_cancelled = is_cancelled or _noop_cancel
+        paths = [str(p) for p in images]
+        if not paths:
+            return []
+
+        model = InferenceService.load_model(weights)
+        results = model.predict(
+            source=paths, device=normalize_device(device), verbose=False
+        )
+
+        output: list[dict] = []
+        for index, result in enumerate(results):
+            if is_cancelled():
+                break
+            records = InferenceService.classification_records(result)
+            if not records:
+                continue
+            record = records[0]
+            # 批量推理时 result.path 可能是 image0.jpg 这类序号名，按输入顺序回填
+            record["path"] = str(paths[index]) if index < len(paths) else str(
+                getattr(result, "path", "")
+            )
+            output.append(record)
+            if index % 10 == 0 or index == len(results) - 1:
+                progress(
+                    int(100 * (index + 1) / len(results)),
+                    f"已分类 {index + 1}/{len(results)}",
+                )
+        return output
+
+    @staticmethod
     def plot(result):
         """绘制检测结果（BGR 数组），失败返回 None。"""
         try:
@@ -102,7 +165,8 @@ class InferenceService:
         model = InferenceService.load_model(weights)
         start = time.perf_counter()
         results = model.predict(
-            source=str(source), conf=conf, iou=iou, device=device, verbose=False
+            source=str(source), conf=conf, iou=iou,
+            device=normalize_device(device), verbose=False,
         )
         elapsed = time.perf_counter() - start
         if not results:
@@ -146,7 +210,8 @@ class InferenceService:
                     break
                 index += 1
                 results = model.predict(
-                    source=frame, conf=conf, iou=iou, device=device, verbose=False
+                    source=frame, conf=conf, iou=iou,
+                    device=normalize_device(device), verbose=False,
                 )
                 if results:
                     result = results[0]

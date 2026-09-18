@@ -6,10 +6,24 @@ from .annotation_canvas import (
     MODE_POLYGON,
     AnnotationCanvas,
 )
-from .thumbnail_grid import ThumbnailGrid
+from .charts import BarChart, LegendList, PieChart
+from .navigator import Navigator
+from .thumbnail_grid import (
+    THUMB_LARGE,
+    THUMB_MEDIUM,
+    THUMB_SMALL,
+    ThumbnailGrid,
+)
 
 __all__ = [
     "AnnotationCanvas",
+    "BarChart",
+    "LegendList",
+    "Navigator",
+    "PieChart",
+    "THUMB_LARGE",
+    "THUMB_MEDIUM",
+    "THUMB_SMALL",
     "ThumbnailGrid",
     "MODE_BROWSE",
     "MODE_BOX",

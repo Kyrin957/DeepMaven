@@ -10,6 +10,7 @@ from src.services.yolo_service import YOLOService
 from src.utils.constants import YOLO_MODEL_VARIANTS
 from src.utils.logger import get_logger
 from src.utils.workers import FunctionWorker
+from src.viewmodels.project_vm import ProjectViewModel
 
 logger = get_logger("model_vm")
 
@@ -26,12 +27,40 @@ class ModelViewModel(QObject):
     taskFailed = Signal(str)             # 失败描述
     message = Signal(str, str)           # level, text
 
-    def __init__(self, parent: QObject | None = None):
+    def __init__(
+        self,
+        project_vm: ProjectViewModel | None = None,
+        parent: QObject | None = None,
+    ):
         super().__init__(parent)
+        self._project_vm = project_vm
         self._variants = YOLO_MODEL_VARIANTS
         self._selected: dict = self._variants[0]
         self._weights: str = ""
         self._worker: FunctionWorker | None = None
+
+    def load_from_project(self, project) -> None:
+        """打开 / 新建项目后，恢复已选模型变体与自定义权重。"""
+        info = dict(getattr(project, "model", None) or {}) if project is not None else {}
+        key = str(info.get("key", ""))
+        self._weights = str(info.get("weights_path", ""))
+        self._selected = next(
+            (v for v in self._variants if v["key"] == key), self._variants[0]
+        )
+        self.modelSelected.emit(self._selected)
+        self.weightsImported.emit(self._weights)
+
+    def _persist(self) -> None:
+        """把当前模型选择写入项目（随保存落盘）。"""
+        project = self._project_vm.project if self._project_vm else None
+        if project is None:
+            return
+        project.model = {
+            "key": self._selected.get("key", ""),
+            "label": self._selected.get("label", ""),
+            "weights_path": self._weights,
+        }
+        project.touch()
 
     # -----------------------------------------------------------
     # 查询
@@ -56,6 +85,7 @@ class ModelViewModel(QObject):
         for variant in self._variants:
             if variant["key"] == key:
                 self._selected = variant
+                self._persist()
                 self.modelSelected.emit(variant)
                 self.message.emit("info", f"已选择模型：{variant['label']}")
                 return
@@ -70,6 +100,7 @@ class ModelViewModel(QObject):
             self.message.emit("error", f"权重文件不存在：{path}")
             return
         self._weights = path
+        self._persist()
         self.weightsImported.emit(path)
         self._probe(path, f"探测权重 {Path(path).name}")
 
@@ -82,6 +113,7 @@ class ModelViewModel(QObject):
 
     def clear_weights(self) -> None:
         self._weights = ""
+        self._persist()
         self.modelInfo.emit({})
         self.message.emit("info", "已清除自定义权重，将使用官方预训练权重")
 

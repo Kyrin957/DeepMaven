@@ -45,11 +45,13 @@ from src.viewmodels import (
 )
 from src.views import (
     AnnotateTab,
-    DataTab,
     EvaluateTab,
     ExportTab,
+    GalleryTab,
     ModelTab,
     ProjectTab,
+    ReviewTab,
+    SplitTab,
     TrainTab,
 )
 
@@ -72,10 +74,10 @@ class MainWindow(FluentWindow):
         self.dataset_vm = DatasetViewModel(self.project_vm, self)
         self.category_vm = CategoryViewModel(self.project_vm, self)
         self.annotate_vm = AnnotateViewModel(self.dataset_vm, self.project_vm, self)
-        self.model_vm = ModelViewModel(self)
+        self.model_vm = ModelViewModel(self.project_vm, self)
         self.train_vm = TrainViewModel(self.project_vm, self)
         self.evaluate_vm = EvaluateViewModel(self.project_vm, self)
-        self.export_vm = ExportViewModel(self)
+        self.export_vm = ExportViewModel(self.project_vm, self)
 
         # 隐藏导航栏顶部的「返回」后退按钮
         self.navigationInterface.setReturnButtonVisible(False)
@@ -145,19 +147,27 @@ class MainWindow(FluentWindow):
         menu_bar.setNativeMenuBar(False)
 
         file_menu = menu_bar.addMenu("文件(&F)")
-        new_action = QAction("新建项目", self)
-        open_action = QAction("打开项目", self)
-        save_action = QAction("保存", self)
+        self.file_menu = file_menu          # 持有引用，便于后续扩展与自动化检查
+        save_action = QAction("保存项目", self)
+        save_action.setIcon(FluentIcon.SAVE.icon())
+        save_as_action = QAction("项目另存为", self)
+        save_as_action.setIcon(FluentIcon.SAVE_AS.icon())
+        close_action = QAction("关闭项目", self)
+        close_action.setIcon(FluentIcon.CLOSE.icon())
         exit_action = QAction("退出", self)
-        file_menu.addAction(new_action)
-        file_menu.addAction(open_action)
-        file_menu.addSeparator()
+        exit_action.setIcon(FluentIcon.POWER_BUTTON.icon())
+
         file_menu.addAction(save_action)
+        file_menu.addAction(save_as_action)
+        file_menu.addSeparator()
+        file_menu.addAction(close_action)
         file_menu.addSeparator()
         file_menu.addAction(exit_action)
-        new_action.triggered.connect(self._nav_to_project)
-        open_action.triggered.connect(self._open_project_dialog)
-        save_action.triggered.connect(lambda: self.project_vm.save_project())
+
+        # 菜单栏创建早于导航页，这里用转发方法在触发时再取页面
+        save_action.triggered.connect(self._save_project)
+        save_as_action.triggered.connect(self._save_project_as)
+        close_action.triggered.connect(self._close_project)
         exit_action.triggered.connect(self.close)
 
         view_menu = menu_bar.addMenu("视图(&V)")
@@ -213,21 +223,52 @@ class MainWindow(FluentWindow):
         """数据集划分完成后，把 data.yaml 交给训练页。"""
         self.train_vm.update_config(data_yaml=yaml_path)
 
+    def _open_in_annotator(self, path: str) -> None:
+        """从图库跳转到标注页，并定位到指定图片。"""
+        index = self.annotate_vm.set_image_by_path(path)
+        if index < 0:
+            self._show_message("warning", "未在当前数据集中找到该图片")
+            return
+        self.switchTo(self.annotate_tab)
+
+    def _on_project_loaded(self, project) -> None:
+        """打开 / 新建项目后，把项目数据回填到各 ViewModel。
+
+        各页面只监听自己 ViewModel 的信号，因此必须在这里统一分发；
+        否则打开已有项目会出现「界面全空」。
+        （类别页与标注页分别自行监听 projectChanged / datasetChanged。）
+        """
+        for vm in (self.dataset_vm, self.model_vm, self.train_vm,
+                   self.evaluate_vm, self.export_vm):
+            loader = getattr(vm, "load_from_project", None)
+            if loader is None:
+                continue
+            try:
+                loader(project)
+            except Exception as exc:  # noqa: BLE001 - 单页恢复失败不应阻断整体
+                logger.warning("%s 恢复项目状态失败: %s", type(vm).__name__, exc)
+        # 项目类型决定标注方式与训练任务
+        try:
+            self.annotate_tab.apply_project_type()
+            self.train_tab.sync_from_config()
+        except Exception as exc:  # noqa: BLE001 - 界面同步失败不应阻断打开流程
+            logger.warning("按项目类型同步界面失败: %s", exc)
+
     # -----------------------------------------------------------
     # 导航页注册
     # -----------------------------------------------------------
     def _init_navigation(self) -> None:
-        self.project_tab = ProjectTab(self.project_vm, self)
+        self.project_tab = ProjectTab(self.project_vm, self.dataset_vm, self)
         self.project_tab.setObjectName("projectTab")
         self.addSubInterface(
             self.project_tab, FluentIcon.FOLDER, "项目管理",
             position=NavigationItemPosition.TOP,
         )
 
-        self.data_tab = DataTab(self.dataset_vm, self.category_vm, self)
-        self.data_tab.setObjectName("dataTab")
+        self.gallery_tab = GalleryTab(self.dataset_vm, self.category_vm, self)
+        self.gallery_tab.setObjectName("galleryTab")
         self.addSubInterface(
-            self.data_tab, FluentIcon.LIBRARY, "数据管理",
+            self.gallery_tab, FluentIcon.PHOTO, "图库导入",
             position=NavigationItemPosition.TOP,
         )
 
@@ -235,6 +276,20 @@ class MainWindow(FluentWindow):
         self.annotate_tab.setObjectName("annotateTab")
         self.addSubInterface(
             self.annotate_tab, FluentIcon.BRUSH, "图像标注",
+            position=NavigationItemPosition.TOP,
+        )
+
+        self.review_tab = ReviewTab(self.dataset_vm, self.category_vm, self)
+        self.review_tab.setObjectName("reviewTab")
+        self.addSubInterface(
+            self.review_tab, FluentIcon.CHECKBOX, "标注检查",
+            position=NavigationItemPosition.TOP,
+        )
+
+        self.split_tab = SplitTab(self.dataset_vm, self.category_vm, self)
+        self.split_tab.setObjectName("splitTab")
+        self.addSubInterface(
+            self.split_tab, FluentIcon.LIBRARY, "数据拆分",
             position=NavigationItemPosition.TOP,
         )
 
@@ -277,10 +332,20 @@ class MainWindow(FluentWindow):
         ]
         for vm in vms:
             vm.message.connect(self._show_message)
-        # 当前项目变化时更新状态栏
+        # 当前项目变化时：更新状态栏，并把项目数据回填到各页面
         self.project_vm.projectChanged.connect(self._on_project_changed_status)
+        self.project_vm.projectChanged.connect(self._on_project_loaded)
         # 数据集划分完成后，把 data.yaml 交给训练页
         self.dataset_vm.datasetReady.connect(self._on_dataset_ready)
+        # 图库双击图片 → 切到标注页并定位到该图片
+        self.gallery_tab.requestAnnotate.connect(self._open_in_annotator)
+        # 新建项目时若带数据集目录，直接导入图库
+        self.project_tab.requestImportDataset.connect(self.dataset_vm.import_images)
+        # 项目信息变化（如完成划分、标注）后刷新项目页
+        self.dataset_vm.datasetChanged.connect(lambda _d: self.project_tab.refresh_current())
+        self.annotate_vm.statusChanged.connect(
+            lambda _done, _total: self.project_tab.refresh_current()
+        )
 
     def _show_message(self, level: str, text: str) -> None:
         """在窗口右上角弹出 InfoBar。level: success / error / warning / info。"""
@@ -317,6 +382,21 @@ class MainWindow(FluentWindow):
         )
         if path:
             self.project_vm.open_project(path)
+
+    # -----------------------------------------------------------
+    # 文件菜单转发（项目管理页持有名称 / 说明编辑状态）
+    # -----------------------------------------------------------
+    def _save_project(self) -> None:
+        """菜单：保存当前项目（同时写回项目页上的名称 / 说明编辑）。"""
+        self.project_tab.save_project()
+
+    def _save_project_as(self) -> None:
+        """菜单：项目另存为。"""
+        self.project_tab.save_project_as()
+
+    def _close_project(self) -> None:
+        """菜单：关闭当前项目。"""
+        self.project_tab.close_project()
 
     def _show_about(self) -> None:
         InfoBar.info(

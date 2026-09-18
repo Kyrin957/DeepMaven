@@ -33,6 +33,7 @@ class Dataset:
     split_val: float = 0.2
     split_test: float = 0.1
     stratified: bool = True         # 是否按类别分层抽样
+    seed: int = 0                   # 随机种子（保证划分可复现）
 
     created_at: str = field(default_factory=_now_iso)
 
@@ -59,6 +60,7 @@ class Dataset:
             "split_val": self.split_val,
             "split_test": self.split_test,
             "stratified": self.stratified,
+            "seed": self.seed,
             "created_at": self.created_at,
         }
 
@@ -78,5 +80,6 @@ class Dataset:
             split_val=data.get("split_val", 0.2),
             split_test=data.get("split_test", 0.1),
             stratified=data.get("stratified", True),
+            seed=data.get("seed", 0),
             created_at=data.get("created_at", _now_iso()),
         )
