@@ -1633,3 +1633,65 @@ qfluentwidgets 的 `Slider` 是**靠自身 `valueChanged` 驱动 `SliderHandle` 
 **下一步计划：** 按需补充相机采集、图库按导入批次分组显示。
 
 ---
+
+## Session 33 — 导航栏展开宽度按导航页标题长度自适应
+
+**日期：** 2026-09-19
+
+**用户反馈：** 主窗口左侧导航栏宽度太大，希望以导航页标题长度为准适当缩减。
+
+**副线：** 按 `README.md` 重建 `.venv`（Python 3.14.7 + `requirements.txt` 全量依赖），
+关键模块导入与离屏启动自检全部通过（未改动仓库内容）。
+
+**一、根因（已实测）**
+
+qfluentwidgets 把导航面板展开宽度硬编码为 `NavigationPanel.expandWidth = 322`，
+而条目宽度 = 面板宽度 − 10 = **312px**。本项目 9 个导航页标题均为 4 个汉字，
+`NavigationTreeWidget.suitableWidth()`（左缩进 + 图标 + 文字 + 右缩进）实测只需 **113px**
+（其中文字本身 56px）——即默认状态下每个条目约 **200px 是纯空白**。
+
+顺带确认了两个既有行为（非本次改动）：
+
+- 面板**启动态是 COMPACT（48px 纯图标栏）**，点击菜单按钮才展开到 `expandWidth`；
+  本次调整的是展开态宽度。
+- 窗口宽度 < `minimumExpandWidth`（1008）时展开态会自动收起；窗口最小宽度 1080 > 1008，
+  因此展开后不会被误收起。
+
+**二、修复**
+
+1. `utils/constants.py`：新增 `NAV_WIDTH_MARGIN = 22`（面板左右各 5px 内边距 + 条目右侧呼吸空间）
+   与 `NAV_MIN_WIDTH = 132`（标题过短时的下限）。
+2. `views/main_window.py`：新增 `_fit_navigation_width()`，在 `_init_navigation()` 之后调用，
+   遍历 `panel.items` 取各 `NavigationTreeWidget.suitableWidth()` 的最大值，
+   再 `setExpandWidth(max(NAV_MIN_WIDTH, widest + NAV_WIDTH_MARGIN))`。
+
+| 文件 | 处理 |
+|------|------|
+| `utils/constants.py` | 新增 `NAV_WIDTH_MARGIN` / `NAV_MIN_WIDTH` |
+| `views/main_window.py` | 导入 `NavigationTreeWidget`；新增 `_fit_navigation_width()` 并在导航注册后调用 |
+
+采用官方 `suitableWidth()`（基于真实 `QFontMetrics`）而非硬编码像素：**增删导航页或改标题会自动重算**。
+注意 `setExpandWidth()` 会同时改写类属性 `NavigationWidget.EXPAND_WIDTH`（全局生效），
+因此必须在导航项创建之后、窗口首次展开之前调用。
+
+**三、验收结果 ✅（offscreen 实测 + 截图）**
+
+| 项 | 改前 | 改后 |
+|------|------|------|
+| 面板展开宽度 | 322 | **135** |
+| 条目宽度 | 312 | 125 |
+| 条目所需宽度 | 113 | 113 |
+| 条目右侧余量 | 199（空白） | 12 |
+
+- 展开态截图确认 9 个导航项「图标 + 四字标题」完整显示，无截断、无重叠，选中指示条正常。
+- `panel.displayMode = EXPAND`，`panel.width() = 135`，条目宽度与面板宽度严格符合 −10 关系。
+- lint：改动文件 0 错误。
+
+**说明与遗留 ⏳：**
+- 宽度只在 `MainWindow.__init__` 计算一次；若日后在运行期动态新增标题更长的导航页，
+  需要再次调用 `_fit_navigation_width()`
+- 面板默认以 COMPACT（纯图标）启动，若希望启动即显示标题需另行开启展开
+
+**下一步计划：** 按需补充相机采集、图库按导入批次分组显示。
+
+---

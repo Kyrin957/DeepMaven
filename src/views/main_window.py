@@ -30,8 +30,16 @@ from qfluentwidgets import (
     setThemeColor,
     Theme,
 )
+from qfluentwidgets.components.navigation import NavigationTreeWidget
 
-from src.utils.constants import APP_NAME, APP_VERSION, BRAND_COLOR, PROJECT_FILE_FILTER
+from src.utils.constants import (
+    APP_NAME,
+    APP_VERSION,
+    BRAND_COLOR,
+    NAV_MIN_WIDTH,
+    NAV_WIDTH_MARGIN,
+    PROJECT_FILE_FILTER,
+)
 from src.utils.logger import get_logger
 from src.viewmodels import (
     AnnotateViewModel,
@@ -94,6 +102,8 @@ class MainWindow(FluentWindow):
 
         # 注册导航页
         self._init_navigation()
+        # 按导航页标题长度收窄导航栏宽度
+        self._fit_navigation_width()
 
         # 统一消息提示
         self._wire_messages()
@@ -116,6 +126,34 @@ class MainWindow(FluentWindow):
         panel.vBoxLayout.setContentsMargins(
             margins.left(), 48, margins.right(), margins.bottom(),
         )
+
+    # -----------------------------------------------------------
+    # 导航栏宽度自适应
+    # -----------------------------------------------------------
+    def _fit_navigation_width(self) -> None:
+        """按导航页标题长度收窄导航栏展开宽度。
+
+        QFluentWidgets 把导航面板的展开宽度固定为 322px，而条目宽度为
+        「面板宽度 - 10」，默认值下条目内有近 200px 是纯空白。这里取各导航
+        项 ``suitableWidth()``（左缩进 + 图标 + 文字 + 右缩进）的最大值，
+        加上面板内边距与条目右侧呼吸空间，得到刚好容纳最长标题的宽度。
+
+        注意：``setExpandWidth`` 会同时改写 ``NavigationWidget.EXPAND_WIDTH``，
+        因此必须在导航项创建之后、窗口首次展开之前调用。
+        """
+        panel = self.navigationInterface.panel
+        widest = 0
+        for item in panel.items.values():
+            widget = item.widget
+            if isinstance(widget, NavigationTreeWidget):
+                widest = max(widest, widget.suitableWidth())
+
+        if widest <= 0:
+            return
+
+        width = max(NAV_MIN_WIDTH, widest + NAV_WIDTH_MARGIN)
+        self.navigationInterface.setExpandWidth(width)
+        logger.info("导航栏展开宽度：%dpx（最长标题所需 %dpx）", width, widest)
 
     # -----------------------------------------------------------
     # 布局重构：在右侧 widgetLayout 内构建纵向 [菜单栏, 页面, 状态栏]
