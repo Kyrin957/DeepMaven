@@ -334,7 +334,8 @@ class AnnotateViewModel(QObject):
             )
         ]
         if not targets:
-            self.message.emit("info", "没有需要预标注的图片")
+            # 「点了没反应」需要可见反馈：info 级只写日志不弹窗，这里按提示处理
+            self.message.emit("warning", "没有需要预标注的图片")
             return
 
         self._autosave()

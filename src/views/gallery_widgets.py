@@ -1,7 +1,7 @@
 """图库页专用面板：浏览筛选栏、数据集拆分映射、图像标记。
 
 参照 Halcon DLT 的图库视图：
-    FilterBar     图像窗口上方的「按标签 / 按标记 / 按拆分 + 文本筛选」
+    FilterBar     图像窗口上方的「标签 / 数据集拆分 / 标记 + 文本筛选」下拉菜单
     SplitMapCard  把选中图像划入 训练 / 验证 / 测试，或移出全部拆分集
     TagCard       图像标记（类似备注），点击标记即对选中图像追加 / 删除
 """
@@ -22,8 +22,12 @@ from qfluentwidgets import (
     BodyLabel,
     CaptionLabel,
     CardWidget,
+    CheckBox,
     ComboBox,
+    DropDownPushButton,
     FluentIcon,
+    Flyout,
+    FlyoutViewBase,
     PillPushButton,
     RoundMenu,
     SearchLineEdit,
@@ -33,16 +37,80 @@ from qfluentwidgets import (
 )
 
 from src.utils.constants import SPLIT_COLORS
+from src.views.widgets import THUMB_MEDIUM, THUMB_STEPS
 
 _COLOR_EMPTY = "#1B1B1B"
 
-# 筛选档位（按顺序循环点击）
-_LABEL_STEPS = (("all", "全部"), ("annotated", "已标注"), ("unannotated", "未标注"))
-_MARK_BASE_STEPS = (("all", "全部"), ("tagged", "带标记"), ("untagged", "无标记"))
+# 「全部」项的键（多选面板里选它表示不筛选）
+_ALL_KEY = "all"
+# 标签菜单的档位：标注状态 + 无标签 + 各标签类别
+_ANNOTATED_STEPS = (("annotated", "已标注"), ("unannotated", "未标注"))
+_UNLABELED_KEY = "unlabeled"
+_CLASS_PREFIX = "class:"
+# 标记菜单的档位
+_MARK_STEPS = (("tagged", "带标记"), ("untagged", "无标记"))
+# 数据集拆分档位（来自左侧「数据集拆分映射」）
 _SPLIT_STEPS = (
-    ("all", "全部"), ("train", "训练"), ("val", "验证"),
-    ("test", "测试"), ("none", "未划分"),
+    ("train", "训练"), ("val", "验证"), ("test", "测试"), ("none", "未划分"),
 )
+
+
+
+class _FilterPanel(FlyoutViewBase):
+    """筛选下拉面板：一组可多选的勾选项（点「全部」即清空其它选择）。"""
+
+    changed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._boxes: dict[str, CheckBox] = {}
+        self._order: list[str] = []
+        self.vBoxLayout = QVBoxLayout(self)
+        self.vBoxLayout.setContentsMargins(14, 10, 14, 12)
+        self.vBoxLayout.setSpacing(2)
+        self.setMinimumWidth(170)
+
+    def set_items(self, items: list, selected=()) -> None:
+        """items: [(key, text), ...]；selected 为已勾选的键（空 = 全部）。"""
+        selected = set(selected) or {_ALL_KEY}
+        for key, text in items:
+            box = CheckBox(text, self)
+            box.setChecked(key in selected)
+            box.toggled.connect(lambda checked, k=key: self._on_toggled(k, checked))
+            box.setMinimumHeight(28)
+            self.vBoxLayout.addWidget(box)
+            self._boxes[key] = box
+            self._order.append(key)
+
+    def _on_toggled(self, key: str, checked: bool) -> None:
+        if checked:
+            if key == _ALL_KEY:
+                # 勾「全部」→ 清掉其它选择
+                for other in self._order:
+                    if other != _ALL_KEY:
+                        self._set_checked(other, False)
+            else:
+                # 勾具体项 → 取消「全部」
+                self._set_checked(_ALL_KEY, False)
+        if not self.selected():
+            # 一个都不剩 → 回到「全部」
+            self._set_checked(_ALL_KEY, True)
+        self.changed.emit()
+
+    def _set_checked(self, key: str, checked: bool) -> None:
+        box = self._boxes.get(key)
+        if box is None:
+            return
+        box.blockSignals(True)
+        box.setChecked(checked)
+        box.blockSignals(False)
+
+    def selected(self) -> list[str]:
+        """已勾选的键（不含「全部」；空列表表示全部）。"""
+        return [
+            key for key in self._order
+            if key != _ALL_KEY and self._boxes[key].isChecked()
+        ]
 # 拆分映射的行：键为空串表示「不在任何一个拆分集里」
 _SPLIT_ROWS = (
     ("", "不在任何一个拆分集里", _COLOR_EMPTY),
@@ -66,118 +134,201 @@ def color_icon(color: str, size: int = 11) -> QIcon:
 
 
 class FilterBar(CardWidget):
-    """图像窗口上方的筛选栏。
+    """图像窗口上方的筛选栏：三个多选下拉菜单 + 文本筛选 + 缩略图尺寸。
 
-    三个按钮各自在候选档位之间循环切换，右侧是文本筛选框（文件名 / 类别 / 标记）。
+    每个菜单都是「下拉 + 勾选项」，**可多选**；选项自动取自左侧各面板：
+        标签       已标注 / 未标注 / 无标签 / 各标签类别（左侧「标签类别」）
+        数据集拆分  训练 / 验证 / 测试 / 未划分（左侧「数据集拆分映射」）
+        标记       带标记 / 无标记 / 各图像标记（左侧「图像标记」）
+    勾选「全部」或一个都不选 = 不按该维度筛选。
     """
 
     filterChanged = Signal()
     textChanged = Signal(str)
     thumbSizeChanged = Signal(int)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, with_size: bool = True):
         super().__init__(parent)
-        self._label = "all"
-        self._mark = "all"
-        self._split = "all"
+        self._annotated: list[str] = []   # 已标注 / 未标注（空 = 全部）
+        self._classes: list[str] = []     # 类别勾选（"" = 无标签；空 = 全部）
+        self._splits: list[str] = []      # train / val / test / none
+        self._marks: list[str] = []       # tagged / untagged / 标记名
+        self._class_options: list[str] = []
         self._tag_names: list[str] = []
+        self._panel = None                # 当前展开的筛选面板（同时只留一个）
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(8)
 
-        self.label_pill = self._pill("按标签")
-        self.label_pill.clicked.connect(lambda: self._cycle("label"))
-        layout.addWidget(self.label_pill)
-
-        self.mark_pill = self._pill("按标记")
-        self.mark_pill.clicked.connect(lambda: self._cycle("mark"))
-        layout.addWidget(self.mark_pill)
-
-        self.split_pill = self._pill("按拆分")
-        self.split_pill.clicked.connect(lambda: self._cycle("split"))
-        layout.addWidget(self.split_pill)
+        self.label_btn = self._menu_button("标签", FluentIcon.TAG, "label")
+        layout.addWidget(self.label_btn)
+        self.split_btn = self._menu_button("数据集拆分", FluentIcon.LIBRARY, "split")
+        layout.addWidget(self.split_btn)
+        self.mark_btn = self._menu_button("标记", FluentIcon.FLAG, "mark")
+        layout.addWidget(self.mark_btn)
 
         self.search = SearchLineEdit(self)
         self.search.setPlaceholderText("输入筛选文本")
-        self.search.setFixedWidth(240)
+        self.search.setFixedWidth(200)
         self.search.textChanged.connect(lambda _t: self.textChanged.emit(self.text()))
         self.search.searchSignal.connect(lambda _t: self.textChanged.emit(self.text()))
         layout.addWidget(self.search)
         layout.addStretch(1)
 
-        self.size_slider = Slider(Qt.Orientation.Horizontal, self)
-        self.size_slider.setRange(0, 2)
-        self.size_slider.setValue(1)
-        self.size_slider.setFixedWidth(90)
-        self.size_slider.setToolTip("缩略图尺寸")
-        self.size_slider.valueChanged.connect(
-            lambda value: self.thumbSizeChanged.emit(int(value))
-        )
-        layout.addWidget(self.size_slider)
+        # 尺寸档位与网格共用同一套（页面用 set_thumb_steps 再收窄）
+        self._thumb_steps: tuple[int, ...] = THUMB_STEPS
+        self._syncing_thumb = False
+        self.size_slider = None
+        if with_size:
+            self.size_slider = Slider(Qt.Orientation.Horizontal, self)
+            self.size_slider.setRange(0, max(0, len(self._thumb_steps) - 1))
+            self.size_slider.setValue(self._thumb_index(THUMB_MEDIUM))
+            self.size_slider.setFixedWidth(90)
+            self.size_slider.setToolTip("缩略图尺寸（Ctrl + 滚轮）")
+            self.size_slider.valueChanged.connect(self._on_slider_value)
+            layout.addWidget(self.size_slider)
 
         self.summary = CaptionLabel("", self)
         layout.addWidget(self.summary)
 
-        self._refresh_pills()
+        self._refresh_buttons()
 
     # -----------------------------------------------------------
-    def _pill(self, title: str) -> PillPushButton:
-        button = PillPushButton(self)
-        button.setCheckable(True)          # 自带选中态，用来看「当前档位是否生效」
-        button.setIcon(FluentIcon.ACCEPT)
-        button.setText(f"{title}: 全部")
-        button.setToolTip("点击在各档位之间循环切换")
+    # 下拉菜单（多选）
+    # -----------------------------------------------------------
+    def _menu_button(self, title: str, icon, which: str) -> DropDownPushButton:
+        button = DropDownPushButton(f"{title}：全部", self)
+        button.setIcon(icon)
+        button.setCheckable(True)          # 选中态表示「该筛选已生效」
+        button.setMinimumWidth(120)
+        button.setToolTip("点击展开筛选选项（可多选）")
+        button.clicked.connect(lambda: self._open_menu(which))
         return button
 
-    def _mark_steps(self) -> tuple:
-        return _MARK_BASE_STEPS + tuple((name, name) for name in self._tag_names)
-
-    def _steps(self, which: str) -> tuple:
+    def _button(self, which: str) -> DropDownPushButton:
         return {
-            "label": _LABEL_STEPS,
-            "mark": self._mark_steps(),
-            "split": _SPLIT_STEPS,
+            "label": self.label_btn, "split": self.split_btn, "mark": self.mark_btn,
         }[which]
 
-    def _value(self, which: str) -> str:
-        return {"label": self._label, "mark": self._mark, "split": self._split}[which]
+    def menu_items(self, which: str) -> list:
+        """菜单项 [(key, text), ...]（key 为 "all" 的项表示不筛选）。"""
+        if which == "label":
+            items = [(_ALL_KEY, "全部")]
+            items.extend(_ANNOTATED_STEPS)
+            items.append((_UNLABELED_KEY, "无标签"))
+            items.extend(
+                (f"{_CLASS_PREFIX}{name}", name) for name in self._class_options
+            )
+            return items
+        if which == "split":
+            return [(_ALL_KEY, "全部")] + list(_SPLIT_STEPS)
+        return [(_ALL_KEY, "全部")] + list(_MARK_STEPS) + [
+            (name, name) for name in self._tag_names
+        ]
 
-    def _cycle(self, which: str) -> None:
-        keys = [key for key, _ in self._steps(which)]
-        current = self._value(which)
-        index = (keys.index(current) + 1) % len(keys) if current in keys else 0
-        setattr(self, f"_{which}", keys[index])
-        self._refresh_pills()
+    def selected_keys(self, which: str) -> list[str]:
+        """当前勾选的键（不含「全部」）。"""
+        if which == "label":
+            keys = list(self._annotated)
+            if "" in self._classes:
+                keys.append(_UNLABELED_KEY)
+            keys.extend(
+                f"{_CLASS_PREFIX}{name}" for name in self._classes if name
+            )
+            return keys
+        if which == "split":
+            return list(self._splits)
+        return list(self._marks)
+
+    def _open_menu(self, which: str) -> None:
+        panel = _FilterPanel(self)
+        panel.set_items(self.menu_items(which), self.selected_keys(which))
+        panel.changed.connect(lambda w=which, p=panel: self._apply(w, p.selected()))
+        self._panel = panel
+        button = self._button(which)
+        Flyout.make(panel, target=button, parent=self)
+
+    def _apply(self, which: str, keys: list) -> None:
+        if which == "label":
+            annotated, classes = [], []
+            for key in keys:
+                if key in dict(_ANNOTATED_STEPS):
+                    annotated.append(key)
+                elif key == _UNLABELED_KEY:
+                    classes.append("")
+                elif key.startswith(_CLASS_PREFIX):
+                    classes.append(key[len(_CLASS_PREFIX):])
+            self._annotated, self._classes = annotated, classes
+        elif which == "split":
+            self._splits = list(keys)
+        else:
+            self._marks = list(keys)
+        self._refresh_buttons()
         self.filterChanged.emit()
 
-    def _refresh_pills(self) -> None:
-        for which, pill, title in (
-            ("label", self.label_pill, "按标签"),
-            ("mark", self.mark_pill, "按标记"),
-            ("split", self.split_pill, "按拆分"),
-        ):
-            steps = dict(self._steps(which))
-            current = self._value(which)
-            pill.setText(f"{title}: {steps.get(current, current)}")
-            pill.setChecked(current != "all")
+    def _refresh_buttons(self) -> None:
+        label_names = [dict(_ANNOTATED_STEPS)[key] for key in self._annotated]
+        label_names += [
+            "无标签" if name == "" else name for name in self._classes
+        ]
+        self.label_btn.setText(self._summary("标签", label_names))
+        self.label_btn.setChecked(bool(label_names))
+
+        split_names = [dict(_SPLIT_STEPS)[key] for key in self._splits]
+        self.split_btn.setText(self._summary("数据集拆分", split_names))
+        self.split_btn.setChecked(bool(split_names))
+
+        mark_names = [dict(_MARK_STEPS).get(key, key) for key in self._marks]
+        self.mark_btn.setText(self._summary("标记", mark_names))
+        self.mark_btn.setChecked(bool(mark_names))
+
+    @staticmethod
+    def _summary(title: str, names: list) -> str:
+        if not names:
+            return f"{title}：全部"
+        if len(names) == 1:
+            return f"{title}：{names[0]}"
+        return f"{title}：已选 {len(names)} 项"
 
     # -----------------------------------------------------------
+    # 候选值（由左侧面板提供）
+    # -----------------------------------------------------------
+    def set_classes(self, names: list) -> None:
+        """把左侧「标签类别」的类别并入标签菜单（失效的选择自动摘除）。
+
+        页面刷新时调用；摘除结果会在本次刷新的过滤中立即生效，因此不再广播。
+        """
+        self._class_options = [str(name) for name in names]
+        self._classes = [
+            c for c in self._classes if c == "" or c in self._class_options
+        ]
+        self._refresh_buttons()
+
     def set_tag_names(self, names: list) -> None:
-        """把现有标记并入「按标记」的候选档位。"""
+        """把左侧「图像标记」的标记并入标记菜单（失效的选择自动摘除）。"""
         self._tag_names = [str(name) for name in names]
-        if self._mark not in dict(self._mark_steps()):
-            self._mark = "all"
-        self._refresh_pills()
+        self._marks = [
+            m for m in self._marks
+            if m in dict(_MARK_STEPS) or m in self._tag_names
+        ]
+        self._refresh_buttons()
 
-    def label_value(self) -> str:
-        return self._label
+    # -----------------------------------------------------------
+    # 取值（供页面过滤；返回列表，"all" 表示不筛选）
+    # -----------------------------------------------------------
+    def label_value(self):
+        return list(self._annotated) or "all"
 
-    def mark_value(self) -> str:
-        return self._mark
+    def class_value(self):
+        """类别筛选：列表（元素 "" 表示无标签）。"""
+        return list(self._classes) or "all"
 
-    def split_value(self) -> str:
-        return self._split
+    def mark_value(self):
+        return list(self._marks) or "all"
+
+    def split_value(self):
+        return list(self._splits) or "all"
 
     def text(self) -> str:
         return self.search.text().strip()
@@ -185,13 +336,57 @@ class FilterBar(CardWidget):
     def set_summary(self, shown: int, total: int) -> None:
         self.summary.setText(f"显示 {shown} / {total} 张")
 
+    def set_thumb_steps(self, steps) -> None:
+        """配置尺寸档位（与 `ThumbnailGrid.set_thumb_steps` 保持一致）。"""
+        values = sorted({int(s) for s in (steps or []) if int(s) > 0})
+        if not values:
+            return
+        self._thumb_steps = tuple(values)
+        if self.size_slider is not None:
+            self.size_slider.setRange(0, len(self._thumb_steps) - 1)
+
+    def set_thumb_size(self, size: int) -> None:
+        """按「尺寸」同步旋钮位置（Ctrl + 滚轮缩放后调用）。
+
+        不能用 `blockSignals` 同步：qfluentwidgets 的滑杆靠自身 valueChanged
+        驱动旋钮移动，阻塞信号会出现「数值变了但旋钮不动」。
+        这里改用短标志忽略本次回调；页面侧处理是幂等的，不会来回打架。
+        """
+        slider = self.size_slider
+        if slider is None:
+            return
+        index = self._thumb_index(size)
+        if slider.value() == index:
+            return
+        self._syncing_thumb = True
+        try:
+            slider.setValue(index)
+        finally:
+            self._syncing_thumb = False
+
+    def _thumb_index(self, size: int) -> int:
+        """尺寸 → 档位下标（取最近档位）。"""
+        return min(
+            range(len(self._thumb_steps)),
+            key=lambda i: abs(self._thumb_steps[i] - int(size)),
+        )
+
+    def _on_slider_value(self, value: int) -> None:
+        if self._syncing_thumb:
+            return
+        self.thumbSizeChanged.emit(int(value))
+
     def reset(self) -> None:
         """复位到「全部」。"""
-        self._label = self._mark = self._split = "all"
+        self._annotated = []
+        self._classes = []
+        self._splits = []
+        self._marks = []
         self.search.blockSignals(True)
         self.search.setText("")
         self.search.blockSignals(False)
-        self._refresh_pills()
+        self._refresh_buttons()
+        self.filterChanged.emit()
 
 
 class SplitRow(QWidget):
@@ -260,7 +455,7 @@ class SplitMapCard(CardWidget):
         lock_icon.setFixedSize(22, 22)
         lock_icon.setEnabled(False)
         lock_layout.addWidget(lock_icon)
-        self.lock_label = CaptionLabel("该拆分由训练使用，无法更改。", lock)
+        self.lock_label = CaptionLabel("已用于训练，无法更改", lock)
         self.lock_label.setWordWrap(True)
         lock_layout.addWidget(self.lock_label, 1)
         layout.addWidget(lock)
@@ -272,10 +467,6 @@ class SplitMapCard(CardWidget):
             row.clicked.connect(self.splitRequested)
             layout.addWidget(row)
             self.rows[key] = row
-
-        self.hint = CaptionLabel("选中图像后点击某一行即可改划。", self)
-        self.hint.setWordWrap(True)
-        layout.addWidget(self.hint)
 
     def set_state(
         self, name: str, counts: dict, current: str = "", locked: bool = False
@@ -300,10 +491,6 @@ class SplitMapCard(CardWidget):
         for key, row in self.rows.items():
             row.set_count(counts.get(_SPLIT_TO_MARK.get(key, ""), 0))
             row.set_active(key == active)
-        self.hint.setText(
-            "该拆分已生成并用于训练，映射只读。" if locked
-            else "选中图像后点击某一行即可改划；「不在任何一个拆分集里」表示未划分。"
-        )
 
 
 class TagCard(CardWidget):
@@ -335,7 +522,7 @@ class TagCard(CardWidget):
         header.addWidget(self.add_btn)
         layout.addLayout(header)
 
-        self.hint = CaptionLabel("为图像设置图像标记：", self)
+        self.hint = CaptionLabel("", self)
         self.hint.setWordWrap(True)
         layout.addWidget(self.hint)
 
@@ -356,17 +543,16 @@ class TagCard(CardWidget):
                 widget.deleteLater()
 
         if not self._names:
-            self.hint.setText("暂无图像标记，点击右上角 + 新增。")
+            self.hint.setText("暂无标记")
             return
-        self.hint.setText("为图像设置图像标记（点击即追加，再点删除）：")
+        self.hint.setText("")
         for index, name in enumerate(self._names):
             chip = PillPushButton(self)
             chip.setCheckable(False)
             chip.setText(f"{name}  {counts.get(name, 0)}")
             chip.setIcon(color_icon(self._colors.get(name, "")))
             chip.setToolTip(
-                f"标记「{name}」已挂 {counts.get(name, 0)} 张\n"
-                "点击：选中图像若没有则追加、有则删除；右键可编辑 / 删除"
+                f"已挂 {counts.get(name, 0)} 张 · 点击追加/删除 · 右键编辑"
             )
             chip.clicked.connect(lambda _=False, n=name: self.tagToggled.emit(n))
             chip.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)

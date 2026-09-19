@@ -32,11 +32,11 @@ from src.views.data_widgets import ClassCard, FilterCard, side_column
 from src.views.widgets import (
     THUMB_LARGE,
     THUMB_MEDIUM,
-    THUMB_SMALL,
+    THUMB_XLARGE,
     ThumbnailGrid,
 )
 
-_THUMB_STEPS = (THUMB_MEDIUM, THUMB_LARGE, THUMB_LARGE)
+_THUMB_STEPS = (THUMB_MEDIUM, THUMB_LARGE, THUMB_XLARGE)
 
 
 class ReviewTab(QWidget):
@@ -103,9 +103,7 @@ class ReviewTab(QWidget):
         self.quality_list = QListWidget(self.quality_card)
         self.quality_list.setMinimumHeight(150)
         quality_layout.addWidget(self.quality_list)
-        self.quality_hint = CaptionLabel(
-            "检查重复图片、模糊、曝光异常与标签问题。", self.quality_card
-        )
+        self.quality_hint = CaptionLabel("", self.quality_card)
         self.quality_hint.setWordWrap(True)
         quality_layout.addWidget(self.quality_hint)
 
@@ -129,10 +127,14 @@ class ReviewTab(QWidget):
         column.addWidget(card)
 
         self.filter_card = FilterCard(with_size=True, parent=self)
+        self.filter_card.set_thumb_steps(_THUMB_STEPS)
+        self.filter_card.set_thumb_size(THUMB_LARGE)   # 与网格初始档位一致
         column.addWidget(self.filter_card)
 
         self.grid = ThumbnailGrid(self)
+        self.grid.set_thumb_steps(_THUMB_STEPS)   # 档位与滑杆一一对应
         self.grid.set_thumb_size(THUMB_LARGE)
+        self.grid.set_wheel_zoom(True)      # Ctrl + 滚轮缩放缩略图
         column.addWidget(self.grid, 1)
 
         self.hint = CaptionLabel("", self)
@@ -145,6 +147,7 @@ class ReviewTab(QWidget):
     def _bind(self) -> None:
         self.filter_card.filterChanged.connect(self._on_filter)
         self.filter_card.thumbSizeChanged.connect(self._on_thumb_size)
+        self.grid.thumbSizeChanged.connect(self._on_grid_thumb_size)
         self.grid.imageActivated.connect(self._on_selected)
         self.class_card.classClicked.connect(self._on_class_clicked)
         self.class_card.changed.connect(self.refresh)
@@ -191,8 +194,7 @@ class ReviewTab(QWidget):
         self.title.setText(f"标注检查 · {dataset.name}" if dataset else "标注检查")
         self.hint.setText(
             f"显示 {len(pairs)} / {total} 张（{condition}），已标注 {annotated} 张"
-            f"（{0 if not total else round(annotated * 100 / total)}%）；"
-            "点击缩略图查看详情。"
+            f"（{0 if not total else round(annotated * 100 / total)}%）"
         )
         if self.isVisible():
             self._on_selected(self.grid.current_index())
@@ -253,6 +255,10 @@ class ReviewTab(QWidget):
         index = max(0, min(len(_THUMB_STEPS) - 1, int(step)))
         self.grid.set_thumb_size(_THUMB_STEPS[index])
 
+    def _on_grid_thumb_size(self, size: int) -> None:
+        """Ctrl + 滚轮缩放后，把尺寸滑杆同步到对应档位。"""
+        self.filter_card.set_thumb_size(int(size))
+
     def _on_selected(self, index: int) -> None:
         path = self.grid.path_at(index)
         if not path:
@@ -273,7 +279,7 @@ class ReviewTab(QWidget):
                 annotated = flags[position]
 
         if self._vm.split_layout() == "classify":
-            count_text = "不适用（分类任务，按类别判定）"
+            count_text = "不适用"
         else:
             label_dir = self._vm.label_dir()
             count = 0

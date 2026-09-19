@@ -20,6 +20,7 @@ from src.utils.constants import (
     IMAGE_EXTS,
     LABEL_EXTS,
     SPLIT_LABELS,
+    UNLABELED_LABEL,
 )
 from src.utils.logger import get_logger
 from src.utils.workers import FunctionWorker
@@ -29,6 +30,19 @@ logger = get_logger("dataset_vm")
 
 # 子集标记 → 划分名（与 thumbnail_grid 的 T / V / E 对应）
 _SUBSET_NAME = {"T": "train", "V": "val", "E": "test"}
+
+
+def _filter_list(value) -> list[str] | None:
+    """把筛选条件统一成列表；"all" / 空表示不筛选（返回 None）。
+
+    支持单个字符串（兼容旧调用）与多选列表（筛选栏的下拉多选）。
+    """
+    if value is None or value == "all":
+        return None
+    if isinstance(value, (list, tuple, set, frozenset)):
+        items = [str(item) for item in value]
+        return items or None
+    return [str(value)]
 
 
 class DatasetViewModel(QObject):
@@ -61,8 +75,10 @@ class DatasetViewModel(QObject):
         self._worker: FunctionWorker | None = None
         # 源目录不可用时，从项目归档释放出来的工作目录
         self._resolved_source: Path | None = None
-        # 已验证可用的来源目录（避免逐张图片调用时反复全目录扫描）
-        self._usable_sources: set[Path] = set()
+        # 来源目录列表缓存（避免逐张图片调用时反复解析路径）
+        self._roots_cache: list[Path] | None = None
+        # 已有图片的内容哈希缓存（导入去重时避免重复读取大图）
+        self._hash_cache: dict[str, str] | None = None
         # 图片清单与标签索引缓存（数据量大，避免每次刷新都重新扫盘）
         self._images: list[Path] | None = None
         self._label_index: dict | None = None
@@ -76,28 +92,320 @@ class DatasetViewModel(QObject):
     # -----------------------------------------------------------
     # 命令
     # -----------------------------------------------------------
-    def import_images(self, directory: str) -> Dataset:
-        """导入图片文件夹并生成统计，返回去重后的数据集。"""
-        dataset = self._service.summarize(directory)
-        self._set_dataset(dataset)
+    def import_images(
+        self, directory: str, options: dict | None = None
+    ) -> Dataset | None:
+        """导入图片文件夹并生成统计，返回累加后的数据集。
+
+        Args:
+            directory: 图片文件夹（递归扫描）。
+            options: 导入选项（见 `_import`），为空时按默认值导入。
+                带 `files` 时只导入其中的图片（子文件夹勾选后的子集）。
+        """
+        directory = Path(directory)
+        if not directory.is_dir():
+            self.message.emit("warning", "请选择有效的图片文件夹")
+            return None
+        options = dict(options or {})
+        subset = options.get("files")
+        if subset:
+            images = [
+                Path(p) for p in subset
+                if Path(p).is_file() and Path(p).suffix.lower() in IMAGE_EXTS
+            ]
+        else:
+            images = self._service.scan_images(directory)
+        if not images:
+            self.message.emit("warning", f"目录中未找到图片：{directory}")
+            return None
+        return self._import(images, options, roots=[directory])
+
+    def import_files(
+        self, paths: list, options: dict | None = None
+    ) -> Dataset | None:
+        """按选中的文件列表导入并生成统计。
+
+        所选文件所在目录会登记为来源目录（与「导入文件夹」保持一致），
+        因此后续排查 / 重扫的目录范围是可预期的。
+        """
+        images = [
+            Path(p) for p in (paths or [])
+            if Path(p).is_file() and Path(p).suffix.lower() in IMAGE_EXTS
+        ]
+        if not images:
+            self.message.emit("warning", "请选择图片文件")
+            return None
+        roots: list[Path] = []
+        for image in images:
+            if image.parent not in roots:
+                roots.append(image.parent)
+        return self._import(images, options, roots=roots)
+
+    def _import(
+        self, images: list, options: dict | None, roots: list
+    ) -> Dataset | None:
+        """导入的公共实现：排序 → 去重 → 初步标注 → 合并顺序 → 重建统计。
+
+        options 支持的键：
+            sort      "name"（默认）/ "time"：按文件名或修改时间升序
+            reverse   bool：反向顺序（把排序结果整体倒过来）
+            position  "right"（默认）/ "left"：新图片插到已有图库的右侧 / 左侧
+            label_map dict：{图片所在文件夹: 标签名}，用于按子文件夹自动标注
+            label     str：兜底标注（文件夹没填标签时用它；"" = 不标注）
+            files     list：只导入这些图片（来源文件夹下的子集）
+            dedupe    bool：是否跳过与图库中已有图片内容重复的图片
+        """
+        project = self._project_vm.project if self._project_vm else None
+        if project is None:
+            self.message.emit("warning", "请先创建或打开项目")
+            return None
+        options = dict(options or {})
+
+        # 1) 排序（+ 反向顺序）
+        ordered = self._service.sort_images(images, str(options.get("sort", "name")))
+        if options.get("reverse"):
+            ordered.reverse()
+
+        # 2) 来源目录：已有目录 + 本次新增目录
+        merged_roots: list[Path] = []
+        for raw in list(self._dataset.sources if self._dataset else []) + [
+            str(root) for root in roots
+        ]:
+            path = Path(raw)
+            if not path.is_dir():
+                continue
+            if any(str(path) == str(item) for item in merged_roots):
+                continue
+            merged_roots.append(path)
+        if not merged_roots:
+            merged_roots = [Path(root) for root in roots]
+
+        # 3) 去重：批内重复 + 与图库已有图片内容重复（SHA256）
+        dedupe = bool(options.get("dedupe", True))
+        known = self._known_hashes() if dedupe else {}
+        accepted, skipped, hashes = self._filter_duplicates(ordered, dedupe, known)
+        if not accepted:
+            self.message.emit(
+                "warning",
+                f"没有可导入的新图片（{skipped} 张与图库内容重复）" if skipped
+                else "没有可导入的图片",
+            )
+            return None
+
+        # 4) 自动标注：图片所在文件夹 → 标签（label_map），没填标签即「无标签」
+        label_map = {
+            str(folder): str(name)
+            for folder, name in (options.get("label_map") or {}).items()
+        }
+        fallback = str(options.get("label", "") or "").strip()
+        applied: dict[str, int] = {}
+        if label_map or fallback:
+            overrides = self._params_dict("class_overrides", create=True)
+            for image in accepted:
+                folder = str(image.parent)
+                if folder in label_map:
+                    name = label_map[folder].strip()
+                elif fallback:
+                    name = fallback
+                else:
+                    continue
+                # 允许写空串：显式表示「无标签」（区分于「没有指定过」）
+                overrides[self._relative_key(image, merged_roots)] = name
+                if name:
+                    applied[name] = applied.get(name, 0) + 1
+            # 类别体系里没有的先建类，保证「已标注」判定与类别列表自洽
+            for name in applied:
+                if not any(str(cls.name) == name for cls in project.classes):
+                    CategoryService.add(project.classes, name)
+
+        # 5) 合并顺序：新图片插入已有图库的左侧 / 右侧
+        order = self._order_list() or [str(path) for path in self.images()]
+        new_paths = [str(path) for path in accepted]
+        position = "left" if str(options.get("position", "right")) == "left" else "right"
+        merged_order = (
+            new_paths + order if position == "left" else order + new_paths
+        )
+        project.params["image_order"] = list(dict.fromkeys(merged_order))
+
+        # 重新导入的图片视为「回到数据集」，从已移除清单里摘掉
+        excludes = self._exclude_list()
+        if excludes:
+            revived = set(new_paths)
+            self._set_excludes(
+                [item for item in excludes if item not in revived]
+            )
+
+        # 6) 重建统计（图片清单 / 标签索引 / 类别分布；仍排除已移除的图片）
+        excluded = self._excluded_paths()
+        library = [
+            path
+            for path in self._merge_order(
+                merged_roots, project.params["image_order"]
+            )
+            if str(path) not in excluded
+        ]
+        label_index = self._service.label_index_for(library, merged_roots)
+        previous = self._dataset
+        dataset = self._service.summarize_library(
+            merged_roots,
+            images=library,
+            label_index=label_index,
+            name=previous.name if previous is not None else "",
+            duplicate_count=(previous.duplicate_count if previous is not None else 0)
+            + skipped,
+        )
+        self._inherit_settings(dataset, previous)
+
+        where = "左侧（最前）" if position == "left" else "右侧（最后）"
+        notice = f"导入 {len(accepted)} 张（插入到{where}）"
+        if skipped:
+            notice += f"，跳过内容重复 {skipped} 张"
+        if applied:
+            brief = "、".join(
+                f"{name} {count} 张"
+                for name, count in sorted(applied.items())[:4]
+            )
+            if len(applied) > 4:
+                brief += f" 等 {len(applied)} 类"
+            notice += f"，已按标签标注：{brief}"
+        self._set_dataset(dataset, notice=notice)
+        if dedupe:
+            self._hash_cache = {**known, **hashes}
         logger.info(
-            "导入数据集 %s: %s 张图片, %s 个标签, 去重 %s 张",
-            dataset.name, dataset.image_count, dataset.label_count,
-            dataset.duplicate_count,
+            "导入数据集 %s: 新增 %s 张（%s），跳过重复 %s 张，合计 %s 张",
+            dataset.name, len(accepted), position, skipped, dataset.image_count,
         )
         return dataset
 
-    def import_files(self, paths: list) -> Dataset | None:
-        """按选中的文件列表导入并生成统计。"""
-        if not paths:
-            return None
-        dataset = self._service.summarize_files(paths)
-        self._set_dataset(dataset)
-        logger.info(
-            "从文件导入 %s 张图片, %s 个标签, 去重 %s 张",
-            dataset.image_count, dataset.label_count, dataset.duplicate_count,
-        )
-        return dataset
+    def _filter_duplicates(
+        self, images: list, dedupe: bool, known: dict
+    ) -> tuple[list[Path], int, dict]:
+        """按内容哈希过滤重复图片。
+
+        Returns:
+            (可导入的图片, 跳过的张数, 新图片的 {路径: 哈希})。
+        """
+        if not dedupe:
+            return [Path(p) for p in images], 0, {}
+
+        seen = set(known.values())
+        accepted: list[Path] = []
+        hashes: dict[str, str] = {}
+        skipped = 0
+        for image in images:
+            path = Path(image)
+            try:
+                digest = self._service.file_sha256(path)
+            except OSError as exc:
+                logger.warning("读取失败 %s: %s", path, exc)
+                continue
+            if digest in seen:
+                skipped += 1
+                continue
+            seen.add(digest)
+            accepted.append(path)
+            hashes[str(path)] = digest
+        return accepted, skipped, hashes
+
+    def _known_hashes(self) -> dict[str, str]:
+        """已有图片的 {路径: 内容哈希}（带缓存，导入去重用）。"""
+        if self._hash_cache is None:
+            cached: dict[str, str] = {}
+            for image in self.images():
+                try:
+                    cached[str(image)] = self._service.file_sha256(image)
+                except OSError:
+                    continue
+            self._hash_cache = cached
+        return self._hash_cache
+
+    @staticmethod
+    def _inherit_settings(dataset: Dataset, previous: Dataset | None) -> None:
+        """把上一份数据集的划分配置与产物信息带到新统计上（导入不重置划分设置）。"""
+        if previous is None:
+            return
+        dataset.name = previous.name or dataset.name
+        dataset.split_train = previous.split_train
+        dataset.split_val = previous.split_val
+        dataset.split_test = previous.split_test
+        dataset.stratified = previous.stratified
+        dataset.seed = previous.seed
+        dataset.output_path = previous.output_path
+        dataset.data_yaml = previous.data_yaml
+        dataset.created_at = previous.created_at
+
+    # -----------------------------------------------------------
+    # 图库顺序（多来源目录按显式顺序合并）
+    # -----------------------------------------------------------
+    def _order_list(self) -> list[str]:
+        """显式图片顺序清单（多文件夹 / 多选导入后用于稳定排序）。
+
+        注意：这里直接读取 `project.params`，因为该值是**列表**而不是字典。
+        """
+        project = self._project_vm.project if self._project_vm else None
+        if project is None:
+            return []
+        raw = project.params.get("image_order")
+        if not isinstance(raw, (list, tuple)):
+            return []
+        return [str(item) for item in raw if str(item).strip()]
+
+    def _exclude_list(self) -> list[str]:
+        """已从数据集移除的图片清单（本地文件保留，只是不再读进程序）。
+
+        注意：这里直接读取 `project.params`，因为该值是**列表**而不是字典。
+        """
+        project = self._project_vm.project if self._project_vm else None
+        if project is None:
+            return []
+        raw = project.params.get("image_excludes")
+        if not isinstance(raw, (list, tuple)):
+            return []
+        return [str(item) for item in raw if str(item).strip()]
+
+    def _excluded_paths(self) -> set[str]:
+        """移除清单的规范化路径集合（用于过滤图库）。"""
+        return {str(Path(item)) for item in self._exclude_list()}
+
+    def _set_excludes(self, paths) -> None:
+        """写入移除清单（保持原有顺序，自动去重）。"""
+        project = self._project_vm.project if self._project_vm else None
+        if project is None:
+            return
+        project.params["image_excludes"] = list(dict.fromkeys(str(p) for p in paths))
+
+    @staticmethod
+    def _merge_order(roots: list, order: list) -> list[Path]:
+        """来源目录扫描结果 + 显式顺序清单 → 最终图片序列。
+
+        顺序清单存在时**以清单为准**：图库内容 = 历次导入的图片，
+        清单顺序即图库顺序（支持左侧 / 右侧插入与多文件夹累加）。
+        清单不存在时（旧项目）退回按来源目录递归扫描。
+        """
+        scanned = DatasetService.scan_images_multi(roots)
+        if not order:
+            return scanned
+        index = {str(path): path for path in scanned}
+        result: list[Path] = []
+        for raw in order:
+            path = Path(raw)
+            key = str(path)
+            if key in index:
+                result.append(index[key])
+            elif path.is_file():
+                result.append(path)
+        return result
+
+    @staticmethod
+    def _relative_key(image, roots: list) -> str:
+        """图片在项目内的稳定标识（相对来源目录的路径；目录外则用绝对路径）。"""
+        path = Path(image)
+        for root in roots:
+            try:
+                return path.relative_to(root).as_posix()
+            except ValueError:
+                continue
+        return path.as_posix()
 
     def set_split(
         self, train: float, val: float, test: float, quiet: bool = False
@@ -153,10 +461,14 @@ class DatasetViewModel(QObject):
         )
         # 分类任务输出 train/<类别>/ 目录结构，检测/分割输出 images+labels 结构
         layout = "classify" if project.model_type == "classify" else "detect"
+        # 图库可能由多个文件夹累加而成，划分按界面上看到的图片清单进行
+        library = self.images()
+        label_index = self.label_index()
         try:
             stats = self._service.split_dataset(
                 source, out_dir,
                 split=split, stratified=self._dataset.stratified, layout=layout,
+                images=library, label_index=label_index,
             )
             if stats["total"] == 0:
                 self.message.emit("warning", "来源目录中未找到图片")
@@ -164,7 +476,7 @@ class DatasetViewModel(QObject):
 
             if layout == "classify":
                 # 分类任务：Ultralytics 直接以数据集目录作为 --data，按子目录扫描
-                classes = list(self._service.child_class_dirs(source))
+                classes = list(self._service.child_class_dirs_multi(self._source_roots()))
                 config_path: Path = out_dir
             else:
                 classes = self._service.load_class_names(source)
@@ -227,9 +539,10 @@ class DatasetViewModel(QObject):
     def load_from_project(self, project) -> None:
         """打开 / 新建项目后，从项目数据恢复数据集状态。"""
         self._resolved_source = None
+        self._roots_cache = None
+        self._hash_cache = None
         self._images = None
         self._subsets = None
-        self._usable_sources.clear()
         dataset = getattr(project, "dataset", None) if project is not None else None
         if dataset is None or not (dataset.image_count or dataset.source_path):
             self._dataset = None
@@ -237,25 +550,43 @@ class DatasetViewModel(QObject):
             self._dataset = dataset
         self.datasetChanged.emit(self._dataset)
 
+    def _source_roots(self) -> list[Path]:
+        """当前数据集的全部来源目录（图库可由多个文件夹累加而成，带缓存）。
+
+        目录解析会缓存：避免被「逐张图片」调用时退化成 O(n²)。
+        全部来源都不可用时，回退到从项目归档释放出来的工作目录。
+        """
+        if self._roots_cache is not None:
+            return self._roots_cache
+        roots: list[Path] = []
+        seen: set[str] = set()
+        dataset = self._dataset
+        if dataset is not None:
+            for raw in dataset.sources:
+                path = Path(raw)
+                key = str(path).lower()
+                if key in seen or not path.is_dir():
+                    continue
+                seen.add(key)
+                roots.append(path)
+        if not roots:
+            restored = self._restore_from_archive()
+            if restored is not None:
+                roots = [restored]
+        self._roots_cache = roots
+        return roots
+
     def resolved_source(self) -> Path | None:
-        """返回可用的数据集来源目录。
+        """返回可用的主来源目录（标注标签的落盘基准）。
 
         优先使用原始来源目录；若该目录已不存在（项目被移动或原始数据被清理），
         则从 `.mprj` 归档把图片释放到项目同级「<项目名>_files/」，保证项目自包含。
-
-        目录可用性会缓存：全目录扫描只做一次，避免被「逐张图片」调用时退化成 O(n²)。
         """
-        dataset = self._dataset
-        if dataset is None:
-            return None
-        source = Path(dataset.source_path) if dataset.source_path else None
-        if source is not None and source.is_dir():
-            if source in self._usable_sources:
-                return source
-            if DatasetService.scan_images(source):
-                self._usable_sources.add(source)
-                return source
-        return self._restore_from_archive()
+        roots = self._source_roots()
+        if roots:
+            self._resolved_source = roots[0]
+            return roots[0]
+        return None
 
     def run_quality_check(self) -> None:
         """后台执行数据质检：重复图片 / 模糊 / 曝光 / 标签校验。"""
@@ -301,9 +632,11 @@ class DatasetViewModel(QObject):
     def clear(self) -> None:
         self._dataset = None
         self._resolved_source = None
+        self._roots_cache = None
+        self._hash_cache = None
         self._images = None
+        self._label_index = None
         self._subsets = None
-        self._usable_sources.clear()
         self.datasetChanged.emit(None)
 
     # -----------------------------------------------------------
@@ -318,7 +651,7 @@ class DatasetViewModel(QObject):
         if not AugmentService.is_available():
             self.message.emit("error", "未安装 Albumentations，无法预览")
             return []
-        images = self.source_images()
+        images = self.images()
         if not images:
             self.message.emit("warning", "请先导入数据集")
             return []
@@ -345,7 +678,7 @@ class DatasetViewModel(QObject):
         if not AugmentService.is_available():
             self.message.emit("error", "未安装 Albumentations，无法执行增强")
             return
-        images = self.source_images()
+        images = self.images()
         if not images:
             self.message.emit("warning", "请先导入数据集")
             return
@@ -381,22 +714,23 @@ class DatasetViewModel(QObject):
     # 质检辅助
     # -----------------------------------------------------------
     def source_images(self) -> list:
-        """当前数据集的图片来源列表（源目录缺失时自动从归档恢复）。"""
-        source = self.resolved_source()
-        return DatasetService.scan_images(source) if source is not None else []
+        """来源目录里可读取的图片（多来源目录 + 显式顺序，未过滤「已移除」）。"""
+        return self._merge_order(self._source_roots(), self._order_list())
 
     def source_label_index(self) -> dict:
-        """当前数据集的「图片主干 → 标签」索引。"""
-        source = self.resolved_source()
-        return DatasetService.build_label_index(source) if source is not None else {}
+        """当前数据集的「图片主干 → 标签」索引（多来源目录合并）。"""
+        return self._service.label_index_for(self.source_images(), self._source_roots())
 
     # -----------------------------------------------------------
     # 图片清单与标注状态（图库 / 标注 / 标注检查页共用）
     # -----------------------------------------------------------
     def images(self, refresh: bool = False) -> list[Path]:
-        """当前数据集的图片清单（带缓存）。"""
+        """当前数据集的图片清单（带缓存，已排除从数据集移除的图片）。"""
         if refresh or self._images is None:
-            self._images = self.source_images()
+            excluded = self._excluded_paths()
+            self._images = [
+                path for path in self.source_images() if str(path) not in excluded
+            ]
         return self._images
 
     def label_dir(self) -> Path | None:
@@ -413,33 +747,50 @@ class DatasetViewModel(QObject):
     def annotated_flags(self) -> list[bool]:
         """每张图片是否「已标注」。
 
-        - **分类任务**：图片位于某个类别目录下即为已标注（类别本身就是标注结果）
-        - **检测 / 分割**：存在且非空的 YOLO 标签文件
+        判定顺序：
+            1. 项目里有该图片的**类别覆盖值**（导入时按子文件夹标签写入 / 手工指定）
+               → 覆盖值非空即已标注，显式为空的「无标签」即未标注
+            2. **分类任务**：图片位于某个类别目录下即为已标注（类别本身就是标注结果）
+            3. **检测 / 分割 / 异常**：存在且非空的 YOLO 标签文件
         """
         images = self.images()
         if not images:
             return []
+        overrides = self._params_dict("class_overrides")
+        roots = self._source_roots()
 
         if self.split_layout() == "classify":
+            # 已知类别 = 数据集统计里的类别 ∪ 项目类别表
             names = set(self._dataset.class_names) if self._dataset else set()
+            project = self._project_vm.project if self._project_vm else None
+            if project is not None:
+                names.update(str(cls.name) for cls in project.classes)
             if not names:
-                source = self.resolved_source()
-                names = set(
-                    DatasetService.child_class_dirs(source) if source else {}
-                )
-            # 分类任务：图片落在某个类别目录里即为已标注
-            # （类别被手工改为「无标签」后即为未标注）
-            return [self.image_class(image) in names for image in images]
+                names = set(DatasetService.child_class_dirs_multi(roots))
+            flags: list[bool] = []
+            for image in images:
+                key = self._relative_key(image, roots)
+                if key in overrides:
+                    flags.append(bool(str(overrides[key] or "").strip()))
+                else:
+                    # 图片落在某个类别目录里即为已标注
+                    flags.append(self.image_class(image) in names)
+            return flags
 
         label_dir = self.label_dir()
-        if label_dir is None:
-            return [False] * len(images)
-        return [
-            DatasetService.label_has_content(
-                AnnotationService.label_path_for(image, label_dir)
+        flags = []
+        for image in images:
+            key = self._relative_key(image, roots)
+            if key in overrides:
+                flags.append(bool(str(overrides[key] or "").strip()))
+                continue
+            flags.append(
+                label_dir is not None
+                and DatasetService.label_has_content(
+                    AnnotationService.label_path_for(image, label_dir)
+                )
             )
-            for image in images
-        ]
+        return flags
 
     def annotated_count(self) -> int:
         return sum(1 for flag in self.annotated_flags() if flag)
@@ -479,6 +830,22 @@ class DatasetViewModel(QObject):
             name = self.image_class(image)
             counts[name] = counts.get(name, 0) + 1
         return counts
+
+    def _sync_class_stats(self, dataset: Dataset) -> None:
+        """把图库中**实际用到的类别**写回数据集统计（概览的「类别数」）。
+
+        类别来源依次为：导入时按子文件夹标签写入的类别、手工指定的类别、
+        YOLO 标签文件、分类目录名 —— 与图库里的判定口径完全一致，
+        避免出现「图库显示 3 类、概览显示 0 类」的不一致。
+        """
+        counts = {
+            name: count
+            for name, count in self.class_distribution().items()
+            if name and name != UNLABELED_LABEL
+        }
+        if counts:
+            dataset.class_names = list(counts)
+            dataset.class_counts = dict(counts)
 
     def class_counts(self) -> dict[str, int]:
         """各类别样本数（来自数据集统计）。"""
@@ -798,18 +1165,22 @@ class DatasetViewModel(QObject):
     # -----------------------------------------------------------
     def filter_images(
         self,
-        label: str = "all",
-        mark: str = "all",
-        split: str = "all",
+        label="all",
+        mark="all",
+        split="all",
         text: str = "",
+        class_name="all",
     ) -> list[Path]:
-        """按 标签状态 / 图像标记 / 数据集划分 / 文本 过滤图片。
+        """按 标签状态 / 类别 / 图像标记 / 数据集划分 / 文本 过滤图片。
 
         Args:
-            label: all / annotated / unannotated。
-            mark: all / tagged / untagged / 具体标记名。
-            split: all / train / val / test / none（未划分）。
+            label: all / annotated / unannotated（可多选）。
+            mark: all / tagged / untagged / 具体标记名（可多选，命中任一即可）。
+            split: all / train / val / test / none（未划分，可多选）。
             text: 关键词，匹配文件名、类别名与标记名（不区分大小写）。
+            class_name: all / ""（无标签）/ 具体类别名（可多选）。
+
+        除 `text` 外均支持「单个值」或「值列表」；"all" / 空列表表示不筛选。
         """
         images = self.images()
         if not images:
@@ -819,26 +1190,34 @@ class DatasetViewModel(QObject):
         classes = [self.image_class(image) for image in images]
         tags = [self.image_tag_names_of(image) for image in images]
         keyword = text.strip().lower()
+        annotated_wanted = _filter_list(label)
+        class_wanted = _filter_list(class_name)
+        split_wanted = _filter_list(split)
+        mark_wanted = _filter_list(mark)
 
         result: list[Path] = []
         for index, image in enumerate(images):
             annotated = flags[index] if index < len(flags) else False
             subset = subsets[index] if index < len(subsets) else ""
             spans = tags[index] if index < len(tags) else []
-            if label == "annotated" and not annotated:
+            if annotated_wanted is not None:
+                state = "annotated" if annotated else "unannotated"
+                if state not in annotated_wanted:
+                    continue
+            if class_wanted is not None and classes[index] not in class_wanted:
                 continue
-            if label == "unannotated" and annotated:
-                continue
-            if mark == "tagged" and not spans:
-                continue
-            if mark == "untagged" and spans:
-                continue
-            if mark not in ("all", "tagged", "untagged") and mark not in spans:
-                continue
-            if split == "none" and subset:
-                continue
-            if split in ("train", "val", "test") and _SUBSET_NAME.get(subset) != split:
-                continue
+            if mark_wanted is not None:
+                hit = ("tagged" in mark_wanted and spans) or (
+                    "untagged" in mark_wanted and not spans
+                )
+                if not hit:
+                    hit = any(name in spans for name in mark_wanted)
+                if not hit:
+                    continue
+            if split_wanted is not None:
+                current = _SUBSET_NAME.get(subset, "none")
+                if current not in split_wanted:
+                    continue
             if keyword and not (
                 keyword in image.name.lower()
                 or keyword in classes[index].lower()
@@ -862,78 +1241,89 @@ class DatasetViewModel(QObject):
             return False
 
     def remove_images(self, paths: list) -> int:
-        """从数据集与项目归档中移除图片，并清掉它们的标记 / 覆盖记录。
+        """把图片从**数据集**中移除（只影响程序读取的图库，不删除本地文件）。
+
+        图片会记入项目内的「已移除清单」，图库 / 标注 / 检查 / 拆分等页面
+        随即不再读取它们；本地文件保持原样，重新导入即可恢复。
 
         Returns:
-            实际删除的文件数。
+            实际移除的图片数。
         """
         project = self._project_vm.project if self._project_vm else None
         if project is None or not paths:
             return 0
         targets = [Path(p) for p in paths]
-        names = {path.name for path in targets}
-        keys = set(self._keys(targets))
+        # 已经不在图库里的图片不必重复记录
+        current = {str(path) for path in self.images()}
+        gone = [target for target in targets if str(target) in current]
+        if not gone:
+            self.message.emit("warning", "所选图片已不在数据集中")
+            return 0
 
-        removed = 0
-        for target in targets:
-            try:
-                if target.is_file():
-                    target.unlink()
-                    removed += 1
-            except OSError as exc:
-                logger.warning("删除图片失败 %s: %s", target, exc)
-
-        # 归档条目按文件名匹配（划分产物中的文件名与来源保持一致）
-        for record in [
-            record for record in list(project.files)
-            if record.kind == "image" and Path(record.virtual_path).name in names
-        ]:
-            project.files.remove(record)
-
+        keys = set(self._keys(gone))
         for key in keys:
             self._params_dict("class_overrides").pop(key, None)
             self._params_dict("split_overrides").pop(key, None)
             self._params_dict("image_tag_map").pop(key, None)
+
+        excludes = self._exclude_list()
+        excludes.extend(str(target) for target in gone)
+        self._set_excludes(excludes)
+
+        # 内容哈希缓存里也要摘掉，否则重新导入时会被当成「重复图片」而跳过
+        if self._hash_cache is not None:
+            for target in gone:
+                self._hash_cache.pop(str(target), None)
+
+        # 同步数据集统计（概览 / 类别数的图片数都要跟着变）
+        self._refresh_stats(project)
 
         project.touch()
         try:
             self._project_vm.service.save(project)
         except (OSError, ValueError) as exc:
             logger.warning("保存项目失败: %s", exc)
+            self.message.emit("error", f"保存项目失败：{exc}")
         self.invalidate_images()
         self.datasetChanged.emit(self._dataset)
         self._project_vm.notify_changed()
-        self.message.emit("success", f"已移除 {removed} 张图片")
-        return removed
+        self.message.emit(
+            "success",
+            f"已从数据集移除 {len(gone)} 张（本地文件未删除）",
+        )
+        return len(gone)
+
+    def _refresh_stats(self, project) -> None:
+        """按当前图库内容重算数据集统计（图片 / 标签 / 类别计数）。"""
+        self.invalidate_images()
+        self._roots_cache = None
+        roots = self._source_roots()
+        images = self.images(refresh=True)
+        label_index = self.label_index(refresh=True)
+        previous = self._dataset
+        dataset = self._service.summarize_library(
+            roots,
+            images=images,
+            label_index=label_index,
+            name=previous.name if previous is not None else "",
+            duplicate_count=previous.duplicate_count if previous is not None else 0,
+        )
+        self._inherit_settings(dataset, previous)
+        self._dataset = dataset
+        self._sync_class_stats(dataset)
+        project.dataset = dataset
 
     # -----------------------------------------------------------
     # 内部：图片标识与项目元信息
     # -----------------------------------------------------------
     def _image_key(self, image) -> str:
         """图片在项目内的稳定标识（相对数据集来源目录的路径）。"""
-        source = self.resolved_source()
-        path = Path(image)
-        if source is not None:
-            try:
-                return path.relative_to(source).as_posix()
-            except ValueError:
-                pass
-        return path.name
+        return self._relative_key(image, self._source_roots())
 
     def _keys(self, images: list) -> list[str]:
         """批量计算图片标识（复用同一次来源目录解析）。"""
-        source = self.resolved_source()
-        keys: list[str] = []
-        for image in images:
-            path = Path(image)
-            if source is not None:
-                try:
-                    keys.append(path.relative_to(source).as_posix())
-                    continue
-                except ValueError:
-                    pass
-            keys.append(path.name)
-        return keys
+        roots = self._source_roots()
+        return [self._relative_key(image, roots) for image in images]
 
     def _params_dict(self, key: str, create: bool = False) -> dict:
         """读取项目 params 中的字典型元信息。"""
@@ -1001,12 +1391,13 @@ class DatasetViewModel(QObject):
 
     def preview_split(self) -> dict:
         """不落盘地计算划分结果（供拆分页预览饼图与类别分布）。"""
-        source = self.resolved_source()
-        if source is None or self._dataset is None:
+        images = self.images()
+        if not images or self._dataset is None:
             return {}
+        layout = self.split_layout()
         try:
             return DatasetService.preview_split(
-                source,
+                self.resolved_source(),
                 split=(
                     self._dataset.split_train,
                     self._dataset.split_val,
@@ -1014,7 +1405,9 @@ class DatasetViewModel(QObject):
                 ),
                 seed=self._dataset.seed,
                 stratified=self._dataset.stratified,
-                layout=self.split_layout(),
+                layout=layout,
+                images=images,
+                label_index={} if layout == "classify" else self.label_index(),
             )
         except (OSError, ValueError) as exc:
             logger.warning("划分预览失败: %s", exc)
@@ -1023,12 +1416,15 @@ class DatasetViewModel(QObject):
     # -----------------------------------------------------------
     # 内部
     # -----------------------------------------------------------
-    def _set_dataset(self, dataset: Dataset) -> None:
+    def _set_dataset(self, dataset: Dataset, notice: str = "") -> None:
         self._dataset = dataset
         self._resolved_source = None
+        self._roots_cache = None
+        self._hash_cache = None
         self._images = None
+        self._label_index = None
         self._subsets = None
-        self._usable_sources.clear()
+        self._sync_class_stats(dataset)
         # 项目直接持有同一份 Dataset 对象，并即时保存，避免忘记保存导致数据丢失
         project = self._project_vm.project if self._project_vm else None
         if project is not None:
@@ -1055,8 +1451,10 @@ class DatasetViewModel(QObject):
         self.datasetChanged.emit(dataset)
         self.message.emit(
             "success",
-            f"导入完成：{dataset.image_count} 张图片，{dataset.class_count} 个类别"
-            + (f"，剔重 {dataset.duplicate_count} 张" if dataset.duplicate_count else ""),
+            notice or (
+                f"导入完成：{dataset.image_count} 张图片，{dataset.class_count} 个类别"
+                + (f"，剔重 {dataset.duplicate_count} 张" if dataset.duplicate_count else "")
+            ),
         )
 
     def _restore_from_archive(self) -> Path | None:

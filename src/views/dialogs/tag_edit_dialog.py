@@ -49,9 +49,8 @@ class TagEditDialog(MessageBoxBase):
         self.viewLayout.addWidget(self.titleLabel)
         self.viewLayout.addWidget(self._build_body(text, color, has_selection))
 
-        self.hint = CaptionLabel(
-            "标记类似备注：对选中的图像点击标记即可追加，再点一次则删除。", self
-        )
+        # 该标签只用于操作反馈，不放说明文字
+        self.hint = CaptionLabel("", self)
         self.hint.setWordWrap(True)
         self.viewLayout.addWidget(self.hint)
 
@@ -60,7 +59,7 @@ class TagEditDialog(MessageBoxBase):
         self.yesButton.setText("确定")
         self.applyButton = PushButton(self.buttonGroup)
         self.applyButton.setText("应用")
-        self.applyButton.setToolTip("应用但不关闭窗口，便于连续标记")
+        self.applyButton.setToolTip("应用但不关闭")
         self.buttonLayout.addWidget(self.applyButton)
 
         # 接管确认按钮：先校验再关闭
@@ -153,7 +152,7 @@ class TagEditDialog(MessageBoxBase):
         if not text:
             return
         if not QColor(text).isValid():
-            self.hint.setText(f"「{text}」不是合法的颜色值（形如 #9DB5B2）")
+            self.hint.setText("颜色值无效，形如 #9DB5B2")
             return
         self.picker.set_color(text)
 

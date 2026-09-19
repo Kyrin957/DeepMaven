@@ -361,7 +361,7 @@ class ProjectTab(QWidget):
         box = MessageBox(
             "删除项目文件",
             f"确定要删除项目「{name}」的文件吗？\n{path}\n\n"
-            "该操作不可撤销（磁盘上的数据集与模型文件不会被删除）。",
+            "不可撤销；数据集与模型文件不会被删除。",
             self,
         )
         box.yesButton.setText("删除")
@@ -437,7 +437,7 @@ class ProjectTab(QWidget):
         box = MessageBox(
             "关闭项目",
             f"确定要关闭项目「{project.name}」吗？\n\n"
-            "关闭只会释放当前项目的编辑状态，项目文件不会被删除。",
+            "项目文件不会被删除。",
             self,
         )
         box.yesButton.setText("关闭")
@@ -509,7 +509,7 @@ class ProjectTab(QWidget):
             + ("" if item["supported"] else " · 规划中")
         )
         self._values["file"].setText(str(project.params.get("path", "") or "—"))
-        self._values["source"].setText(project.dataset.source_path or "—")
+        self._values["source"].setText(project.dataset.source_label or "—")
 
         names = project.class_names
         distributions = project.dataset.class_counts or {}

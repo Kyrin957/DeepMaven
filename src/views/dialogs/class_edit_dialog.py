@@ -196,9 +196,8 @@ class ClassEditDialog(MessageBoxBase):
         self.viewLayout.addWidget(self.titleLabel)
         self.viewLayout.addWidget(self._build_body(name, color, cls_id))
 
-        self.hint = CaptionLabel(
-            "颜色可在右侧色板上自选，也可直接输入 #RRGGBB。", self
-        )
+        # 该标签只用于操作反馈，不放说明文字
+        self.hint = CaptionLabel("", self)
         self.hint.setWordWrap(True)
         self.viewLayout.addWidget(self.hint)
 
@@ -283,7 +282,7 @@ class ClassEditDialog(MessageBoxBase):
         if not text:
             return
         if not QColor(text).isValid():
-            self.hint.setText(f"「{text}」不是合法的颜色值（形如 #66CCFF）")
+            self.hint.setText("颜色值无效，形如 #66CCFF")
             return
         self.picker.set_color(text)
 

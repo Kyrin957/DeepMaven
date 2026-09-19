@@ -54,7 +54,8 @@ class ModelTab(BasePage):
         card, layout = self.add_card("权重导入")
         row = QHBoxLayout()
         self.weights_edit = LineEdit(card)
-        self.weights_edit.setPlaceholderText("选择 .pt 自定义权重，留空则使用官方预训练权重")
+        self.weights_edit.setPlaceholderText("自定义权重 (.pt)")
+        self.weights_edit.setToolTip("留空则使用官方预训练权重")
         row.addWidget(self.weights_edit, 1)
         browse_btn = PushButton("浏览…", card)
         browse_btn.clicked.connect(self._on_browse)
@@ -69,7 +70,7 @@ class ModelTab(BasePage):
 
     def _build_info_card(self) -> None:
         card, layout = self.add_card("模型信息")
-        self.info_label = CaptionLabel("导入权重后在此显示模型基础信息", card)
+        self.info_label = CaptionLabel("未导入权重", card)
         layout.addWidget(self.info_label)
 
     # -----------------------------------------------------------
@@ -91,8 +92,9 @@ class ModelTab(BasePage):
             self._vm.prepare_variant()
 
     def _on_selected(self, variant: dict) -> None:
+        # 变体说明已在下拉项里，这里只留尺寸
         self.variant_desc.setText(
-            f"默认推理尺寸 {variant['imgsz']}×{variant['imgsz']}  ·  {variant['desc']}"
+            f"推理尺寸 {variant['imgsz']}×{variant['imgsz']}"
         )
 
     def _on_model_info(self, info: dict) -> None:

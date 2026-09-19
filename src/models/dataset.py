@@ -19,7 +19,8 @@ class Dataset:
     """
 
     name: str = "未命名数据集"
-    source_path: str = ""           # 原始图片/标签来源目录
+    source_path: str = ""           # 原始图片/标签来源目录（首个来源，兼容旧项目）
+    source_paths: list[str] = field(default_factory=list)  # 全部来源目录（可多次导入累加）
     output_path: str = ""           # 划分结果的落盘目录
     data_yaml: str = ""             # 生成的 data.yaml 路径
     image_count: int = 0
@@ -45,10 +46,24 @@ class Dataset:
     def class_count(self) -> int:
         return len(self.class_names)
 
+    @property
+    def sources(self) -> list[str]:
+        """全部来源目录（旧项目只有单个 source_path 时自动兼容）。"""
+        values = [str(p) for p in self.source_paths if str(p).strip()]
+        if not values and self.source_path:
+            values = [self.source_path]
+        return values
+
+    @property
+    def source_label(self) -> str:
+        """来源目录的展示文本（多个来源用「；」分隔）。"""
+        return "；".join(self.sources)
+
     def to_dict(self) -> dict:
         return {
             "name": self.name,
             "source_path": self.source_path,
+            "source_paths": self.source_paths,
             "output_path": self.output_path,
             "data_yaml": self.data_yaml,
             "image_count": self.image_count,
@@ -69,6 +84,7 @@ class Dataset:
         return cls(
             name=data.get("name", "未命名数据集"),
             source_path=data.get("source_path", ""),
+            source_paths=list(data.get("source_paths", []) or []),
             output_path=data.get("output_path", ""),
             data_yaml=data.get("data_yaml", ""),
             image_count=data.get("image_count", 0),

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import stat
 from pathlib import Path
 
 from src.models.dataset import Dataset
@@ -60,8 +61,170 @@ class DatasetService:
         ]
 
     # -----------------------------------------------------------
+    # 多来源目录（图库可由多个文件夹累加而成）
+    # -----------------------------------------------------------
+    @staticmethod
+    def scan_images_multi(dirs: list) -> list[Path]:
+        """按给定顺序扫描多个目录并合并图片清单（按路径去重）。"""
+        result: list[Path] = []
+        seen: set[str] = set()
+        for raw in dirs or []:
+            directory = Path(raw)
+            if not directory.is_dir():
+                continue
+            for path in DatasetService.scan_images(directory):
+                key = str(path)
+                if key in seen:
+                    continue
+                seen.add(key)
+                result.append(path)
+        return result
+
+    @staticmethod
+    def scan_labels_multi(dirs: list) -> list[Path]:
+        """按给定顺序扫描多个目录并合并标签清单（按路径去重）。"""
+        result: list[Path] = []
+        seen: set[str] = set()
+        for raw in dirs or []:
+            directory = Path(raw)
+            if not directory.is_dir():
+                continue
+            for path in DatasetService.scan_labels(directory):
+                key = str(path)
+                if key in seen:
+                    continue
+                seen.add(key)
+                result.append(path)
+        return result
+
+    @staticmethod
+    def build_label_index_multi(dirs: list) -> dict[str, Path]:
+        """多来源目录的「图片主干 → 标签」索引（先出现者优先）。"""
+        index: dict[str, Path] = {}
+        for raw in dirs or []:
+            for stem, path in DatasetService.build_label_index(raw).items():
+                index.setdefault(stem, path)
+        return index
+
+    @staticmethod
+    def label_index_for(images: list, dirs: list = ()) -> dict[str, Path]:
+        """图片清单 → 标签索引。
+
+        来源目录内的图片按 YOLO 约定扫描配对；目录外的图片（多选文件导入）
+        按「同目录同名 .txt」配对，保证零散文件也能带上标签。
+        """
+        index = DatasetService.build_label_index_multi(list(dirs or []))
+        for raw in images or []:
+            image = Path(raw)
+            if image.stem in index:
+                continue
+            sibling = image.parent / f"{image.stem}.txt"
+            if sibling.is_file():
+                index[image.stem] = sibling
+        return index
+
+    @staticmethod
+    def child_class_dirs_multi(dirs: list) -> dict[str, list[Path]]:
+        """多来源目录的分类类别（子目录名）合并统计。"""
+        result: dict[str, list[Path]] = {}
+        for raw in dirs or []:
+            for name, items in DatasetService.child_class_dirs(raw).items():
+                result.setdefault(name, []).extend(items)
+        return result
+
+    @staticmethod
+    def sort_images(paths: list, mode: str = "name") -> list[Path]:
+        """按文件名 / 修改时间升序排序图片（同值时按文件名兜底）。"""
+        items = [Path(p) for p in paths]
+
+        if mode == "time":
+            def key(path: Path):
+                try:
+                    return (path.stat().st_mtime, path.name.lower())
+                except OSError:
+                    return (0.0, path.name.lower())
+        else:
+            def key(path: Path):
+                return path.name.lower()
+
+        return sorted(items, key=key)
+
+    @staticmethod
+    def accumulate_classes(labels: list) -> tuple[list[str], dict[str, int]]:
+        """统计标签中出现的类别（读取 YOLO 行的首字段）。"""
+        return DatasetService._accumulate_classes([Path(p) for p in labels])
+
+    @staticmethod
+    def summarize_library(
+        roots: list,
+        images: list | None = None,
+        label_index: dict | None = None,
+        name: str = "",
+        duplicate_count: int = 0,
+    ) -> Dataset:
+        """按「来源目录 + 图片清单 + 标签索引」重建数据集统计。
+
+        与 `summarize` 的差别：图片清单与标签索引可以由调用方直接给定，
+        因此支持多个来源目录（分多次导入）以及目录外的零散图片。
+        """
+        dirs = [Path(r) for r in (roots or [])]
+        if images is None:
+            images = DatasetService.scan_images_multi(dirs)
+        images = [Path(p) for p in images]
+        if label_index is None:
+            label_index = DatasetService.build_label_index_multi(dirs)
+
+        used_labels = [
+            label_index[image.stem] for image in images if image.stem in label_index
+        ]
+        class_names, class_counts = DatasetService.accumulate_classes(used_labels)
+
+        source = str(dirs[0]) if dirs else ""
+        dataset = Dataset(
+            name=name or (dirs[0].name if dirs else "未命名数据集"),
+            source_path=source,
+            source_paths=[str(d) for d in dirs],
+            image_count=len(images),
+            label_count=len(used_labels),
+            duplicate_count=duplicate_count,
+        )
+        dataset.class_names = class_names
+        dataset.class_counts = class_counts
+        if not class_names:
+            # 分类数据集没有标签文件，类别来自子目录名
+            folder_classes = DatasetService.child_class_dirs_multi(dirs)
+            if folder_classes:
+                dataset.class_names = list(folder_classes)
+                dataset.class_counts = {
+                    class_name: len(items)
+                    for class_name, items in folder_classes.items()
+                }
+        return dataset
+
+    # -----------------------------------------------------------
     # 内容去重（SHA256）
     # -----------------------------------------------------------
+    @staticmethod
+    def remove_file(path: str | Path) -> None:
+        """删除文件；只读文件先去掉只读属性再删。
+
+        从压缩包（ZIP）解出来的图片在 Windows 上带「只读」属性，
+        直接 `unlink()` 会抛 `PermissionError: [WinError 5]`，
+        这里补一次「清属性 → 再删」，与资源管理器的行为保持一致。
+
+        Raises:
+            OSError: 文件不存在或确实无法删除时向上抛出，由调用方处理。
+        """
+        target = Path(path)
+        try:
+            target.unlink()
+            return
+        except PermissionError:
+            pass
+        mode = target.stat().st_mode
+        os.chmod(target, mode | stat.S_IWRITE)
+        target.unlink()
+
     @staticmethod
     def file_sha256(path: str | Path, chunk_size: int = 1 << 20) -> str:
         """按内容计算 SHA256（分块读取，避免大图占内存）。"""
@@ -365,6 +528,8 @@ class DatasetService:
         seed: int = 0,
         stratified: bool = True,
         layout: str = "detect",
+        images: list | None = None,
+        label_index: dict | None = None,
     ) -> dict:
         """把图片（及同名标签）复制为可训练的 YOLO 数据集结构。
 
@@ -376,13 +541,19 @@ class DatasetService:
         Args:
             stratified: 是否分层抽样（分类任务恒按类别分层）。
             layout: 数据集结构，detect / segment / classify。
+            images: 待划分的图片清单；为 None 时扫描 `source_dir`。
+                图库可由多个文件夹组成，此时由调用方把合并后的清单传进来。
+            label_index: 「图片主干 → 标签」索引；为 None 时按 `source_dir` 配对。
 
         Returns:
             统计字典：total / train / val / test / labels / layout。
         """
         source = Path(source_dir)
         target = Path(target_dir)
-        images = DatasetService.scan_images(source)
+        if images is None:
+            images = DatasetService.scan_images(source)
+        else:
+            images = [Path(p) for p in images]
         stats = {
             "total": len(images), "train": 0, "val": 0, "test": 0,
             "labels": 0, "linked": 0, "copied": 0, "layout": layout,
@@ -408,7 +579,8 @@ class DatasetService:
             )
             return stats
 
-        label_index = DatasetService.build_label_index(source)
+        if label_index is None:
+            label_index = DatasetService.build_label_index(source)
         buckets = DatasetService.split_members(
             images, label_index, split=split, seed=seed,
             stratified=stratified, layout=layout,
@@ -452,7 +624,8 @@ class DatasetService:
         """
         if destination.exists():
             try:
-                destination.unlink()
+                # 划分产物可能是上一次留下的只读硬链接，同样需要先清属性
+                DatasetService.remove_file(destination)
             except OSError:
                 pass
         try:
@@ -531,8 +704,14 @@ class DatasetService:
         seed: int = 0,
         stratified: bool = True,
         layout: str = "detect",
+        images: list | None = None,
+        label_index: dict | None = None,
     ) -> dict:
         """**不落盘**地计算划分结果，供界面预览（拆分页的饼图与类别分布）。
+
+        Args:
+            images: 待划分的图片清单；为 None 时扫描 `source_dir`。
+            label_index: 「图片主干 → 标签」索引；为 None 时按 `source_dir` 配对。
 
         Returns:
             {
@@ -542,8 +721,9 @@ class DatasetService:
               "per_class": {类别: {"total": n, "train": n, "val": n, "test": n}},
             }
         """
-        source = Path(source_dir)
-        images = DatasetService.scan_images(source)
+        source = Path(source_dir) if source_dir else None
+        if images is None:
+            images = DatasetService.scan_images(source) if source else []
         result: dict = {
             "total": len(images), "layout": layout,
             "subsets": {}, "per_class": {},
@@ -551,10 +731,11 @@ class DatasetService:
         if not images:
             return result
 
-        label_index = (
-            {} if layout == "classify"
-            else DatasetService.build_label_index(source)
-        )
+        if label_index is None:
+            label_index = (
+                {} if layout == "classify" or source is None
+                else DatasetService.build_label_index(source)
+            )
         buckets = DatasetService.split_members(
             images, label_index, split=split, seed=seed,
             stratified=stratified, layout=layout,

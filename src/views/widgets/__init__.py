@@ -12,6 +12,8 @@ from .thumbnail_grid import (
     THUMB_LARGE,
     THUMB_MEDIUM,
     THUMB_SMALL,
+    THUMB_STEPS,
+    THUMB_XLARGE,
     ThumbnailGrid,
 )
 
@@ -24,6 +26,8 @@ __all__ = [
     "THUMB_LARGE",
     "THUMB_MEDIUM",
     "THUMB_SMALL",
+    "THUMB_STEPS",
+    "THUMB_XLARGE",
     "ThumbnailGrid",
     "MODE_BROWSE",
     "MODE_BOX",

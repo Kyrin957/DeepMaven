@@ -120,7 +120,7 @@ class TrainViewModel(QObject):
         if self._config.task_type == "anomaly":
             if not self._config.anomaly_root:
                 self.message.emit(
-                    "warning", "请先选择异常检测数据目录（需含 normal/ 与 abnormal/）"
+                    "warning", "请选择含 normal/ 与 abnormal/ 的目录"
                 )
                 return
         elif not self._config.data_yaml:

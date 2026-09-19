@@ -134,6 +134,7 @@ class AnnotateTab(QWidget):
         list_layout.addWidget(StrongBodyLabel("图像列表", list_card))
         self.grid = ThumbnailGrid(list_card)
         self.grid.set_thumb_size(THUMB_SMALL)
+        self.grid.set_wheel_zoom(True)      # Ctrl + 滚轮缩放缩略图
         list_layout.addWidget(self.grid, 1)
 
         return side_column(current_card, list_card, width=240)
@@ -411,13 +412,9 @@ class AnnotateTab(QWidget):
         self.rotate_spin.setVisible(is_obb)
         self.rotate_btn.setVisible(is_obb)
         if mode == "none":
-            self.status_message(
-                "该任务类型按整图判定，无需框选标注；类别可在「图库」页管理"
-            )
+            self.status_message("按整图判定，无需框选")
         elif is_obb:
-            self.status_message(
-                "旋转框：拖出矩形后，用「旋转选中」微调角度（自动转四点框）"
-            )
+            self.status_message("旋转框：拖框后用「旋转选中」调角度")
 
     def _on_rotate(self) -> None:
         delta = self.rotate_spin.value()
@@ -426,9 +423,9 @@ class AnnotateTab(QWidget):
             return
         if self.canvas.rotate_selected(delta):
             self.rotate_spin.setValue(0.0)
-            self.status_message(f"已旋转 {delta:+.1f}°，记得点击「保存标注」")
+            self.status_message(f"已旋转 {delta:+.1f}°")
         else:
-            self.status_message("请先在画布或「标注对象」列表中选中一个标注")
+            self.status_message("请先选中一个标注")
 
     def _on_jump(self) -> None:
         self._vm.set_current(self.jump_spin.value() - 1)

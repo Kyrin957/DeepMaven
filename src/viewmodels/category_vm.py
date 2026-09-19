@@ -88,7 +88,7 @@ class CategoryViewModel(QObject):
         if project is None:
             return
         CategoryService.remove(project.classes, cls_id)
-        self._commit("类别已删除；id 已重排，已有标注需核查")
+        self._commit("类别已删除，id 已重排")
 
     def move_class(self, cls_id: int, delta: int) -> None:
         """上移 / 下移类别。"""

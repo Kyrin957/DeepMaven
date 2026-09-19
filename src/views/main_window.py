@@ -348,16 +348,23 @@ class MainWindow(FluentWindow):
         )
 
     def _show_message(self, level: str, text: str) -> None:
-        """在窗口右上角弹出 InfoBar。level: success / error / warning / info。"""
+        """在窗口右上角弹出 InfoBar。level: success / error / warning / info。
+
+        info 级（蓝色图标）只写入后台日志，不弹窗：这类消息多是「已保存 /
+        当前档位 / 已刷新」之类的过程反馈，弹窗太吵；页面内的提示文字、
+        状态栏与日志仍然保留，反馈不会丢失。
+        """
         level = level if level in ("success", "error", "warning", "info") else "info"
+        logger.info("[%s] %s", level, text)
+        if level == "info":
+            return
         getattr(InfoBar, level)(
             title=text,
             content="",
             parent=self,
             position=InfoBarPosition.TOP_RIGHT,
-            duration=3000,
+            duration=5000,       # 通知停留时长
         )
-        logger.info("[%s] %s", level, text)
 
     # -----------------------------------------------------------
     # 其它
@@ -421,6 +428,6 @@ class MainWindow(FluentWindow):
         self.titleBar.move(0, 0)
         self.titleBar.resize(self.width(), self.titleBar.height())
 
-    def closeEvent(self, event) -> None:
+    def closeEvent(self, e) -> None:  # noqa: N802 - Qt 命名
         logger.info("应用退出")
-        super().closeEvent(event)
+        super().closeEvent(e)

@@ -30,6 +30,7 @@ from qfluentwidgets import (
 )
 
 from src.views.dialogs.class_edit_dialog import PRESET_COLORS, ClassEditDialog
+from src.views.widgets import THUMB_LARGE, THUMB_STEPS
 
 _COLOR_FALLBACK = "#66CCFF"
 _UNLABELED_ROW_LABEL = "无标签"
@@ -75,7 +76,7 @@ class StatsCard(CardWidget):
         self._values["labels"].setText(str(dataset.label_count))
         self._values["classes"].setText(str(dataset.class_count))
         self._values["duplicates"].setText(str(dataset.duplicate_count))
-        self.source.setText(f"来源：{dataset.source_path or '—'}")
+        self.source.setText(f"来源：{dataset.source_label or '—'}")
 
 
 class ImportCard(CardWidget):
@@ -102,10 +103,6 @@ class ImportCard(CardWidget):
         self.files_btn.setIcon(FluentIcon.PHOTO)
         self.files_btn.clicked.connect(self.filesRequested)
         layout.addWidget(self.files_btn)
-
-        self.hint = CaptionLabel("也可以把文件夹或图片直接拖入窗口。", self)
-        self.hint.setWordWrap(True)
-        layout.addWidget(self.hint)
 
 
 class ClassRow(QWidget):
@@ -216,9 +213,8 @@ class ClassCard(CardWidget):
         self.list.itemSelectionChanged.connect(self._on_selection)
         layout.addWidget(self.list)
 
-        self.hint = CaptionLabel(
-            "点击类别行可给它赋值；行尾按钮可编辑名称 / 颜色，或删除类别。", self
-        )
+        # 该标签只用于操作反馈，不放说明文字
+        self.hint = CaptionLabel("", self)
         self.hint.setWordWrap(True)
         layout.addWidget(self.hint)
 
@@ -404,6 +400,9 @@ class FilterCard(CardWidget):
 
     def __init__(self, with_size: bool = True, parent=None):
         super().__init__(parent)
+        # 尺寸档位与网格共用同一套（页面用 set_thumb_steps 再收窄）
+        self._thumb_steps: tuple[int, ...] = THUMB_STEPS
+        self._syncing_thumb = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(6)
@@ -424,11 +423,9 @@ class FilterCard(CardWidget):
             size_row = QHBoxLayout()
             size_row.addWidget(CaptionLabel("缩略图", self))
             self.size_slider = Slider(Qt.Orientation.Horizontal, self)
-            self.size_slider.setRange(0, 2)
-            self.size_slider.setValue(1)
-            self.size_slider.valueChanged.connect(
-                lambda value: self.thumbSizeChanged.emit(int(value))
-            )
+            self.size_slider.setRange(0, max(0, len(self._thumb_steps) - 1))
+            self.size_slider.setValue(self._thumb_index(THUMB_LARGE))
+            self.size_slider.valueChanged.connect(self._on_slider_value)
             size_row.addWidget(self.size_slider, 1)
             layout.addLayout(size_row)
 
@@ -445,6 +442,47 @@ class FilterCard(CardWidget):
 
     def filter_key(self) -> str:
         return self._key
+
+    def set_thumb_steps(self, steps) -> None:
+        """配置尺寸档位（与 `ThumbnailGrid.set_thumb_steps` 保持一致）。"""
+        values = sorted({int(s) for s in (steps or []) if int(s) > 0})
+        if not values:
+            return
+        self._thumb_steps = tuple(values)
+        slider = getattr(self, "size_slider", None)
+        if slider is not None:
+            slider.setRange(0, len(self._thumb_steps) - 1)
+
+    def set_thumb_size(self, size: int) -> None:
+        """按「尺寸」同步旋钮位置（Ctrl + 滚轮缩放后调用）。
+
+        不能用 `blockSignals` 同步：qfluentwidgets 的滑杆靠自身 valueChanged
+        驱动旋钮移动，阻塞信号会出现「数值变了但旋钮不动」。
+        这里改用短标志忽略本次回调；页面侧处理是幂等的，不会来回打架。
+        """
+        slider = getattr(self, "size_slider", None)
+        if slider is None:
+            return
+        index = self._thumb_index(size)
+        if slider.value() == index:
+            return
+        self._syncing_thumb = True
+        try:
+            slider.setValue(index)
+        finally:
+            self._syncing_thumb = False
+
+    def _thumb_index(self, size: int) -> int:
+        """尺寸 → 档位下标（取最近档位）。"""
+        return min(
+            range(len(self._thumb_steps)),
+            key=lambda i: abs(self._thumb_steps[i] - int(size)),
+        )
+
+    def _on_slider_value(self, value: int) -> None:
+        if self._syncing_thumb:
+            return
+        self.thumbSizeChanged.emit(int(value))
 
 
 class SectionLabel(CaptionLabel):

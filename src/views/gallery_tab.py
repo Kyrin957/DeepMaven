@@ -37,17 +37,13 @@ from qfluentwidgets import (
 from src.viewmodels.category_vm import CategoryViewModel
 from src.viewmodels.dataset_vm import DatasetViewModel
 from src.views.data_widgets import ClassCard, ImportCard, StatsCard, side_column
-from src.views.dialogs import TagEditDialog
+from src.views.dialogs import ImportImagesDialog, TagEditDialog
 from src.views.dialogs.tag_edit_dialog import DEFAULT_TAG_COLOR
 from src.views.gallery_widgets import FilterBar, SplitMapCard, TagCard
-from src.views.widgets import (
-    THUMB_LARGE,
-    THUMB_MEDIUM,
-    THUMB_SMALL,
-    ThumbnailGrid,
-)
+from src.views.widgets import THUMB_STEPS, ThumbnailGrid
 
-_THUMB_STEPS = (THUMB_SMALL, THUMB_MEDIUM, THUMB_LARGE)
+# 尺寸档位与网格、尺寸滑杆共用同一套（见 views/widgets/thumbnail_grid.py）
+_THUMB_STEPS = THUMB_STEPS
 _IMAGE_FILTER = "图片 (*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp)"
 _SIDE_WIDTH = 292
 
@@ -109,6 +105,7 @@ class GalleryTab(QWidget):
         main.addWidget(self.filter_bar)
 
         self.grid = ThumbnailGrid(self)
+        self.grid.set_wheel_zoom(True)      # Ctrl + 滚轮缩放缩略图
         main.addWidget(self.grid, 1)
 
         self.hint = CaptionLabel("", self)
@@ -126,6 +123,8 @@ class GalleryTab(QWidget):
         self.filter_bar.filterChanged.connect(self.refresh)
         self.filter_bar.textChanged.connect(lambda _t: self.refresh())
         self.filter_bar.thumbSizeChanged.connect(self._on_thumb_size)
+        # Ctrl + 滚轮缩放后回同步滑杆
+        self.grid.thumbSizeChanged.connect(self._on_grid_thumb_size)
 
         self.class_card.classClicked.connect(self._on_class_clicked)
         self.class_card.changed.connect(self.refresh)
@@ -168,12 +167,18 @@ class GalleryTab(QWidget):
         if self._category_vm is not None:
             self.class_card.set_classes(list(self._category_vm.classes), counts)
 
+        # 筛选候选自动跟随左侧面板：标签类别 / 数据集拆分 / 图像标记
+        if self._category_vm is not None:
+            self.filter_bar.set_classes(
+                [cls.name for cls in self._category_vm.classes]
+            )
         self.filter_bar.set_tag_names(self._vm.all_tag_names())
         paths = self._vm.filter_images(
             label=self.filter_bar.label_value(),
             mark=self.filter_bar.mark_value(),
             split=self.filter_bar.split_value(),
             text=self.filter_bar.text(),
+            class_name=self.filter_bar.class_value(),
         )
         new_paths = [str(path) for path in paths]
         decorations = self._vm.gallery_decorations(paths)
@@ -198,11 +203,9 @@ class GalleryTab(QWidget):
         total = len(self._vm.images())
         self.filter_bar.set_summary(len(new_paths), total)
         self.hint.setText(
-            "尚未导入数据集。点击左侧「导入文件夹」，或把图片直接拖入窗口。"
+            "尚未导入图像"
             if dataset is None
-            else f"已选 {len(self.grid.selected_indexes())} / {len(new_paths)} 张；"
-                 "选中图像后：点类别行改类别、点拆分映射行改划、点标记追加或删除；"
-                 "右键可打开位置 / 另存 / 移除。"
+            else f"已选 {len(self.grid.selected_indexes())} / {len(new_paths)} 张"
         )
         self._update_side_state()
         self._stale = False
@@ -259,6 +262,11 @@ class GalleryTab(QWidget):
         index = max(0, min(len(_THUMB_STEPS) - 1, int(step)))
         self.grid.set_thumb_size(_THUMB_STEPS[index])
         self._vm.notify(f"缩略图尺寸：{self.grid.thumb_size()}px")
+
+    def _on_grid_thumb_size(self, size: int) -> None:
+        """Ctrl + 滚轮缩放后，把尺寸滑杆同步到对应档位。"""
+        self.filter_bar.set_thumb_size(int(size))
+        self._vm.notify(f"缩略图尺寸：{int(size)}px")
 
     def _on_double_click(self, index: int) -> None:
         path = self.grid.path_at(index)
@@ -364,7 +372,7 @@ class GalleryTab(QWidget):
         menu.addSeparator()
         menu.addAction(
             Action(
-                f"移除所选图像（{len(paths)} 张）",
+                f"从数据集移除（{len(paths)} 张）",
                 triggered=lambda: self._remove_images(paths),
             )
         )
@@ -388,8 +396,8 @@ class GalleryTab(QWidget):
     def _remove_images(self, paths: list) -> None:
         box = MessageBox(
             "移除所选图像",
-            f"确定要从数据集中移除这 {len(paths)} 张图像吗？\n\n"
-            "图像文件会从数据集目录中删除，项目归档里的副本也会一并移除。",
+            f"确定要把这 {len(paths)} 张图像从数据集中移除吗？\n\n"
+            "只移出图库，本地文件不会被删除。",
             self.window(),
         )
         box.yesButton.setText("移除")
@@ -403,14 +411,52 @@ class GalleryTab(QWidget):
     def _on_import_folder(self) -> None:
         directory = QFileDialog.getExistingDirectory(self, "选择图片文件夹")
         if directory:
-            self._vm.import_images(directory)
+            self._import_dialog("folder", [directory])
 
     def _on_import_files(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(
             self, "选择图片", "", _IMAGE_FILTER
         )
         if paths:
-            self._vm.import_files(paths)
+            self._import_dialog("files", paths)
+
+    def _import_dialog(self, mode: str, selection: list) -> None:
+        """打开「导入图像」选项弹窗，按选项完成排序 / 插入位置 / 初步标注。"""
+        classes = (
+            [cls.name for cls in self._category_vm.classes]
+            if self._category_vm is not None else []
+        )
+        existing = self._vm.images()
+        dialog = ImportImagesDialog(
+            self.window(),
+            mode=mode,
+            initial=selection,
+            has_dataset=bool(existing),
+            classes=classes,
+            existing_count=len(existing),
+        )
+        if not dialog.exec():
+            return
+
+        data = dialog.result_data()
+        label = str(data.get("label") or "")
+        if label:
+            # OK / NG 这类快捷初步标注：项目里还没有对应类别时先建类再导入
+            self._ensure_class(label)
+        if str(data.get("mode")) == "folder":
+            paths = list(data.get("paths") or [])
+            if paths:
+                self._vm.import_images(paths[0], data)
+        else:
+            self._vm.import_files(list(data.get("paths") or []), data)
+
+    def _ensure_class(self, name: str) -> None:
+        """确保项目类别表里存在该类别（初步标注用）。"""
+        if self._category_vm is None:
+            return
+        if any(str(cls.name) == name for cls in self._category_vm.classes):
+            return
+        self._category_vm.add_class(name)
 
     def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         if event.mimeData().hasUrls():
@@ -423,7 +469,7 @@ class GalleryTab(QWidget):
         directories = [p for p in paths if Path(p).is_dir()]
         files = [p for p in paths if Path(p).is_file()]
         if files:
-            self._vm.import_files(files)
+            self._import_dialog("files", files)
         elif directories:
-            self._vm.import_images(directories[0])
+            self._import_dialog("folder", [directories[0]])
         event.acceptProposedAction()

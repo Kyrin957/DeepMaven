@@ -150,7 +150,7 @@ class SplitTab(QWidget):
         class_layout.setContentsMargins(16, 12, 16, 12)
         class_layout.setSpacing(6)
         class_layout.addWidget(StrongBodyLabel("类别分布预览", class_card))
-        self.class_hint = CaptionLabel("导入数据集后可查看各类别样本分布。", class_card)
+        self.class_hint = CaptionLabel("", class_card)
         class_layout.addWidget(self.class_hint)
         self.bar_chart = BarChart(class_card)
         class_layout.addWidget(self.bar_chart)
@@ -179,9 +179,7 @@ class SplitTab(QWidget):
         layout.setSpacing(8)
         layout.addWidget(StrongBodyLabel("数据增强", card))
 
-        self.aug_hint = CaptionLabel(
-            "对已标注图片生成增强副本（需安装 Albumentations）。", card
-        )
+        self.aug_hint = CaptionLabel("", card)
         layout.addWidget(self.aug_hint)
 
         grid = QHBoxLayout()
@@ -282,9 +280,7 @@ class SplitTab(QWidget):
         self._refresh_preview()
         preview = self._vm.preview_split()
         total = int(preview.get("total", 0)) if preview else 0
-        self._vm.notify(
-            f"已刷新预览：共 {total} 张待划分" if total else "没有可划分的图片"
-        )
+        self._vm.notify(f"共 {total} 张待划分" if total else "没有可划分的图片")
 
     def _on_name_changed(self) -> None:
         if self._syncing:
@@ -292,7 +288,7 @@ class SplitTab(QWidget):
         self._vm.set_split_name(self.name_edit.text())
         resolved = self._vm.split_name()
         self.name_edit.setText(resolved)
-        self._vm.notify(f"拆分名称已设为「{resolved}」，下次拆分会输出到该目录")
+        self._vm.notify(f"拆分名称：{resolved}")
 
     def _refresh_preview(self) -> None:
         preview = self._vm.preview_split()
@@ -301,7 +297,7 @@ class SplitTab(QWidget):
             self.pie.set_data([], "")
             self.legend.set_data([])
             self.bar_chart.set_data([])
-            self.class_hint.setText("导入数据集后可查看各类别样本分布。")
+            self.class_hint.setText("暂无数据")
             return
 
         subsets = preview.get("subsets") or {}
@@ -330,10 +326,7 @@ class SplitTab(QWidget):
             color = _COLOR_UNLABELED if name == UNLABELED_LABEL else "#0F6CBD"
             rows.append((name, count, maximum or 1, color))
         self.bar_chart.set_data(rows)
-        self.class_hint.setText(
-            f"共 {len(per_class)} 个类别，合计 {total} 张；"
-            "按类别分层抽样时会尽量保持各子集比例一致。"
-        )
+        self.class_hint.setText(f"共 {len(per_class)} 个类别 · {total} 张")
 
     # -----------------------------------------------------------
     # 参数
@@ -388,32 +381,30 @@ class SplitTab(QWidget):
 
     def _on_aug_preview(self) -> None:
         if not AugmentService.is_available():
-            self.aug_hint.setText("未安装 Albumentations，无法预览增强效果。")
-            self._vm.notify("未安装 Albumentations，无法预览增强效果", "error")
+            self.aug_hint.setText("未安装 Albumentations")
+            self._vm.notify("未安装 Albumentations，无法预览增强", "error")
             return
         arrays = self._vm.augment_preview(self._augment_config(), count=4)
         if not arrays:
-            self.aug_hint.setText(
-                "没有可用于预览的已标注图片（检测/分割任务需先标注）。"
-            )
-            self._vm.notify("没有可用于预览的已标注图片（需先完成框/多边形标注）", "warning")
+            self.aug_hint.setText("没有已标注的图片")
+            self._vm.notify("没有已标注的图片，无法预览增强", "warning")
             return
         for index, label in enumerate(self.preview_labels):
             if index < len(arrays):
                 label.setPixmap(self._to_pixmap(arrays[index], 92))
             else:
                 label.clear()
-        self.aug_hint.setText(f"已生成 {len(arrays)} 张预览（基于第一张已标注图片）。")
+        self.aug_hint.setText(f"已生成 {len(arrays)} 张预览")
         self._vm.notify(f"已生成 {len(arrays)} 张增强预览")
 
     def _on_aug_apply(self) -> None:
         if not AugmentService.is_available():
-            self.aug_hint.setText("未安装 Albumentations，无法执行增强。")
+            self.aug_hint.setText("未安装 Albumentations")
             self._vm.notify("未安装 Albumentations，无法执行增强", "error")
             return
         if self._vm.split_layout() == "classify":
-            self.aug_hint.setText("分类任务暂不支持离线增强（需先完成框/多边形标注）。")
-            self._vm.notify("分类任务没有框/多边形标注，暂不支持离线增强", "warning")
+            self.aug_hint.setText("分类任务不支持离线增强")
+            self._vm.notify("分类任务不支持离线增强", "warning")
             return
         self._vm.augment_apply(self._augment_config())
 

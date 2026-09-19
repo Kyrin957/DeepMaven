@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QRectF, QSize, Qt, Signal
+from PySide6.QtCore import QEvent, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -44,11 +44,28 @@ _SUBSET_KEY = {"T": "train", "V": "val", "E": "test"}
 _SUBSET_NAME = {"T": "train（训练）", "V": "val（验证）", "E": "test（测试）"}
 _MAX_MARKERS = 4            # 左下角最多显示几个标记色点
 
-# 缩略图尺寸档位（界面上的 小 / 中 / 大）
+# 图片上的三个角标：下面都是**基准尺寸**（176px 档位下的大小），
+# 绘制时按「缩略图档位 / 基准边长」等比缩放，避免小图角标过大、大图角标过小。
+_REFERENCE_THUMB = 176.0    # 基准缩略图边长（THUMB_LARGE，此档位下角标大小刚好）
+_MIN_SCALE = 0.25           # 缩放下限，防止极端档位下角标被压成 0
+
+_MARK_SIZE = 22.0           # 右上角「已标注」三角
+_SUBSET_SIZE = 28.0         # 右下角 T / V / E 方块
+_SUBSET_FONT = 12.0         # T / V / E 字母字号
+_MARKER_SIZE = 12.0         # 左下角标记色点
+_MARKER_GAP = 4.0
+
+_BADGE_INSET = 7.0          # 角标距缩略图框边缘的间距（基准）
+_THUMB_INSET = 5.0          # 缩略图框距卡片边缘的间距
+_THUMB_TEXT_RESERVE = 28.0  # 卡片底部为文件名一行预留的高度
+
+# 缩略图尺寸档位（界面上的 小 / 中 / 大 / 特大）
 THUMB_SMALL = 88
 THUMB_MEDIUM = 124
 THUMB_LARGE = 176
-MASTER_SIZE = 176          # 缓存主图的边长（内存与清晰度的折中）
+THUMB_XLARGE = 352         # 特大档：最大档再大一倍
+THUMB_STEPS = (THUMB_SMALL, THUMB_MEDIUM, THUMB_LARGE, THUMB_XLARGE)
+MASTER_SIZE = THUMB_XLARGE  # 缓存主图的边长（按最大档取，放大时不糊）
 
 # 配色
 _COLOR_BG = "#2B2B2B"
@@ -60,12 +77,12 @@ _COLOR_MARK = "#E3008C"        # 已标注角标（DLT 粉色）
 _COLOR_TEXT = "#E8E8E8"
 _COLOR_TEXT_DIM = "#909090"
 
-_SUBSET_SIZE = 14.0            # 右下角 T / V / E 标记的边长
 _COLOR_TAG_EMPTY = "#8A8A8A"   # 标记没有颜色时的色点颜色
 
 # 主图缓存：同一进程内复用已解码并缩放的缩略图，避免每次刷新都重新读盘解码
+# （主图按最大档尺寸缓存，条目较大，因此上限比早期版本收敛）
 _MASTER_CACHE: dict = {}
-_MASTER_CACHE_LIMIT = 512
+_MASTER_CACHE_LIMIT = 192
 
 
 class ThumbnailDelegate(QStyledItemDelegate):
@@ -78,10 +95,32 @@ class ThumbnailDelegate(QStyledItemDelegate):
     def sizeHint(self, option, index) -> QSize:  # noqa: N802 - Qt 命名
         return QSize(self.thumb + 18, self.thumb + 42)
 
+    def _badge_scale(self) -> float:
+        """角标缩放系数（以 `_REFERENCE_THUMB` 为基准）。"""
+        return max(_MIN_SCALE, self.thumb / _REFERENCE_THUMB)
+
+    @staticmethod
+    def _thumb_rect(rect: QRectF) -> QRectF:
+        """缩略图框（图片显示区域）。下边两个角标以它为锚点。"""
+        return QRectF(
+            rect.left() + _THUMB_INSET,
+            rect.top() + _THUMB_INSET,
+            rect.width() - _THUMB_INSET * 2,
+            rect.height() - _THUMB_TEXT_RESERVE,
+        )
+
     def paint(self, painter: QPainter, option, index) -> None:  # noqa: N802
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         rect = QRectF(option.rect).adjusted(2.0, 2.0, -2.0, -2.0)
+
+        # 角标随缩略图档位等比缩放（176px 为基准）
+        scale = self._badge_scale()
+        mark_size = _MARK_SIZE * scale
+        subset_size = _SUBSET_SIZE * scale
+        marker_size = _MARKER_SIZE * scale
+        marker_gap = _MARKER_GAP * scale
+        badge_inset = max(3.0, _BADGE_INSET * scale)
 
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
@@ -99,13 +138,10 @@ class ThumbnailDelegate(QStyledItemDelegate):
         painter.drawRoundedRect(rect, 4.0, 4.0)
 
         # 缩略图
+        thumb_rect = self._thumb_rect(rect)
         icon = index.data(Qt.ItemDataRole.DecorationRole)
         if isinstance(icon, QIcon) and not icon.isNull():
-            icon_rect = QRectF(
-                rect.left() + 5, rect.top() + 5,
-                rect.width() - 10, rect.height() - 28,
-            )
-            icon.paint(painter, icon_rect.toRect(), Qt.AlignmentFlag.AlignCenter)
+            icon.paint(painter, thumb_rect.toRect(), Qt.AlignmentFlag.AlignCenter)
 
         # 文件名（过长时中间省略）
         font = QFont(option.font)
@@ -124,49 +160,49 @@ class ThumbnailDelegate(QStyledItemDelegate):
         )
 
         # 已标注角标：右上角实心三角，颜色取自该图所属类别颜色
+        # （挂在卡片右上角，不压到图片显示区域）
         if annotated:
-            size = 11.0
             path = QPainterPath()
             path.moveTo(rect.right() - 1, rect.top() + 1)
-            path.lineTo(rect.right() - 1 - size, rect.top() + 1)
-            path.lineTo(rect.right() - 1, rect.top() + 1 + size)
+            path.lineTo(rect.right() - 1 - mark_size, rect.top() + 1)
+            path.lineTo(rect.right() - 1, rect.top() + 1 + mark_size)
             path.closeSubpath()
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor(str(index.data(_COLOR_ROLE) or "") or _COLOR_MARK))
             painter.drawPath(path)
 
-        # 所属数据集标记：右下角 T / V / E
+        # 所属数据集标记：贴着缩略图框右下角
         subset = str(index.data(_SUBSET_ROLE) or "")
         if subset:
             box = QRectF(
-                rect.right() - 7.0 - _SUBSET_SIZE,
-                rect.bottom() - 30.0 - _SUBSET_SIZE,
-                _SUBSET_SIZE,
-                _SUBSET_SIZE,
+                thumb_rect.right() - badge_inset - subset_size,
+                thumb_rect.bottom() - badge_inset - subset_size,
+                subset_size,
+                subset_size,
             )
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(
                 QColor(SPLIT_COLORS.get(_SUBSET_KEY.get(subset, ""), "#4A5459"))
             )
-            painter.drawRoundedRect(box, 3.0, 3.0)
+            painter.drawRoundedRect(box, max(2.0, 3.0 * scale), max(2.0, 3.0 * scale))
             badge_font = QFont(option.font)
-            badge_font.setPointSizeF(max(6.5, badge_font.pointSizeF() - 2.0))
+            badge_font.setPointSizeF(max(6.0, _SUBSET_FONT * scale))
             badge_font.setBold(True)
             painter.setFont(badge_font)
             painter.setPen(QColor("#FFFFFF"))
             painter.drawText(box, Qt.AlignmentFlag.AlignCenter, subset)
 
-        # 图像标记：左下角色点（最多 4 个）
+        # 图像标记：贴着缩略图框左下角（最多 4 个）
         markers = index.data(_MARKERS_ROLE) or []
         if isinstance(markers, (list, tuple)) and markers:
-            size, gap = 6.0, 2.0
-            left = rect.left() + 7.0
-            top = rect.bottom() - 30.0 - size
+            left = thumb_rect.left() + badge_inset
+            top = thumb_rect.bottom() - badge_inset - marker_size
             painter.setPen(Qt.PenStyle.NoPen)
             for position, color in enumerate(list(markers)[:_MAX_MARKERS]):
                 painter.setBrush(QColor(str(color) or _COLOR_TAG_EMPTY))
                 painter.drawEllipse(
-                    QRectF(left + position * (size + gap), top, size, size)
+                    QRectF(left + position * (marker_size + marker_gap),
+                           top, marker_size, marker_size)
                 )
 
         painter.restore()
@@ -178,9 +214,14 @@ class ThumbnailGrid(QListWidget):
     imageActivated = Signal(int)        # 当前项变化（点击 / 键盘）
     imageDoubleClicked = Signal(int)    # 双击
     imageContextMenu = Signal(int, object)   # 右键：(行号, 全局坐标)
+    thumbSizeChanged = Signal(int)      # Ctrl + 滚轮调整尺寸后广播（供页面同步滑杆）
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        # Ctrl + 滚轮缩放默认关闭，由需要它的页面打开（避免影响其它页面的固定尺寸）
+        self._wheel_zoom = False
+        # 本网格允许的缩放档位（页面可用 set_thumb_steps 收窄，与滑杆共用）
+        self._steps: tuple[int, ...] = THUMB_STEPS
         self._delegate = ThumbnailDelegate(self)
         self.setItemDelegate(self._delegate)
         self.setViewMode(QListView.ViewMode.IconMode)
@@ -330,6 +371,69 @@ class ThumbnailGrid(QListWidget):
 
     def thumb_size(self) -> int:
         return self._delegate.thumb
+
+    def set_thumb_steps(self, steps) -> None:
+        """限定本网格允许的缩放档位（升序去重；非法时回退为全部档位）。
+
+        Ctrl + 滚轮与页面上的尺寸滑杆**共用这一套档位**，页面据此设置滑杆范围，
+        避免两侧档位数量不一致导致滑杆指到错误位置。
+        """
+        values = sorted({int(s) for s in (steps or []) if int(s) > 0})
+        self._steps = tuple(values) or THUMB_STEPS
+        if self.thumb_size() not in self._steps:
+            self.set_thumb_size(self._steps[self.thumb_index()])
+
+    def thumb_steps(self) -> tuple[int, ...]:
+        return self._steps
+
+    def thumb_index(self) -> int:
+        """当前尺寸在档位表中的下标（取最近档位）。"""
+        return min(
+            range(len(self._steps)),
+            key=lambda i: abs(self._steps[i] - self.thumb_size()),
+        )
+
+    # -----------------------------------------------------------
+    # Ctrl + 滚轮缩放
+    # -----------------------------------------------------------
+    def set_wheel_zoom(self, enabled: bool) -> None:
+        """是否允许 Ctrl + 滚轮调整缩略图尺寸。"""
+        self._wheel_zoom = bool(enabled)
+
+    def zoom(self, delta: int) -> bool:
+        """按本网格的档位缩放缩略图（delta 为 +1 / -1）。返回档位是否变化。"""
+        sizes = self._steps
+        current = self.thumb_size()
+        index = self.thumb_index()
+        target = max(0, min(len(sizes) - 1, index + int(delta)))
+        if sizes[target] == current:
+            return False
+        self.set_thumb_size(sizes[target])
+        self.thumbSizeChanged.emit(sizes[target])
+        return True
+
+    def _handle_wheel(self, event) -> bool:
+        """Ctrl + 滚轮缩放；返回是否已处理（未处理则交给默认滚动）。"""
+        if event.type() != QEvent.Type.Wheel:
+            return False
+        if not self._wheel_zoom:
+            return False
+        if not (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            return False
+        self.zoom(1 if event.angleDelta().y() > 0 else -1)
+        event.accept()
+        return True
+
+    def viewportEvent(self, event) -> bool:  # noqa: N802 - Qt 命名
+        """真实鼠标滚轮由视口接收，必须在这里拦截才生效。"""
+        if self._handle_wheel(event):
+            return True
+        return super().viewportEvent(event)
+
+    def wheelEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        """Ctrl + 滚轮缩放缩略图；否则交给父类滚动列表。"""
+        if not self._handle_wheel(event):
+            super().wheelEvent(event)
 
     # -----------------------------------------------------------
     # 内部

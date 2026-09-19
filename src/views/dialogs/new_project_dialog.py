@@ -134,7 +134,7 @@ class NewProjectDialog(MessageBoxBase):
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
-        layout.addWidget(CaptionLabel("从现有数据集创建项目（可选）：", container))
+        layout.addWidget(CaptionLabel("从现有数据集创建", container))
 
         row = QHBoxLayout()
         row.setSpacing(10)
@@ -142,9 +142,7 @@ class NewProjectDialog(MessageBoxBase):
         self.dataset_btn.setIcon(FluentIcon.FOLDER)
         self.dataset_btn.clicked.connect(self._on_pick_dataset)
         row.addWidget(self.dataset_btn)
-        self.dataset_label = CaptionLabel(
-            "不导入：项目创建后在「图库」页导入图片或拖入文件夹即可。", container
-        )
+        self.dataset_label = CaptionLabel("未选择", container)
         self.dataset_label.setWordWrap(True)
         row.addWidget(self.dataset_label, 1)
         layout.addLayout(row)
@@ -228,7 +226,7 @@ class NewProjectDialog(MessageBoxBase):
             else:
                 self.detail_title.setText("暂不支持")
                 self.detail_text.setText("")
-                self.detail_note.setText("该深度学习方法是规划中的能力，当前暂不可用。")
+                self.detail_note.setText("规划中，暂不可用")
             return
         self._current = key
         for card_key, card in self._cards.items():
@@ -241,7 +239,7 @@ class NewProjectDialog(MessageBoxBase):
         if selectable:
             self.detail_note.setText(
                 f"标注方式：{_annotation_text(item['annotation'])}\n"
-                f"训练模型：YOLO11{item['model_suffix'] or ''}（可换更大变体）\n\n"
+                f"训练模型：YOLO11{item['model_suffix'] or ''}\n\n"
                 f"{item['note']}"
             )
         else:
@@ -319,7 +317,7 @@ class NewProjectDialog(MessageBoxBase):
             path = f"{path}.mprj"
             self.path_edit.setText(path)
         if Path(path).exists():
-            self.hint.setText("该路径已存在项目文件，请换一个路径")
+            self.hint.setText("路径已存在项目文件")
             return
         try:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -343,7 +341,7 @@ class NewProjectDialog(MessageBoxBase):
 
 def _annotation_text(mode: str) -> str:
     return {
-        "none": "无需框选（分类 / 异常检测按整图判定）",
+        "none": "无需框选",
         "box": "轴对齐矩形框",
         "obb": "矩形框 + 角度微调",
         "polygon": "多边形轮廓",
