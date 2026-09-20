@@ -211,6 +211,9 @@ SPLIT_COLORS = {
 }
 SPLIT_LABELS = {"train": "训练", "val": "验证", "test": "测试"}
 
+# 图表配色（评估页的混淆矩阵 / 概率条等按类别顺序取色）
+PLOT_COLORS = ["#0F6CBD", "#0F7B0F", "#C42B1C", "#B16CEA", "#E8A33D", "#4A5459"]
+
 # 支持的图片扩展名
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 # 支持的标签扩展名

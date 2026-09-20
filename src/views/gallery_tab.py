@@ -34,12 +34,18 @@ from qfluentwidgets import (
     StrongBodyLabel,
 )
 
+from src.models.filter_rules import FilterRules
 from src.viewmodels.category_vm import CategoryViewModel
 from src.viewmodels.dataset_vm import DatasetViewModel
 from src.views.data_widgets import ClassCard, ImportCard, StatsCard, side_column
-from src.views.dialogs import ImportImagesDialog, TagEditDialog
+from src.views.dialogs import (
+    FilterRulesDialog,
+    ImportImagesDialog,
+    LabelStatsDialog,
+    TagEditDialog,
+)
 from src.views.dialogs.tag_edit_dialog import DEFAULT_TAG_COLOR
-from src.views.gallery_widgets import FilterBar, SplitMapCard, TagCard
+from src.views.gallery_widgets import DisplayBar, FilterBar, SplitMapCard, TagCard
 from src.views.widgets import THUMB_STEPS, ThumbnailGrid
 
 # 尺寸档位与网格、尺寸滑杆共用同一套（见 views/widgets/thumbnail_grid.py）
@@ -104,9 +110,14 @@ class GalleryTab(QWidget):
         self.filter_bar = FilterBar(self)
         main.addWidget(self.filter_bar)
 
+        # 显示增强（亮度 / 对比度 / 类别名），只影响显示
+        self.display_bar = DisplayBar(self)
+        main.addWidget(self.display_bar)
+
         self.grid = ThumbnailGrid(self)
         self.grid.set_wheel_zoom(True)      # Ctrl + 滚轮缩放缩略图
         main.addWidget(self.grid, 1)
+        self._apply_display()
 
         self.hint = CaptionLabel("", self)
         self.hint.setWordWrap(True)
@@ -123,6 +134,10 @@ class GalleryTab(QWidget):
         self.filter_bar.filterChanged.connect(self.refresh)
         self.filter_bar.textChanged.connect(lambda _t: self.refresh())
         self.filter_bar.thumbSizeChanged.connect(self._on_thumb_size)
+        self.filter_bar.rulesRequested.connect(self._on_rules)
+        self.filter_bar.rulesCleared.connect(self._on_rules_cleared)
+        self.filter_bar.statsRequested.connect(self._on_stats)
+        self.display_bar.changed.connect(self._apply_display)
         # Ctrl + 滚轮缩放后回同步滑杆
         self.grid.thumbSizeChanged.connect(self._on_grid_thumb_size)
 
@@ -156,6 +171,44 @@ class GalleryTab(QWidget):
             self._stale = True
 
     # -----------------------------------------------------------
+    # 自定义筛选规则 / 标签统计 / 显示增强
+    # -----------------------------------------------------------
+    def _apply_display(self) -> None:
+        """把显示增强参数下发给缩略图网格（只影响显示）。"""
+        self.grid.set_display(**self.display_bar.values())
+
+    def _rule_options(self) -> dict:
+        """规则弹窗的候选值（类别 / 标记；拆分与状态由模型自带候选）。"""
+        classes = (
+            [str(cls.name) for cls in self._category_vm.classes]
+            if self._category_vm is not None else []
+        )
+        return {"classes": classes, "tags": self._vm.all_tag_names()}
+
+    def _on_rules(self) -> None:
+        """打开自定义筛选规则弹窗（确定后随项目保存）。"""
+        dialog = FilterRulesDialog(
+            self,
+            tree=self._vm.filter_rules(),
+            options=self._rule_options(),
+            counter=lambda tree: self._vm.count_filtered(tree),
+        )
+        if dialog.exec():
+            self._vm.set_filter_rules(dialog.result_tree())
+
+    def _on_rules_cleared(self) -> None:
+        self._vm.set_filter_rules({})
+
+    def _stats_provider(self, scope: str) -> dict:
+        """标签统计数据源（整体 / 选中集）。"""
+        paths = self.grid.selected_paths() if scope == "selection" else None
+        return self._vm.label_statistics(paths, scope)
+
+    def _on_stats(self) -> None:
+        scope = "selection" if self.grid.selected_paths() else "all"
+        LabelStatsDialog(self, provider=self._stats_provider, scope=scope).exec()
+
+    # -----------------------------------------------------------
     # 刷新
     # -----------------------------------------------------------
     def refresh(self) -> None:
@@ -182,6 +235,7 @@ class GalleryTab(QWidget):
         )
         new_paths = [str(path) for path in paths]
         decorations = self._vm.gallery_decorations(paths)
+        names = decorations.get("classnames") or []
 
         # 图片集合没变时只更新角标，避免每次都重建 390 张缩略图
         if new_paths and new_paths == self.grid.paths():
@@ -191,6 +245,7 @@ class GalleryTab(QWidget):
                 decorations["markers"],
                 decorations["subsets"],
             )
+            self.grid.set_class_names(names)
         else:
             self.grid.set_images(
                 new_paths,
@@ -198,10 +253,13 @@ class GalleryTab(QWidget):
                 decorations["colors"],
                 decorations["subsets"],
                 decorations["markers"],
+                classnames=names,
             )
 
         total = len(self._vm.images())
         self.filter_bar.set_summary(len(new_paths), total)
+        rules = FilterRules(self._vm.filter_rules())
+        self.filter_bar.set_rule_summary(rules.active_count(), rules.describe())
         self.hint.setText(
             "尚未导入图像"
             if dataset is None
@@ -404,6 +462,32 @@ class GalleryTab(QWidget):
         box.cancelButton.setText("取消")
         if box.exec():
             self._vm.remove_images(paths)
+
+    # -----------------------------------------------------------
+    # 快捷键 / 拖放入口
+    # -----------------------------------------------------------
+    def select_all(self) -> None:
+        """全选当前图库（Ctrl + A）。"""
+        self.grid.selectAll()
+        self._update_side_state()
+
+    def remove_selected(self) -> None:
+        """移除选中的图像（Del）。"""
+        paths = self._require_selection()
+        if paths:
+            self._remove_images(paths)
+
+    def import_paths(self, paths: list) -> None:
+        """拖放导入：文件夹按目录导入，单张图片按「父目录 + 文件子集」导入。"""
+        targets = [Path(p) for p in paths]
+        folders = [p for p in targets if p.is_dir()]
+        files = [p for p in targets if p.is_file()]
+        for folder in folders:
+            self._vm.import_images(str(folder))
+        for parent in {p.parent for p in files}:
+            subset = [str(p) for p in files if p.parent == parent]
+            self._vm.import_images(str(parent), {"files": subset})
+        self.refresh()
 
     # -----------------------------------------------------------
     # 导入

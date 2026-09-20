@@ -29,6 +29,7 @@ from src.services.annotation_service import AnnotationService
 from src.viewmodels.category_vm import CategoryViewModel
 from src.viewmodels.dataset_vm import DatasetViewModel
 from src.views.data_widgets import ClassCard, FilterCard, side_column
+from src.views.gallery_widgets import DisplayBar
 from src.views.widgets import (
     THUMB_LARGE,
     THUMB_MEDIUM,
@@ -131,11 +132,16 @@ class ReviewTab(QWidget):
         self.filter_card.set_thumb_size(THUMB_LARGE)   # 与网格初始档位一致
         column.addWidget(self.filter_card)
 
+        # 显示增强（亮度 / 对比度 / 类别名）：只影响显示
+        self.display_bar = DisplayBar(self)
+        column.addWidget(self.display_bar)
+
         self.grid = ThumbnailGrid(self)
         self.grid.set_thumb_steps(_THUMB_STEPS)   # 档位与滑杆一一对应
         self.grid.set_thumb_size(THUMB_LARGE)
         self.grid.set_wheel_zoom(True)      # Ctrl + 滚轮缩放缩略图
         column.addWidget(self.grid, 1)
+        self._apply_display()
 
         self.hint = CaptionLabel("", self)
         column.addWidget(self.hint)
@@ -147,6 +153,7 @@ class ReviewTab(QWidget):
     def _bind(self) -> None:
         self.filter_card.filterChanged.connect(self._on_filter)
         self.filter_card.thumbSizeChanged.connect(self._on_thumb_size)
+        self.display_bar.changed.connect(self._apply_display)
         self.grid.thumbSizeChanged.connect(self._on_grid_thumb_size)
         self.grid.imageActivated.connect(self._on_selected)
         self.class_card.classClicked.connect(self._on_class_clicked)
@@ -199,15 +206,21 @@ class ReviewTab(QWidget):
         if self.isVisible():
             self._on_selected(self.grid.current_index())
 
+    def _apply_display(self) -> None:
+        """把显示增强参数下发给缩略图网格（只影响显示）。"""
+        self.grid.set_display(**self.display_bar.values())
+
     def _render_grid(self) -> None:
         """真正绘制缩略图（仅在页面可见时调用）。"""
         pairs = self._pending_pairs or []
-        colors, subsets = self._vm.decorations_for([path for path, _ in pairs])
+        paths = [path for path, _ in pairs]
+        colors, subsets = self._vm.decorations_for(paths)
         self.grid.set_images(
-            [path for path, _ in pairs],
+            paths,
             [flag for _, flag in pairs],
             colors,
             subsets,
+            classnames=self._vm.class_names_for(paths),
         )
         # 没有选中项时默认选中第一张，保证详情面板不是空的
         if pairs and self.grid.current_index() < 0:
@@ -224,6 +237,9 @@ class ReviewTab(QWidget):
             return
         colors, _subsets = self._vm.decorations_for([path for path, _ in pairs])
         self.grid.set_annotated([flag for _, flag in pairs], colors)
+        self.grid.set_class_names(
+            self._vm.class_names_for([path for path, _ in pairs])
+        )
         self.filter_card.set_summary(
             len(self._vm.images()), self._vm.annotated_count()
         )
@@ -254,6 +270,10 @@ class ReviewTab(QWidget):
     def _on_thumb_size(self, step: int) -> None:
         index = max(0, min(len(_THUMB_STEPS) - 1, int(step)))
         self.grid.set_thumb_size(_THUMB_STEPS[index])
+
+    def select_all(self) -> None:
+        """全选当前筛选出的图像（Ctrl + A）。"""
+        self.grid.selectAll()
 
     def _on_grid_thumb_size(self, size: int) -> None:
         """Ctrl + 滚轮缩放后，把尺寸滑杆同步到对应档位。"""

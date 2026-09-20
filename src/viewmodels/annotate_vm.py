@@ -11,8 +11,9 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
 
-from src.models.annotation import POLYGON, Annotation, ImageAnnotation
+from src.models.annotation import BOX, POLYGON, Annotation, ImageAnnotation
 from src.services.annotation_service import AnnotationService
+from src.utils.geometry import scale_points, translate
 from src.services.autolabel_service import (
     DEFAULT_DETECT_WEIGHTS,
     DEFAULT_SAM_WEIGHTS,
@@ -20,6 +21,7 @@ from src.services.autolabel_service import (
 )
 from src.services.dataset_service import DatasetService
 from src.utils.constants import PROJECT_ANNOTATION
+from src.utils.history import stack
 from src.utils.logger import get_logger
 from src.utils.workers import FunctionWorker
 from src.viewmodels.dataset_vm import DatasetViewModel
@@ -263,26 +265,127 @@ class AnnotateViewModel(QObject):
         if self._current is None:
             self.message.emit("warning", "请先导入数据集并选择图片")
             return
+        before = self.snapshot_items()
         self._current.items.append(
             Annotation(cls_id=cls_id, kind=kind, points=list(points))
         )
         self._dirty = True
         self.annotationLoaded.emit(self._current)
+        self.push_undo("添加标注", before)
 
     def remove_annotation(self, index: int) -> None:
         """删除当前图片的第 index 个标注。"""
         if self._current is None or not (0 <= index < len(self._current.items)):
             return
+        before = self.snapshot_items()
         self._current.items.pop(index)
         self._dirty = True
         self.annotationLoaded.emit(self._current)
+        self.push_undo("删除标注", before)
+
+    def remove_many(self, indexes: list) -> int:
+        """批量删除标注（多选），返回删除数量。"""
+        if self._current is None or not indexes:
+            return 0
+        valid = sorted({int(i) for i in indexes
+                        if 0 <= int(i) < len(self._current.items)}, reverse=True)
+        if not valid:
+            return 0
+        before = self.snapshot_items()
+        for index in valid:
+            self._current.items.pop(index)
+        self._dirty = True
+        self.annotationLoaded.emit(self._current)
+        self.push_undo("删除标注", before)
+        return len(valid)
 
     def clear_annotations(self) -> None:
-        if self._current is None:
+        if self._current is None or not self._current.items:
             return
+        before = self.snapshot_items()
         self._current.items.clear()
         self._dirty = True
         self.annotationLoaded.emit(self._current)
+        self.push_undo("清空标注", before)
+
+    def set_class_for(self, indexes: list, cls_id: int) -> int:
+        """批量改类别，返回改动数量。"""
+        if self._current is None or not indexes:
+            return 0
+        valid = [int(i) for i in indexes if 0 <= int(i) < len(self._current.items)]
+        if not valid:
+            return 0
+        before = self.snapshot_items()
+        for index in valid:
+            self._current.items[index].cls_id = int(cls_id)
+        self._dirty = True
+        self.annotationLoaded.emit(self._current)
+        self.push_undo("修改类别", before)
+        return len(valid)
+
+    def set_geometry(self, index: int, x: float, y: float,
+                     width: float, height: float) -> bool:
+        """按像素数值设置某标注的位置与尺寸（数值编辑）。"""
+        if self._current is None or not (0 <= index < len(self._current.items)):
+            return False
+        item = self._current.items[index]
+        img_w = max(1, int(self._current.width or 1))
+        img_h = max(1, int(self._current.height or 1))
+        x1, y1, x2, y2 = item.bounds()
+        old_w = max((x2 - x1) * img_w, 1e-6)
+        old_h = max((y2 - y1) * img_h, 1e-6)
+        sx = max(width, 1.0) / old_w
+        sy = max(height, 1.0) / old_h
+        before = self.snapshot_items()
+        scaled = scale_points(list(item.points), sx, sy, anchor=(x1, y1))
+        moved = translate(scaled, (x - x1 * img_w) / img_w, (y - y1 * img_h) / img_h)
+        item.points = moved
+        if item.is_box:
+            item.points = [(moved[0][0], moved[0][1]), (moved[-1][0], moved[-1][1])]
+        self._dirty = True
+        self.annotationLoaded.emit(self._current)
+        self.push_undo("修改标注", before, key=f"geom:{self._index}:{index}")
+        return True
+
+    def step_image(self, step: int) -> None:
+        """翻图：±N 张；|step| 很大时跳到首 / 末张（PageUp / PageDown 用）。"""
+        if not self._images:
+            return
+        if abs(step) >= 9999:
+            self.set_current(0 if step < 0 else len(self._images) - 1)
+            return
+        self.set_current(self._index + int(step))
+
+    # -----------------------------------------------------------
+    # 撤销 / 重做（快照）
+    # -----------------------------------------------------------
+    def snapshot_items(self) -> list[dict]:
+        """当前图片标注的快照（撤销 / 重做用）。"""
+        items = self._current.items if self._current is not None else []
+        return [item.to_dict() for item in items]
+
+    def push_undo(self, label: str, before: list, after: list | None = None,
+                  key: str = "") -> None:
+        """登记一步撤销：before / after 是两份标注快照。"""
+        after = self.snapshot_items() if after is None else after
+        index = self._index
+        stack().push(
+            label,
+            lambda: self._restore_items(index, before),
+            lambda: self._restore_items(index, after),
+            key=key,
+        )
+
+    def _restore_items(self, index: int, snapshot: list) -> None:
+        """回到某张图片并恢复其标注快照。"""
+        if index != self._index and 0 <= index < len(self._images):
+            self.set_current(index)
+        if self._current is None:
+            return
+        self._current.items = [Annotation.from_dict(data) for data in snapshot]
+        self._dirty = True
+        self.annotationLoaded.emit(self._current)
+        self._autosave()
 
     def save(self) -> None:
         """保存当前图片的标注。"""

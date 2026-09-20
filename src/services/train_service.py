@@ -9,7 +9,7 @@ import json
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QProcess, Signal
+from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
 
 from src.models.training import TrainingConfig
 from src.utils.constants import PROJECT_ROOT
@@ -32,6 +32,7 @@ class TrainService(QObject):
         self._process: QProcess | None = None
         self._buffer = ""
         self._summary: dict = {}
+        self._config: TrainingConfig | None = None
 
     # -----------------------------------------------------------
     # 状态
@@ -67,6 +68,12 @@ class TrainService(QObject):
         process = QProcess(self)
         process.setWorkingDirectory(str(cwd))
         process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        # 子进程统一按 UTF-8 输出：中文 Windows 控制台默认 GBK，Anomalib/Lightning
+        # 经 rich 输出 • 等字符时会抛 UnicodeEncodeError 中断训练
+        environment = QProcessEnvironment.systemEnvironment()
+        environment.insert("PYTHONIOENCODING", "utf-8")
+        environment.insert("PYTHONUTF8", "1")
+        process.setProcessEnvironment(environment)
         process.readyReadStandardOutput.connect(self._read_output)
         process.finished.connect(self._on_finished)
         process.errorOccurred.connect(self._on_error)
@@ -75,6 +82,7 @@ class TrainService(QObject):
         logger.info("启动训练子进程：%s", " ".join(args))
         self._buffer = ""
         self._summary = {}
+        self._config = config      # 暂停 / 继续需要知道控制文件位置
         process.start(sys.executable, args)
         if not process.waitForStarted(8000):
             self.failed.emit("训练进程启动失败")
@@ -87,7 +95,49 @@ class TrainService(QObject):
         if self._process is None:
             return
         logger.info("终止训练子进程")
+        self.resume()          # 清掉暂停标记，避免下次训练一启动就被挂起
         self._process.kill()
+
+    # -----------------------------------------------------------
+    # 暂停 / 继续（轮边界生效）
+    # -----------------------------------------------------------
+    @staticmethod
+    def pause_file(config: TrainingConfig) -> Path:
+        """暂停标记文件：父进程与训练子进程约定的控制文件。"""
+        root = Path(config.project_dir or (PROJECT_ROOT / "runs"))
+        return root / "train.pause"
+
+    def pause(self) -> bool:
+        """请求暂停训练（在当前轮结束后生效）。"""
+        if self._config is None or not self.is_running():
+            return False
+        try:
+            path = self.pause_file(self._config)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("pause", encoding="utf-8")
+        except OSError as exc:
+            logger.warning("创建暂停标记失败: %s", exc)
+            return False
+        logger.info("已请求暂停（轮边界生效）：%s", path)
+        return True
+
+    def resume(self) -> None:
+        """移除暂停标记（训练在下一轮边界自动继续）。"""
+        if self._config is None:
+            return
+        path = self.pause_file(self._config)
+        try:
+            if path.exists():
+                path.unlink()
+                logger.info("已继续训练：%s", path)
+        except OSError as exc:
+            logger.warning("移除暂停标记失败: %s", exc)
+
+    def is_paused(self) -> bool:
+        """当前是否处于暂停请求状态。"""
+        return bool(
+            self._config is not None and self.pause_file(self._config).exists()
+        )
 
     @staticmethod
     def build_args(config: TrainingConfig) -> list[str]:
@@ -109,6 +159,7 @@ class TrainService(QObject):
             "--abnormal-dir", config.anomaly_abnormal_dir,
             "--output", config.project_dir or str(PROJECT_ROOT / "runs" / "anomaly"),
             "--seed", str(config.seed),
+            "--device", normalize_device(config.device),
         ]
         if not config.anomaly_pretrained:
             args.append("--no-pretrained")
@@ -116,7 +167,7 @@ class TrainService(QObject):
 
     @staticmethod
     def _yolo_args(config: TrainingConfig) -> list[str]:
-        """YOLO 训练参数。"""
+        """YOLO 训练参数（覆盖训练页「设置」里的全部参数）。"""
         args = [
             "-m", "src.services.train_worker",
             "--data", config.data_yaml,
@@ -126,11 +177,35 @@ class TrainService(QObject):
             "--imgsz", str(config.imgsz),
             "--lr", str(config.lr),
             "--optimizer", config.optimizer,
+            "--weight-decay", str(config.weight_decay),
+            "--momentum", str(config.momentum),
+            "--warmup-epochs", str(config.warmup_epochs),
+            "--patience", str(config.patience),
+            "--cos-lr" if config.cos_lr else "--no-cos-lr",
+            "--deterministic" if config.deterministic else "--no-deterministic",
+            "--close-mosaic", str(config.close_mosaic),
+            "--val" if config.val else "--no-val",
+            "--cache" if config.cache else "--no-cache",
+            "--single-cls" if config.single_cls else "--no-single-cls",
+            "--rect" if config.rect else "--no-rect",
+            "--dropout", str(config.dropout),
             "--device", normalize_device(config.device),
             "--workers", str(config.workers),
             "--seed", str(config.seed),
             "--project", config.project_dir or str(PROJECT_ROOT / "runs"),
             "--name", config.model_key,
+            "--augment" if config.augment else "--no-augment",
+            "--hflip", str(config.hflip),
+            "--vflip", str(config.vflip),
+            "--degrees", str(config.degrees),
+            "--scale", str(config.scale),
+            "--translate", str(config.translate),
+            "--hsv-h", str(config.hsv_h),
+            "--hsv-s", str(config.hsv_s),
+            "--hsv-v", str(config.hsv_v),
+            "--mosaic", str(config.mosaic),
+            "--mixup", str(config.mixup),
+            "--pause-file", str(TrainService.pause_file(config)),
         ]
         if config.resume:
             args.append("--resume")

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QRectF, QSize, Qt, Signal
+from PySide6.QtCore import QEvent, QPointF, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.utils.constants import SPLIT_COLORS
+from src.utils.image_ops import adjust_pixmap, normalize_display
 
 # 条目数据角色
 _PATH_ROLE = Qt.ItemDataRole.UserRole
@@ -38,6 +39,8 @@ _MASTER_ROLE = Qt.ItemDataRole.UserRole + 2
 _COLOR_ROLE = Qt.ItemDataRole.UserRole + 3      # 类别颜色（已标注角标用）
 _SUBSET_ROLE = Qt.ItemDataRole.UserRole + 4     # 所属数据集：T / V / E
 _MARKERS_ROLE = Qt.ItemDataRole.UserRole + 5    # 图像标记颜色列表
+_EVAL_ROLE = Qt.ItemDataRole.UserRole + 6       # 评估标记 {conf, correct, label}
+_CLASSNAME_ROLE = Qt.ItemDataRole.UserRole + 7  # 类别名（可叠加在缩略图上）
 
 # 子集标记 → SPLIT_COLORS 的键 / 显示名
 _SUBSET_KEY = {"T": "train", "V": "val", "E": "test"}
@@ -79,10 +82,17 @@ _COLOR_TEXT_DIM = "#909090"
 
 _COLOR_TAG_EMPTY = "#8A8A8A"   # 标记没有颜色时的色点颜色
 
+# 评估页：预测正确 / 错误的标记色
+_COLOR_EVAL_OK = "#0F7B0F"
+_COLOR_EVAL_BAD = "#C42B1C"
+
 # 主图缓存：同一进程内复用已解码并缩放的缩略图，避免每次刷新都重新读盘解码
 # （主图按最大档尺寸缓存，条目较大，因此上限比早期版本收敛）
 _MASTER_CACHE: dict = {}
 _MASTER_CACHE_LIMIT = 192
+
+# 显示增强（亮度 / 对比度）结果的缓存上限：按「图片 + 档位 + 参数」缓存
+_ADJUST_CACHE_LIMIT = 600
 
 
 class ThumbnailDelegate(QStyledItemDelegate):
@@ -91,6 +101,12 @@ class ThumbnailDelegate(QStyledItemDelegate):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.thumb = THUMB_MEDIUM
+        # 显示增强：只影响显示，不写回文件（图库 / 检查页用）
+        self.brightness = 0.0
+        self.contrast = 0.0
+        self.show_class_names = False
+        self.name_width = 0.6
+        self._adjust_cache: dict = {}
 
     def sizeHint(self, option, index) -> QSize:  # noqa: N802 - Qt 命名
         return QSize(self.thumb + 18, self.thumb + 42)
@@ -98,6 +114,65 @@ class ThumbnailDelegate(QStyledItemDelegate):
     def _badge_scale(self) -> float:
         """角标缩放系数（以 `_REFERENCE_THUMB` 为基准）。"""
         return max(_MIN_SCALE, self.thumb / _REFERENCE_THUMB)
+
+    # -----------------------------------------------------------
+    # 显示增强（亮度 / 对比度 / 类别名叠加）
+    # -----------------------------------------------------------
+    def set_display(
+        self,
+        brightness: float = 0.0,
+        contrast: float = 0.0,
+        show_class_names: bool = False,
+        name_width: float = 0.6,
+    ) -> None:
+        self.brightness = normalize_display(brightness)
+        self.contrast = normalize_display(contrast)
+        self.show_class_names = bool(show_class_names)
+        self.name_width = max(0.25, min(1.0, float(name_width or 0.6)))
+        self._adjust_cache.clear()
+
+    def display_settings(self) -> dict:
+        return {
+            "brightness": self.brightness,
+            "contrast": self.contrast,
+            "show_class_names": self.show_class_names,
+            "name_width": self.name_width,
+        }
+
+    def clear_display_cache(self) -> None:
+        self._adjust_cache.clear()
+
+    def needs_display_adjust(self) -> bool:
+        return bool(self.brightness or self.contrast)
+
+    def _display_pixmap(self, index) -> "QPixmap | None":
+        """按显示参数调整后的缩略图；未启用增强时返回 None（走默认图标绘制）。
+
+        结果按「图片 + 档位 + 参数」缓存，滚动时不会反复做整图运算。
+        """
+        if not self.needs_display_adjust():
+            return None
+        master = index.data(_MASTER_ROLE)
+        if not isinstance(master, QPixmap) or master.isNull():
+            return None
+        size = int(self.thumb)
+        key = (
+            str(index.data(_PATH_ROLE) or ""), size,
+            round(float(self.brightness), 3), round(float(self.contrast), 3),
+        )
+        cached = self._adjust_cache.get(key)
+        if cached is not None:
+            return cached
+        scaled = master.scaled(
+            size, size,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        adjusted = adjust_pixmap(scaled, self.brightness, self.contrast)
+        if len(self._adjust_cache) >= _ADJUST_CACHE_LIMIT:
+            self._adjust_cache.clear()
+        self._adjust_cache[key] = adjusted
+        return adjusted
 
     @staticmethod
     def _thumb_rect(rect: QRectF) -> QRectF:
@@ -137,11 +212,21 @@ class ThumbnailDelegate(QStyledItemDelegate):
         painter.setBrush(background)
         painter.drawRoundedRect(rect, 4.0, 4.0)
 
-        # 缩略图
+        # 缩略图（显示增强只作用于显示，原图不受影响）
         thumb_rect = self._thumb_rect(rect)
-        icon = index.data(Qt.ItemDataRole.DecorationRole)
-        if isinstance(icon, QIcon) and not icon.isNull():
-            icon.paint(painter, thumb_rect.toRect(), Qt.AlignmentFlag.AlignCenter)
+        shot = self._display_pixmap(index)
+        if shot is not None:
+            painter.drawPixmap(
+                QPointF(
+                    thumb_rect.center().x() - shot.width() / 2.0,
+                    thumb_rect.center().y() - shot.height() / 2.0,
+                ),
+                shot,
+            )
+        else:
+            icon = index.data(Qt.ItemDataRole.DecorationRole)
+            if isinstance(icon, QIcon) and not icon.isNull():
+                icon.paint(painter, thumb_rect.toRect(), Qt.AlignmentFlag.AlignCenter)
 
         # 文件名（过长时中间省略）
         font = QFont(option.font)
@@ -205,7 +290,110 @@ class ThumbnailDelegate(QStyledItemDelegate):
                            top, marker_size, marker_size)
                 )
 
+        self._paint_class_name(painter, option, index, thumb_rect, scale)
+        self._paint_eval(painter, option, index, thumb_rect, scale)
         painter.restore()
+
+    def _paint_class_name(self, painter, option, index, thumb_rect: QRectF, scale: float) -> None:
+        """缩略图左上角叠加类别名（宽度按比例可调，参照 DLT 的类别名框）。"""
+        if not self.show_class_names:
+            return
+        info = index.data(_EVAL_ROLE)
+        if isinstance(info, dict) and info:
+            return      # 评估页左上角已是对错徽标，避免重叠
+        name = str(index.data(_CLASSNAME_ROLE) or "")
+        if not name:
+            return
+        font = QFont(option.font)
+        font.setPointSizeF(max(6.5, 9.0 * scale))
+        font.setBold(True)
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        width = max(34.0, thumb_rect.width() * self.name_width)
+        height = float(metrics.height() + 4)
+        box = QRectF(
+            thumb_rect.left() + 2.0, thumb_rect.top() + 2.0, width, height
+        )
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 170))
+        painter.drawRoundedRect(box, 3.0, 3.0)
+        painter.setPen(QColor("#FFFFFF"))
+        painter.drawText(
+            box.adjusted(5.0, 0, -5.0, 0),
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+            metrics.elidedText(
+                name, Qt.TextElideMode.ElideRight, max(10, int(width) - 10)
+            ),
+        )
+
+    def _paint_eval(self, painter, option, index, thumb_rect: QRectF, scale: float) -> None:
+        """评估标记：对错边框 + 左上角对错徽标 + 底部置信度条。"""
+        info = index.data(_EVAL_ROLE)
+        if not isinstance(info, dict) or not info:
+            return
+        correct = bool(info.get("correct"))
+        color = QColor(_COLOR_EVAL_OK if correct else _COLOR_EVAL_BAD)
+
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(color, max(1.4, 2.0 * scale)))
+        painter.drawRoundedRect(thumb_rect.adjusted(0.5, 0.5, -0.5, -0.5), 4.0, 4.0)
+
+        # 左上角对错徽标（用线段绘制，避免依赖字体里的对勾字形）
+        badge = max(11.0, 17.0 * scale)
+        box = QRectF(thumb_rect.left() + 2.0, thumb_rect.top() + 2.0, badge, badge)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(color)
+        painter.drawEllipse(box)
+        painter.setPen(QPen(QColor("#FFFFFF"), max(1.2, 1.8 * scale)))
+        if correct:
+            path = QPainterPath()
+            path.moveTo(box.left() + badge * 0.26, box.top() + badge * 0.54)
+            path.lineTo(box.left() + badge * 0.45, box.top() + badge * 0.72)
+            path.lineTo(box.left() + badge * 0.76, box.top() + badge * 0.30)
+            painter.drawPath(path)
+        else:
+            inset = badge * 0.30
+            painter.drawLine(
+                QPointF(box.left() + inset, box.top() + inset),
+                QPointF(box.right() - inset, box.bottom() - inset),
+            )
+            painter.drawLine(
+                QPointF(box.right() - inset, box.top() + inset),
+                QPointF(box.left() + inset, box.bottom() - inset),
+            )
+
+        # 底部置信度条（缩略图内，半透明底）
+        strip_h = max(12.0, 16.0 * scale)
+        strip = QRectF(
+            thumb_rect.left(), thumb_rect.bottom() - strip_h,
+            thumb_rect.width(), strip_h,
+        )
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 160))
+        painter.drawRect(strip)
+
+        text_font = QFont(option.font)
+        text_font.setPointSizeF(max(6.5, 9.0 * scale))
+        text_font.setBold(True)
+        painter.setFont(text_font)
+        painter.setPen(QColor("#FFFFFF"))
+        text = f"{float(info.get('conf') or 0):.3f}"
+        painter.drawText(
+            strip.adjusted(4.0, 0, -4.0, 0),
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+            text,
+        )
+        label = str(info.get("label") or "")
+        if label:
+            painter.setPen(color.lighter(160))
+            painter.drawText(
+                strip.adjusted(4.0, 0, -4.0, 0),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
+                painter.fontMetrics().elidedText(
+                    label, Qt.TextElideMode.ElideRight,
+                    max(10, int(thumb_rect.width()) - 46),
+                ),
+            )
 
 
 class ThumbnailGrid(QListWidget):
@@ -247,6 +435,8 @@ class ThumbnailGrid(QListWidget):
         colors: list | None = None,
         subsets: list | None = None,
         markers: list | None = None,
+        evals: list | None = None,
+        classnames: list | None = None,
     ) -> None:
         """重建网格。
 
@@ -256,6 +446,8 @@ class ThumbnailGrid(QListWidget):
             colors: 与 paths 等长的类别颜色序列（右上角角标着色）。
             subsets: 与 paths 等长的数据集标记序列（T / V / E，右下角显示）。
             markers: 与 paths 等长的标记颜色列表（左下角色点）。
+            evals: 与 paths 等长的评估标记（{conf, correct, label}），模型评估页使用。
+            classnames: 与 paths 等长的类别名（开启「显示类别名」后叠加在缩略图上）。
         """
 
         def pick(values, index, default=""):
@@ -273,6 +465,8 @@ class ThumbnailGrid(QListWidget):
             item.setData(_COLOR_ROLE, str(pick(colors, index, "")))
             item.setData(_SUBSET_ROLE, str(pick(subsets, index, "")))
             item.setData(_MARKERS_ROLE, list(pick(markers, index, [])))
+            item.setData(_EVAL_ROLE, pick(evals, index, {}))
+            item.setData(_CLASSNAME_ROLE, str(pick(classnames, index, "")))
             item.setToolTip(self._tooltip(item))
             self.addItem(item)
         self.blockSignals(False)
@@ -300,10 +494,43 @@ class ThumbnailGrid(QListWidget):
             item.setToolTip(self._tooltip(item))
         self.viewport().update()
 
+    def set_class_names(self, names: list) -> None:
+        """就地更新缩略图上叠加的类别名（图片集合不变时用）。"""
+        for index in range(self.count()):
+            item = self.item(index)
+            item.setData(
+                _CLASSNAME_ROLE, str(names[index]) if index < len(names) else ""
+            )
+        self.viewport().update()
+
+    # -----------------------------------------------------------
+    # 显示增强（亮度 / 对比度 / 类别名叠加，仅影响显示）
+    # -----------------------------------------------------------
+    def set_display(
+        self,
+        brightness: float = 0.0,
+        contrast: float = 0.0,
+        show_class_names: bool = False,
+        name_width: float = 0.6,
+    ) -> None:
+        self._delegate.set_display(
+            brightness, contrast, show_class_names, name_width
+        )
+        self.viewport().update()
+
+    def display_settings(self) -> dict:
+        return self._delegate.display_settings()
+
     @staticmethod
     def _tooltip(item) -> str:
-        """悬停提示：路径 + 标注状态 + 所属数据集。"""
+        """悬停提示：路径 + 标注状态 + 所属数据集（评估页为预测信息）。"""
         lines = [str(item.data(_PATH_ROLE) or "")]
+        info = item.data(_EVAL_ROLE)
+        if isinstance(info, dict) and info:
+            label = str(info.get("label") or "—")
+            lines.append(f"预测：{label} {float(info.get('conf') or 0):.3f}")
+            lines.append("正确" if info.get("correct") else "错误")
+            return "\n".join(lines)
         lines.append("已标注" if item.data(_ANNOTATED_ROLE) else "未标注")
         subset = str(item.data(_SUBSET_ROLE) or "")
         if subset:
@@ -361,6 +588,7 @@ class ThumbnailGrid(QListWidget):
         if size == self._delegate.thumb:
             return
         self._delegate.thumb = size
+        self._delegate.clear_display_cache()      # 档位变了，旧的显示增强缓存作废
         self.setIconSize(QSize(size, size))
         self.setGridSize(QSize(size + 18, size + 42))
         for index in range(self.count()):

@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 
 BOX = "box"
 POLYGON = "polygon"
+MASK = "mask"       # 掩码实例（点列为其外轮廓，与多边形同坐标口径）
 
 
 @dataclass
@@ -30,6 +31,10 @@ class Annotation:
     @property
     def is_polygon(self) -> bool:
         return self.kind == POLYGON
+
+    @property
+    def is_mask(self) -> bool:
+        return self.kind == MASK
 
     def bounds(self) -> tuple[float, float, float, float]:
         """返回归一化包围盒 (x1, y1, x2, y2)。"""

@@ -10,6 +10,14 @@ from src.utils.logger import get_logger
 
 logger = get_logger("export")
 
+# 各导出格式实际支持的参数：Ultralytics 会拒绝格式不支持的额外参数
+# （例如 torchscript 不接受 opset / dynamic），因此按格式白名单传参。
+_FORMAT_ARGS = {
+    "onnx": ("imgsz", "opset", "dynamic", "simplify", "half"),
+    "torchscript": ("imgsz", "half"),
+    "pt": ("imgsz",),
+}
+
 
 class ExportService:
     """将训练完成的模型导出为部署格式。"""
@@ -34,13 +42,17 @@ class ExportService:
         则把产物移动过去。
         """
         yolo = self._get_yolo(config.weights_path)
-        fmt_args = {
+        allowed = _FORMAT_ARGS.get(str(config.format), ("imgsz",))
+        values = {
             "imgsz": config.imgsz,
             "opset": config.opset,
             "dynamic": config.dynamic,
+            "simplify": config.simplify,
+            "half": bool(getattr(config, "half", False)),
         }
-        if config.format == "onnx":
-            fmt_args["simplify"] = config.simplify
+        fmt_args = {key: values[key] for key in allowed}
+        if not fmt_args.get("half"):
+            fmt_args.pop("half", None)      # 半精度只在勾选时传入
 
         result = yolo.export(format=config.format, **fmt_args)
         produced = Path(str(result)) if result else None

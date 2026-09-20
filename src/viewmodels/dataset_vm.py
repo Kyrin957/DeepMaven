@@ -8,6 +8,8 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Signal
 
 from src.models.dataset import Dataset
+from src.models.filter_rules import UNLABELED_NAME, FilterRules
+from src.models.split import Split
 from src.services.annotation_service import AnnotationService
 from src.services.category_service import CategoryService
 from src.services.quality_service import QualityService
@@ -55,6 +57,7 @@ class DatasetViewModel(QObject):
     datasetChanged = Signal(object)      # Dataset
     datasetImported = Signal(object)     # Dataset
     splitChanged = Signal(tuple)         # (train, val, test) 比例
+    splitsChanged = Signal(list)         # 项目内的拆分列表（多套拆分）
     datasetReady = Signal(str)           # 生成的 data.yaml 路径
     qualityReady = Signal(dict)          # 质检结果
     taskStarted = Signal(str)            # 后台任务开始（任务名）
@@ -84,6 +87,10 @@ class DatasetViewModel(QObject):
         self._label_index: dict | None = None
         # 图片所属子集标记缓存（T/V/E）
         self._subsets: list[str] | None = None
+        # 图像元信息（宽 / 高 / 通道数）与标签信息（数量 / 类别）缓存
+        # —— 仅供自定义筛选规则与标签统计按需读取
+        self._meta_cache: dict[str, dict] = {}
+        self._label_info_cache: dict[str, dict] = {}
 
     @property
     def dataset(self) -> Dataset | None:
@@ -407,18 +414,194 @@ class DatasetViewModel(QObject):
                 continue
         return path.as_posix()
 
+    # -----------------------------------------------------------
+    # 数据拆分（一个项目可有多套拆分）
+    # -----------------------------------------------------------
+    def splits(self) -> list:
+        """项目内的全部拆分（旧项目会自动迁移出一套）。"""
+        project = self._project_vm.project if self._project_vm else None
+        if project is None:
+            return []
+        project.ensure_splits(self.split_layout())
+        return list(project.splits)
+
+    def splits_ready(self) -> list[dict]:
+        """拆分列表的展示数据（下拉 / 列表通用）。"""
+        return [
+            {
+                "id": split.split_id,
+                "name": split.name,
+                "label": f"{split.name} · {split.ratio_text}"
+                         + (f" · {split.total()} 张" if split.ready else ""),
+                "ready": split.ready,
+                "locked": split.locked,
+                "counts": {key: int(value) for key, value in split.counts.items()},
+                "total": split.total(),
+            }
+            for split in self.splits()
+        ]
+
+    def active_split(self):
+        """当前选中的拆分。"""
+        project = self._project_vm.project if self._project_vm else None
+        if project is None:
+            return None
+        project.ensure_splits(self.split_layout())
+        return project.active_split()
+
+    def split_by_id(self, split_id: int):
+        project = self._project_vm.project if self._project_vm else None
+        return project.split_by_id(split_id) if project is not None else None
+
+    def select_split(self, split_id: int) -> None:
+        """切换当前拆分：镜像到 Dataset，并让训练配置跟随。"""
+        project = self._project_vm.project if self._project_vm else None
+        split = project.split_by_id(split_id) if project is not None else None
+        if project is None or split is None:
+            return
+        project.active_split_id = split.split_id
+        project.params["split_name"] = split.name
+        project.training.split_id = split.split_id
+        project.training.split_name = split.name
+        if split.data_yaml:
+            project.training.data_yaml = split.data_yaml
+        project.touch()
+        self._mirror_split(split)
+        self._emit_splits()
+        self.splitChanged.emit((split.train, split.val, split.test))
+
+    def add_split(self, name: str = "", base_split_id: int | None = None) -> int:
+        """新建一套拆分（默认沿用当前拆分的比例与随机种子）。"""
+        project = self._project_vm.project if self._project_vm else None
+        if project is None:
+            self.message.emit("warning", "请先创建或打开项目")
+            return -1
+        project.ensure_splits(self.split_layout())
+        base = (
+            project.split_by_id(base_split_id) if base_split_id is not None
+            else project.active_split()
+        )
+        split_id = project.next_split_id()
+        title = (name or "").strip() or f"拆分{split_id + 1}"
+        if project.split_by_name(title) is not None:
+            title = f"{title} ({split_id + 1})"
+        project.splits.append(Split(
+            split_id=split_id,
+            name=title,
+            train=base.train if base else 0.7,
+            val=base.val if base else 0.2,
+            test=base.test if base else 0.1,
+            seed=base.seed if base else 0,
+            stratified=base.stratified if base else True,
+            layout=self.split_layout(),
+        ))
+        project.active_split_id = split_id
+        project.params["split_name"] = title
+        project.touch()
+        self._mirror_split(project.active_split())
+        self._emit_splits()
+        self.message.emit("success", f"已新建拆分「{title}」")
+        return split_id
+
+    def duplicate_split(self, split_id: int) -> int:
+        """复制一套拆分（沿用其比例与随机种子，产物需重新生成）。"""
+        project = self._project_vm.project if self._project_vm else None
+        source = project.split_by_id(split_id) if project is not None else None
+        if project is None or source is None:
+            return -1
+        return self.add_split(f"{source.name} 副本", base_split_id=split_id)
+
+    def rename_split(self, split_id: int, name: str) -> str:
+        """重命名拆分（名称同时用作划分产物的目录名）。"""
+        project = self._project_vm.project if self._project_vm else None
+        split = project.split_by_id(split_id) if project is not None else None
+        if project is None or split is None:
+            return ""
+        title = (name or "").strip() or split.name
+        other = project.split_by_name(title)
+        if other is not None and other.split_id != split.split_id:
+            self.message.emit("warning", f"拆分名「{title}」已存在")
+            return split.name
+        split.name = title
+        if project.active_split() is split:
+            project.params["split_name"] = title
+            project.training.split_name = title
+        project.touch()
+        self._emit_splits()
+        return title
+
+    def remove_split(self, split_id: int) -> bool:
+        """删除一套拆分（磁盘上的产物目录保留）。"""
+        project = self._project_vm.project if self._project_vm else None
+        split = project.split_by_id(split_id) if project is not None else None
+        if project is None or split is None:
+            return False
+        if len(project.splits) <= 1:
+            self.message.emit("warning", "至少保留一套拆分")
+            return False
+        project.splits = [
+            item for item in project.splits if item.split_id != split.split_id
+        ]
+        if project.active_split_id == split.split_id:
+            project.active_split_id = project.splits[0].split_id
+        project.touch()
+        self._mirror_split(project.active_split())
+        self._emit_splits()
+        self.message.emit("success", f"已删除拆分「{split.name}」")
+        return True
+
+    def mark_active_split_used(self) -> None:
+        """把当前拆分标记为「已被训练使用」（比例不再改动）。"""
+        split = self.active_split()
+        project = self._project_vm.project if self._project_vm else None
+        if split is None or project is None:
+            return
+        split.locked = True
+        project.touch()
+        self._emit_splits()
+
+    def _emit_splits(self) -> None:
+        self.datasetChanged.emit(self._dataset)
+        self.splitsChanged.emit(self.splits_ready())
+
+    def _mirror_split(self, split) -> None:
+        """把拆分参数镜像到 Dataset（兼容既有界面 / 统计 / 预览）。"""
+        if split is None or self._dataset is None:
+            return
+        dataset = self._dataset
+        dataset.split_train = float(split.train)
+        dataset.split_val = float(split.val)
+        dataset.split_test = float(split.test)
+        dataset.stratified = bool(split.stratified)
+        dataset.seed = int(split.seed)
+        dataset.output_path = split.output_dir
+        dataset.data_yaml = split.data_yaml
+        if split.classes:
+            dataset.class_names = list(split.classes)
+        self._subsets = None
+
     def set_split(
         self, train: float, val: float, test: float, quiet: bool = False
     ) -> None:
-        """更新划分比例（应满足 train+val+test ≈ 1）。
+        """更新当前拆分的划分比例（应满足 train+val+test ≈ 1）。
 
         Args:
             quiet: 为 True 时不弹出提示（滑动条 / 数字框连续调整时使用）。
         """
-        if self._dataset is not None:
+        split = self.active_split()
+        if split is not None:
+            split.train = float(train)
+            split.val = float(val)
+            split.test = float(test)
+            project = self._project_vm.project if self._project_vm else None
+            if project is not None:
+                project.touch()
+            self._mirror_split(split)
+        elif self._dataset is not None:
             self._dataset.split_train = train
             self._dataset.split_val = val
             self._dataset.split_test = test
+            self._subsets = None
         self.splitChanged.emit((train, val, test))
         if not quiet:
             self.message.emit(
@@ -426,16 +609,30 @@ class DatasetViewModel(QObject):
             )
 
     def set_seed(self, seed: int, quiet: bool = True) -> None:
-        """设置随机种子（保证划分可复现）。"""
-        if self._dataset is not None:
+        """设置当前拆分的随机种子（保证划分可复现）。"""
+        split = self.active_split()
+        if split is not None:
+            split.seed = int(seed)
+            self._mirror_split(split)
+            project = self._project_vm.project if self._project_vm else None
+            if project is not None:
+                project.touch()
+        elif self._dataset is not None:
             self._dataset.seed = int(seed)
         if not quiet:
             self.message.emit("info", f"随机种子已设为 {int(seed)}")
 
     def set_stratified(self, enabled: bool) -> None:
-        """切换是否按类别分层抽样。"""
+        """切换当前拆分是否按类别分层抽样。"""
         enabled = bool(enabled)
-        if self._dataset is not None:
+        split = self.active_split()
+        if split is not None:
+            split.stratified = enabled
+            self._mirror_split(split)
+            project = self._project_vm.project if self._project_vm else None
+            if project is not None:
+                project.touch()
+        elif self._dataset is not None:
             self._dataset.stratified = enabled
         self.message.emit(
             "info", f"分层划分：{'开启' if enabled else '关闭'}"
@@ -464,6 +661,25 @@ class DatasetViewModel(QObject):
         # 图库可能由多个文件夹累加而成，划分按界面上看到的图片清单进行
         library = self.images()
         label_index = self.label_index()
+
+        # 预检查：验证集为空时后端会直接失败（val=None），这里提前拦住
+        try:
+            buckets = DatasetService.split_members(
+                library,
+                {} if layout == "classify" else label_index,
+                split=split,
+                seed=self._dataset.seed,
+                stratified=self._dataset.stratified,
+                layout=layout,
+            )
+        except (OSError, ValueError):
+            buckets = {}
+        if buckets and (not buckets["train"] or not buckets["val"]):
+            self.message.emit(
+                "warning",
+                "验证集为空，请调整拆分比例或增加图片",
+            )
+            return
         try:
             stats = self._service.split_dataset(
                 source, out_dir,
@@ -487,11 +703,17 @@ class DatasetViewModel(QObject):
                     out_dir, classes, "images/train", "images/val", "images/test"
                 )
 
-            # 先把划分结果写回模型层，再保存，保证这些字段一并落盘
+            # 划分结果写进当前拆分（一个项目可有多套），并镜像到 Dataset
+            split = self.active_split()
+            if split is not None:
+                split.layout = layout
+                split.mark_generated(out_dir, config_path, stats, classes)
             self._dataset.output_path = str(out_dir)
             self._dataset.data_yaml = str(config_path)
             self._dataset.class_names = classes
             project.training.data_yaml = str(config_path)
+            project.training.split_id = split.split_id if split else 0
+            project.training.split_name = split.name if split else ""
             # 项目文件只保存项目自身的数据（配置 / 标注 / 模型）：
             # 图像与标签留在磁盘数据集目录（硬链接，不额外占盘），
             # 不再把整份图像库复制进 .mprj —— 否则项目体积会翻倍且无必要。
@@ -518,8 +740,10 @@ class DatasetViewModel(QObject):
             self.message.emit("error", f"数据集划分失败：{exc}")
             return
 
+        self._subsets = None
         self.datasetChanged.emit(self._dataset)
         self._project_vm.notify_changed()
+        self.splitsChanged.emit(self.splits_ready())
         self.datasetReady.emit(str(config_path))
 
         linked = int(stats.get("linked", 0))
@@ -548,6 +772,11 @@ class DatasetViewModel(QObject):
             self._dataset = None
         else:
             self._dataset = dataset
+        if project is not None:
+            # 旧项目没有拆分列表：这里补一套出来，并让界面按当前拆分显示
+            project.ensure_splits(self.split_layout())
+            self._mirror_split(project.active_split())
+            self.splitsChanged.emit(self.splits_ready())
         self.datasetChanged.emit(self._dataset)
 
     def _source_roots(self) -> list[Path]:
@@ -724,6 +953,166 @@ class DatasetViewModel(QObject):
     # -----------------------------------------------------------
     # 图片清单与标注状态（图库 / 标注 / 标注检查页共用）
     # -----------------------------------------------------------
+    # -----------------------------------------------------------
+    # 图像位置：基础路径 / 缺失检查 / 重定位
+    # -----------------------------------------------------------
+    def source_roots(self) -> list[Path]:
+        """当前存在的来源目录（供界面展示）。"""
+        return list(self._source_roots())
+
+    def base_path(self) -> str:
+        """项目记录的基础路径（未设置时取首个来源目录）。"""
+        project = self._project_vm.project if self._project_vm else None
+        if project is not None:
+            value = str(project.params.get("image_base_path") or "").strip()
+            if value:
+                return value
+        roots = self._source_roots()
+        return str(roots[0]) if roots else ""
+
+    def set_base_path(self, path: str) -> None:
+        """记录图像基础路径（随项目保存）。"""
+        project = self._project_vm.project if self._project_vm else None
+        if project is None:
+            return
+        project.params["image_base_path"] = str(path).strip()
+        project.touch()
+
+    def missing_images(self) -> list[Path]:
+        """已扫描到但磁盘上不存在的图片。"""
+        return [path for path in self.images() if not Path(path).is_file()]
+
+    def expected_image_count(self) -> int:
+        """项目应有的图像数。
+
+        来源目录整盘搬走时扫描为空，仅靠扫描无法判断「少了多少」，
+        因此以「`.mprj` 图像归档条目」与「数据集统计的导入张数」作为基准，
+        与扫描结果取最大值。
+        """
+        project = self._project_vm.project if self._project_vm else None
+        archived = len(project.find_by_kind("image")) if project is not None else 0
+        recorded = int(getattr(self._dataset, "image_count", 0) or 0)
+        return max(archived, recorded, len(self.images()))
+
+    def missing_count(self) -> int:
+        """缺失图像数量。"""
+        return max(0, self.expected_image_count() - len(self.images()))
+
+    def relocate_images(self, new_root: str) -> dict:
+        """把缺失图像重定位到新根目录。
+
+        与 DLT 一致：要求文件名与目录结构保持一致，**全部找到**才生效；
+        否则只报告数量、不改动来源。
+        """
+        root = Path(new_root)
+        result = {"found": 0, "total": self.missing_count(), "relocated": False}
+        if not root.is_dir() or result["total"] <= 0:
+            return result
+
+        names = {path.name.lower() for path in self.images()}
+        found_names = {
+            image.name.lower()
+            for image in root.rglob("*")
+            if image.is_file() and image.suffix.lower() in IMAGE_EXTS
+        }
+        if names:
+            found = len(names & found_names)
+            total = len(names)
+        else:
+            # 来源目录已整体搬走：按新目录里的图片数与应有数量比对
+            found = len(found_names)
+            total = max(result["total"], found)
+        result["found"] = found
+        result["total"] = total
+        if total <= 0 or found < total:
+            return result
+
+        dataset = self._dataset
+        if dataset is None:
+            return result
+        remapped = self._remap_recorded_paths(root)
+        dataset.source_path = str(root)
+        dataset.source_paths = [str(root)]
+        self._invalidate_caches()
+        result["remapped"] = remapped
+        project = self._project_vm.project if self._project_vm else None
+        if project is not None:
+            project.params["image_base_path"] = str(root)
+            project.touch()
+        self.datasetChanged.emit(dataset)
+        result["relocated"] = True
+        return result
+
+    def _remap_recorded_paths(self, root: Path) -> int:
+        """把项目里记录的旧图片路径改写到新根目录。
+
+        图库顺序（`image_order`）、移除清单（`image_excludes`）与按路径索引的
+        元数据（如标记映射）都保存的是绝对路径；来源搬移后必须一并改写，
+        否则「重定位」后图库仍是空的。这里按「图片文件名 + 尾部目录」匹配，
+        递归处理列表 / 字典，返回改写的条目数。
+        """
+        project = self._project_vm.project if self._project_vm else None
+        if project is None:
+            return 0
+        index: dict[str, list[Path]] = {}
+        for candidate in root.rglob("*"):
+            if candidate.is_file() and candidate.suffix.lower() in IMAGE_EXTS:
+                index.setdefault(candidate.name.lower(), []).append(candidate)
+        if not index:
+            return 0
+
+        counter = {"count": 0}
+
+        def walk(node):
+            if isinstance(node, str):
+                path = Path(node)
+                if path.suffix.lower() not in IMAGE_EXTS:
+                    return node
+                target = self._match_relocated(path, index)
+                if target is None:
+                    return node
+                counter["count"] += 1
+                return str(target)
+            if isinstance(node, list):
+                return [walk(item) for item in node]
+            if isinstance(node, dict):
+                return {walk(key): walk(value) for key, value in node.items()}
+            return node
+
+        project.params = walk(project.params)
+        project.touch()
+        return counter["count"]
+
+    @staticmethod
+    def _match_relocated(image: Path, index: dict) -> Path | None:
+        """按文件名 + 尾部目录名匹配重定位目标（目录层级一致者优先）。"""
+        candidates = index.get(image.name.lower(), [])
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+        wanted = [part.lower() for part in image.parts[-3:-1]]
+
+        def score(candidate: Path) -> int:
+            parents = [part.lower() for part in candidate.parts[-4:-2]]
+            return sum(
+                1 for offset, name in enumerate(wanted)
+                if name in parents[offset: offset + 2]
+            )
+
+        return max(candidates, key=score)
+
+    def _invalidate_caches(self) -> None:
+        """来源目录变化后清空各类缓存。"""
+        self._resolved_source = None
+        self._roots_cache = None
+        self._hash_cache = None
+        self._images = None
+        self._label_index = None
+        self._subsets = None
+        self._meta_cache = {}
+        self._label_info_cache = {}
+
     def images(self, refresh: bool = False) -> list[Path]:
         """当前数据集的图片清单（带缓存，已排除从数据集移除的图片）。"""
         if refresh or self._images is None:
@@ -795,10 +1184,27 @@ class DatasetViewModel(QObject):
     def annotated_count(self) -> int:
         return sum(1 for flag in self.annotated_flags() if flag)
 
+    def _known_class_names(self) -> set[str]:
+        """已知类别名：数据集统计到的类别 ∪ 项目类别表。"""
+        names = {
+            str(item) for item in (getattr(self._dataset, "class_names", []) or [])
+        }
+        project = self._project_vm.project if self._project_vm else None
+        names.update(
+            str(item.name) for item in (getattr(project, "classes", []) or [])
+        )
+        return {name for name in names if name}
+
+    def _is_source_root(self, directory: Path) -> bool:
+        """目录是否为数据集来源目录（多来源导入时就是各个类别目录）。"""
+        text = str(directory)
+        return any(text == str(root) for root in self._source_roots())
+
     def image_class(self, image) -> str:
         """图片所属类别名（分类看目录名，检测看标签首个类别 id）。
 
-        返回空串表示「无标签」——手工指定过的图片以项目里的覆盖值为准。
+        返回空串表示「无标签」——手工指定过的图片以项目里的覆盖值为准；
+        分类任务里直接放在来源根目录下（不在任何类别子目录里）的图片也算无标签。
         """
         override = self._params_dict("class_overrides")
         key = self._image_key(image)
@@ -806,7 +1212,11 @@ class DatasetViewModel(QObject):
             return str(override[key] or "")
         layout = self.split_layout()
         if layout == "classify":
-            return Path(image).parent.name
+            parent = Path(image).parent
+            known = self._known_class_names()
+            if known and self._is_source_root(parent) and parent.name not in known:
+                return ""
+            return parent.name
         return DatasetService.image_class_name(image, self.label_index(), layout)
 
     def filtered_images(
@@ -940,6 +1350,14 @@ class DatasetViewModel(QObject):
             [value(subsets, path) for path in paths],
         )
 
+    def class_names_for(self, paths: list) -> list[str]:
+        """给定图片序列 → 每张图的类别名（供缩略图叠加类别名）。"""
+        names = {
+            str(image): self._class_name_of(self.image_class(image))
+            for image in self.images()
+        }
+        return [names.get(str(path), "") for path in paths]
+
     def gallery_decorations(self, paths: list) -> dict:
         """一次性取出缩略图需要的全部装饰（避免多次 O(n) 复算）。
 
@@ -952,6 +1370,9 @@ class DatasetViewModel(QObject):
         colors = self.image_colors()
         subsets = self.subset_labels()
         markers = self.marker_colors()
+        names = [
+            self._class_name_of(self.image_class(image)) for image in images
+        ]
 
         def value(series: list, path, default):
             index = position.get(str(path))
@@ -964,6 +1385,7 @@ class DatasetViewModel(QObject):
             "colors": [str(value(colors, p, "")) for p in paths],
             "subsets": [str(value(subsets, p, "")) for p in paths],
             "markers": [list(value(markers, p, [])) for p in paths],
+            "classnames": [str(value(names, p, "")) for p in paths],
         }
 
     # -----------------------------------------------------------
@@ -1151,18 +1573,244 @@ class DatasetViewModel(QObject):
         ).strip() or DEFAULT_SPLIT_NAME
 
     def split_locked(self) -> bool:
-        """该拆分是否已被训练使用（使用后不允许再改）。"""
+        """当前拆分是否已被训练使用（使用后不再改比例）。"""
+        split = self.active_split()
+        if split is not None and split.locked:
+            return True
         project = self._project_vm.project if self._project_vm else None
         if project is None:
             return False
+        # 兼容旧项目：训练已完成，且用的正是当前拆分的 data.yaml
         status = str(getattr(project.training, "status", "") or "")
-        return bool(getattr(project.training, "data_yaml", "")) and status in (
-            "running", "finished", "done", "success",
+        trained_yaml = str(getattr(project.training, "data_yaml", "") or "")
+        current_yaml = str(getattr(split, "data_yaml", "") or "")
+        return (
+            bool(trained_yaml)
+            and trained_yaml == current_yaml
+            and status in ("running", "finished", "done", "success")
         )
 
     # -----------------------------------------------------------
     # 组合筛选：标签状态 / 图像标记 / 数据集划分 / 文本
     # -----------------------------------------------------------
+    # -----------------------------------------------------------
+    # 图像元信息 / 备注 / 标签（供自定义筛选规则与标签统计使用）
+    # -----------------------------------------------------------
+    def image_meta(self, image) -> dict:
+        """图像元信息：{"width", "height", "channels"}。
+
+        只读文件头（PIL 不解码像素），结果按路径缓存 —— 只有用到尺寸 / 通道数的
+        筛选规则才会走这里，避免无谓的解码开销。
+        """
+        key = str(image)
+        cached = self._meta_cache.get(key)
+        if cached is not None:
+            return dict(cached)
+        meta = {"width": 0, "height": 0, "channels": 0}
+        try:
+            from PIL import Image as PILImage
+
+            with PILImage.open(key) as handle:
+                meta["width"], meta["height"] = (int(value) for value in handle.size)
+                meta["channels"] = len(handle.getbands())
+        except Exception as exc:  # noqa: BLE001 - 无法识别的图片按 0 处理
+            logger.debug("读取图像元信息失败 %s: %s", key, exc)
+        self._meta_cache[key] = dict(meta)
+        return dict(meta)
+
+    @staticmethod
+    def _read_label_summary(label_path) -> tuple[int, list[int]]:
+        """读标签文件：返回 (标注数量, 类别 id 列表)。"""
+        if label_path is None:
+            return 0, []
+        try:
+            text = Path(label_path).read_text(encoding="utf-8")
+        except OSError:
+            return 0, []
+        count = 0
+        ids: set[int] = set()
+        for line in text.splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            count += 1
+            try:
+                ids.add(int(float(parts[0])))
+            except ValueError:
+                continue
+        return count, sorted(ids)
+
+    def _class_name_of(self, value) -> str:
+        """类别 id / 名称 → 显示用类别名（无法映射时原样返回）。"""
+        text = str(value)
+        if not text.lstrip("-").isdigit():
+            return text
+        class_id = int(text)
+        dataset = self._dataset
+        names = [str(item) for item in (getattr(dataset, "class_names", []) or [])]
+        if 0 <= class_id < len(names):
+            return names[class_id]
+        project = self._project_vm.project if self._project_vm else None
+        for item in getattr(project, "classes", []) or []:
+            raw = getattr(item, "class_id", None)
+            try:
+                same = raw is not None and int(raw) == class_id
+            except (TypeError, ValueError):
+                same = False
+            if same:
+                return str(item.name)
+        return text
+
+    def label_info(self, image) -> dict:
+        """图片的标注数量与标注类别：{"count", "classes"}（带缓存）。"""
+        key = self._image_key(image)
+        cached = self._label_info_cache.get(key)
+        if cached is not None:
+            return dict(cached)
+        info = {"count": 0, "classes": []}
+        if self.split_layout() == "classify":
+            name = self.image_class(image)
+            if name and name != UNLABELED_LABEL:
+                info = {"count": 1, "classes": [name]}
+        else:
+            label = self.label_index().get(Path(image).stem)
+            count, ids = self._read_label_summary(label)
+            if count:
+                info = {
+                    "count": count,
+                    "classes": [self._class_name_of(item) for item in ids],
+                }
+        self._label_info_cache[key] = dict(info)
+        return dict(info)
+
+    def notes_dir(self) -> Path | None:
+        """图片备注目录（项目文件同级的 `notes/`，与标注页保持同一口径）。"""
+        project = self._project_vm.project if self._project_vm else None
+        if project is None:
+            return None
+        path = str(project.params.get("path", "") or "")
+        return (Path(path).parent / "notes") if path else None
+
+    def image_note(self, image) -> str:
+        """图片备注文本（没有备注返回空串）。"""
+        directory = self.notes_dir()
+        if directory is None:
+            return ""
+        file = directory / f"{Path(image).stem}.txt"
+        try:
+            return file.read_text(encoding="utf-8").strip() if file.is_file() else ""
+        except OSError:
+            return ""
+
+    # -----------------------------------------------------------
+    # 自定义筛选规则
+    # -----------------------------------------------------------
+    def filter_rules(self) -> dict:
+        """项目里保存的自定义筛选规则（无规则返回空字典）。"""
+        tree = self._params_dict("filter_rules")
+        return dict(tree) if isinstance(tree, dict) else {}
+
+    def set_filter_rules(self, tree) -> None:
+        """保存自定义筛选规则（随项目落盘）。"""
+        project = self._project_vm.project if self._project_vm else None
+        if project is None:
+            self.message.emit("warning", "请先创建或打开项目")
+            return
+        project.params["filter_rules"] = dict(tree or {})
+        self._commit_meta("筛选规则已更新")
+
+    def count_filtered(self, rules: dict) -> tuple[int, int]:
+        """规则预览：返回 (命中张数, 总张数)。"""
+        return len(self.filter_images(rules=rules)), len(self.images())
+
+    # -----------------------------------------------------------
+    # 标签统计
+    # -----------------------------------------------------------
+    def label_statistics(self, paths: list | None = None, scope: str = "all") -> dict:
+        """标签统计：类别 / 数据集拆分 / 图像标记 的数量与占比 + 标注覆盖。
+
+        Args:
+            paths: 限定统计的图片（选中集）；None 表示全部图片。
+            scope: 只作为结果里的标记透传（all / selection）。
+        """
+        images = self.images()
+        if paths is None:
+            selected = list(images)
+        else:
+            wanted = {str(item) for item in paths}
+            selected = [image for image in images if str(image) in wanted]
+        total = len(selected)
+        flags = self.annotated_flags()
+        subsets = self.subset_labels()
+        position = {str(image): index for index, image in enumerate(images)}
+        project = self._project_vm.project if self._project_vm else None
+        class_colors = {
+            str(item.name): str(item.color or "")
+            for item in (getattr(project, "classes", []) or [])
+        }
+
+        classes: dict[str, int] = {}
+        splits: dict[str, int] = {}
+        tags: dict[str, int] = {}
+        annotated = 0
+        tagged = 0
+        for image in selected:
+            index = position.get(str(image), -1)
+            if 0 <= index < len(flags) and flags[index]:
+                annotated += 1
+            name = self.image_class(image)
+            label_name = self._class_name_of(name) if name else ""
+            classes[label_name] = classes.get(label_name, 0) + 1
+            subset = subsets[index] if 0 <= index < len(subsets) else ""
+            split_key = _SUBSET_NAME.get(subset, "none")
+            splits[split_key] = splits.get(split_key, 0) + 1
+            names = self.image_tag_names_of(image)
+            if names:
+                tagged += 1
+            for tag in names:
+                tags[tag] = tags.get(tag, 0) + 1
+
+        def share(count: int) -> float:
+            return (count / total) if total else 0.0
+
+        class_rows = [
+            {"name": key, "count": classes[key], "share": share(classes[key]),
+             "color": class_colors.get(key, "")}
+            for key in sorted(classes, key=lambda item: (-classes[item], str(item)))
+            if key
+        ]
+        if "" in classes:      # 「无标签」固定排在最后
+            class_rows.append({
+                "name": "", "count": classes[""],
+                "share": share(classes[""]), "color": "",
+            })
+
+        split_labels = {"train": "训练", "val": "验证", "test": "测试", "none": "未划分"}
+        split_rows = [
+            {"name": split_labels[key], "count": splits.get(key, 0),
+             "share": share(splits.get(key, 0))}
+            for key in ("train", "val", "test", "none")
+            if splits.get(key, 0)
+        ]
+
+        tag_rows = [
+            {"name": key, "count": tags[key], "share": share(tags[key]),
+             "color": self.tag_color(key)}
+            for key in sorted(tags, key=lambda item: (-tags[item], str(item)))
+        ]
+        missing = total - tagged
+        if missing > 0:
+            tag_rows.append({"name": "", "count": missing, "share": share(missing),
+                             "color": ""})
+        return {
+            "scope": str(scope),
+            "total": total,
+            "annotated": annotated,
+            "classes": class_rows,
+            "splits": split_rows,
+            "tags": tag_rows,
+        }
+
     def filter_images(
         self,
         label="all",
@@ -1170,6 +1818,7 @@ class DatasetViewModel(QObject):
         split="all",
         text: str = "",
         class_name="all",
+        rules: dict | None = None,
     ) -> list[Path]:
         """按 标签状态 / 类别 / 图像标记 / 数据集划分 / 文本 过滤图片。
 
@@ -1179,6 +1828,7 @@ class DatasetViewModel(QObject):
             split: all / train / val / test / none（未划分，可多选）。
             text: 关键词，匹配文件名、类别名与标记名（不区分大小写）。
             class_name: all / ""（无标签）/ 具体类别名（可多选）。
+            rules: 自定义筛选规则（条件树）；None 表示用项目里保存的规则。
 
         除 `text` 外均支持「单个值」或「值列表」；"all" / 空列表表示不筛选。
         """
@@ -1190,6 +1840,17 @@ class DatasetViewModel(QObject):
         classes = [self.image_class(image) for image in images]
         tags = [self.image_tag_names_of(image) for image in images]
         keyword = text.strip().lower()
+
+        # 自定义筛选规则：只在规则真正用到某个字段时才去读图像信息
+        ruleset = FilterRules(self.filter_rules() if rules is None else rules)
+        wanted = set() if ruleset.is_empty() else ruleset.fields()
+        metas = [self.image_meta(image) for image in images] if wanted & {
+            "width", "height", "channels"
+        } else []
+        infos = [self.label_info(image) for image in images] if wanted & {
+            "label_count", "classes"
+        } else []
+        notes = [self.image_note(image) for image in images] if "comment" in wanted else []
         annotated_wanted = _filter_list(label)
         class_wanted = _filter_list(class_name)
         split_wanted = _filter_list(split)
@@ -1223,6 +1884,20 @@ class DatasetViewModel(QObject):
                 or keyword in classes[index].lower()
                 or any(keyword in span.lower() for span in spans)
             ):
+                continue
+            if not ruleset.is_empty() and not ruleset.match({
+                "name": image.name,
+                "path": str(image),
+                "state": "annotated" if annotated else "unannotated",
+                "comment": notes[index] if index < len(notes) else "",
+                "tags": spans,
+                "classes": infos[index]["classes"] if index < len(infos) else [],
+                "split": _SUBSET_NAME.get(subset, "none") or "none",
+                "label_count": infos[index]["count"] if index < len(infos) else 0,
+                "width": metas[index]["width"] if index < len(metas) else 0,
+                "height": metas[index]["height"] if index < len(metas) else 0,
+                "channels": metas[index]["channels"] if index < len(metas) else 0,
+            }):
                 continue
             result.append(image)
         return result
@@ -1360,23 +2035,30 @@ class DatasetViewModel(QObject):
         self._images = None
         self._label_index = None
         self._subsets = None
+        self._label_info_cache = {}
 
     # -----------------------------------------------------------
     # 拆分名称（决定划分产物的目录名）
     # -----------------------------------------------------------
     def split_name(self) -> str:
-        """划分产物的目录名（默认 `dataset`，可在数据拆分页改名）。"""
+        """当前拆分的名称（同时是划分产物的目录名）。"""
+        split = self.active_split()
+        if split is not None and split.name:
+            return split.name
         project = self._project_vm.project if self._project_vm else None
         stored = str((project.params.get("split_name") if project else "") or "").strip()
         return stored or DEFAULT_SPLIT_NAME
 
     def set_split_name(self, name: str) -> None:
-        """设置拆分名称（用于划分产物的目录名）。"""
-        project = self._project_vm.project if self._project_vm else None
-        if project is None:
+        """设置当前拆分的名称（用于划分产物的目录名）。"""
+        split = self.active_split()
+        if split is None:
             return
-        project.params["split_name"] = name.strip()
-        project.touch()
+        resolved = self.rename_split(split.split_id, name)
+        project = self._project_vm.project if self._project_vm else None
+        if project is not None:
+            project.params["split_name"] = resolved
+            project.touch()
 
     def notify(self, text: str, level: str = "info") -> None:
         """供界面反馈本地操作结果的提示通道。"""

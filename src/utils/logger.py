@@ -14,6 +14,8 @@ def setup_logger(
     level: int = logging.INFO,
     log_to_file: bool = True,
     log_dir: Path | None = None,
+    backup_count: int = 10,
+    max_bytes: int = 5 * 1024 * 1024,
 ) -> logging.Logger:
     """初始化应用日志器。
 
@@ -21,6 +23,8 @@ def setup_logger(
         level: 日志级别。
         log_to_file: 是否同时写入日志文件。
         log_dir: 日志文件目录，默认使用 data/logs。
+        backup_count: 滚动日志保留份数（偏好设置可配，默认 10 份）。
+        max_bytes: 单个日志文件上限（字节）。
 
     Returns:
         已配置的 logger 实例。
@@ -44,14 +48,14 @@ def setup_logger(
     console.setFormatter(fmt)
     logger.addHandler(console)
 
-    # 文件 handler（滚动日志，单文件 5MB，保留 3 份）
+    # 文件 handler（滚动日志，单文件上限与保留份数由偏好设置决定）
     if log_to_file:
         log_dir = log_dir or (DATA_DIR / "logs")
         log_dir.mkdir(parents=True, exist_ok=True)
         file_handler = RotatingFileHandler(
             log_dir / "deepmaven.log",
-            maxBytes=5 * 1024 * 1024,
-            backupCount=3,
+            maxBytes=max(1024, int(max_bytes)),
+            backupCount=max(1, int(backup_count)),
             encoding="utf-8",
         )
         file_handler.setLevel(level)

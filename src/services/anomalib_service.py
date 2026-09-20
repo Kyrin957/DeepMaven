@@ -12,9 +12,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from src.utils.constants import DATA_DIR
 from src.utils.logger import get_logger
 
 logger = get_logger("anomalib")
+
+# 异常热力图缓存目录（原始分数图，供评估页「热图」视图与最小缺陷尺寸使用）
+ANOMALY_HEAT_DIR = DATA_DIR / "anomaly"
 
 # 推荐模型（兼顾速度与效果）
 MODEL_KEYS = [
@@ -120,8 +124,44 @@ class AnomalibService:
                     "score": float(scores[index]) if index < len(scores) else 0.0,
                     "label": int(labels[index]) if index < len(labels) else 0,
                 })
+            # 异常热力图：有则落盘（原始分数图 .npy），供评估页「热图」视图与
+            # 「最小缺陷尺寸」后处理使用；没有该输出时不影响推理结果
+            _save_heat_maps(batch, paths, results)
         logger.info("异常检测推理完成：%s 张", len(results))
         return results
+
+
+def _save_heat_maps(batch, paths: list, results: list) -> None:
+    """尽量把 Anomalib 的 anomaly_map 存成 .npy（没有该输出时静默跳过）。"""
+    raw = getattr(batch, "anomaly_map", None)
+    if raw is None:
+        return
+    try:
+        import numpy as np
+    except ImportError:
+        return
+    directory = ANOMALY_HEAT_DIR
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning("创建热力图目录失败: %s", exc)
+        return
+    for index, path in enumerate(paths):
+        try:
+            array = np.asarray(raw[index].detach().cpu().squeeze())
+        except Exception as exc:  # noqa: BLE001 - 取不到就跳过这张
+            logger.debug("读取异常热力图失败 %s: %s", path, exc)
+            continue
+        if array.ndim != 2:
+            continue
+        target = directory / f"{Path(path).stem}.npy"
+        try:
+            np.save(target, array.astype("float32"))
+        except OSError as exc:
+            logger.warning("保存热力图失败 %s: %s", target, exc)
+            continue
+        if index < len(results):
+            results[index]["heat_map"] = str(target)
 
 
 def _to_list(value) -> list:

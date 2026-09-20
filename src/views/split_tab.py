@@ -16,6 +16,8 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -25,6 +27,7 @@ from qfluentwidgets import (
     CaptionLabel,
     CardWidget,
     LineEdit,
+    MessageBox,
     PrimaryPushButton,
     PushButton,
     StrongBodyLabel,
@@ -69,6 +72,29 @@ class SplitTab(QWidget):
         root.addLayout(self._build_main(), 1)
 
     def _build_side(self) -> QWidget:
+        # 拆分列表：一个项目可以有多套拆分（横向比较不同划分）
+        self.list_card = CardWidget(self)
+        list_layout = QVBoxLayout(self.list_card)
+        list_layout.setContentsMargins(14, 12, 14, 12)
+        list_layout.setSpacing(6)
+        list_layout.addWidget(StrongBodyLabel("拆分列表", self.list_card))
+        self.split_list = QListWidget(self.list_card)
+        self.split_list.setMinimumHeight(120)
+        self.split_list.currentRowChanged.connect(self._on_split_selected)
+        list_layout.addWidget(self.split_list)
+
+        tools = QHBoxLayout()
+        tools.setSpacing(6)
+        self.add_split_btn = PushButton("新建", self.list_card)
+        self.copy_split_btn = PushButton("复制", self.list_card)
+        self.del_split_btn = PushButton("删除", self.list_card)
+        self.add_split_btn.clicked.connect(self._on_add_split)
+        self.copy_split_btn.clicked.connect(self._on_duplicate_split)
+        self.del_split_btn.clicked.connect(self._on_delete_split)
+        for button in (self.add_split_btn, self.copy_split_btn, self.del_split_btn):
+            tools.addWidget(button)
+        list_layout.addLayout(tools)
+
         self.setting_card = CardWidget(self)
         layout = QVBoxLayout(self.setting_card)
         layout.setContentsMargins(14, 12, 14, 12)
@@ -128,7 +154,9 @@ class SplitTab(QWidget):
         self.legend = LegendList(self.overview_card)
         overview_layout.addWidget(self.legend)
 
-        return side_column(self.setting_card, self.overview_card, width=300)
+        return side_column(
+            self.list_card, self.setting_card, self.overview_card, width=300
+        )
 
     def _build_main(self) -> QVBoxLayout:
         column = QVBoxLayout()
@@ -251,6 +279,7 @@ class SplitTab(QWidget):
 
         self._vm.datasetChanged.connect(lambda _d: self.refresh())
         self._vm.taskFinished.connect(lambda _t: self.refresh())
+        self._vm.splitsChanged.connect(lambda _rows: self.refresh())
 
     # -----------------------------------------------------------
     # 刷新
@@ -274,7 +303,81 @@ class SplitTab(QWidget):
         self.name_edit.setText(self._vm.split_name())
         self._syncing = False
 
+        self._refresh_splits()
+        self._apply_lock_state()
         self._refresh_preview()
+
+    # -----------------------------------------------------------
+    # 拆分列表（一个项目可有多套）
+    # -----------------------------------------------------------
+    def _refresh_splits(self) -> None:
+        """刷新拆分列表并把当前拆分置为选中。"""
+        rows = self._vm.splits_ready()
+        active = self._vm.active_split()
+        active_id = active.split_id if active is not None else 0
+        self._syncing = True
+        try:
+            self.split_list.clear()
+            for row in rows:
+                parts = str(row["label"]).split(" · ")
+                text = row["name"] + (f"  {parts[1]}" if len(parts) > 1 else "")
+                if row["ready"]:
+                    text += f"  {row['total']} 张"
+                item = QListWidgetItem(text)
+                item.setData(Qt.ItemDataRole.UserRole, int(row["id"]))
+                self.split_list.addItem(item)
+                if int(row["id"]) == active_id:
+                    self.split_list.setCurrentRow(self.split_list.count() - 1)
+        finally:
+            self._syncing = False
+        self.del_split_btn.setEnabled(len(rows) > 1)
+
+    def _on_split_selected(self, row: int) -> None:
+        if self._syncing or row < 0:
+            return
+        item = self.split_list.item(row)
+        if item is None:
+            return
+        split_id = int(item.data(Qt.ItemDataRole.UserRole))
+        active = self._vm.active_split()
+        if active is not None and active.split_id == split_id:
+            return
+        self._vm.select_split(split_id)
+        self.refresh()
+
+    def _on_add_split(self) -> None:
+        self._vm.add_split()
+        self.refresh()
+
+    def _on_duplicate_split(self) -> None:
+        active = self._vm.active_split()
+        if active is not None:
+            self._vm.duplicate_split(active.split_id)
+            self.refresh()
+
+    def _on_delete_split(self) -> None:
+        active = self._vm.active_split()
+        if active is None:
+            return
+        box = MessageBox(
+            "删除拆分",
+            f"确定要删除拆分「{active.name}」吗？\n\n"
+            "磁盘上的产物目录不会被删除。",
+            self.window(),
+        )
+        box.yesButton.setText("删除")
+        box.cancelButton.setText("取消")
+        if box.exec():
+            self._vm.remove_split(active.split_id)
+            self.refresh()
+
+    def _apply_lock_state(self) -> None:
+        """已被训练使用的拆分：比例只读。"""
+        locked = self._vm.split_locked()
+        for spin in self.ratio_spins.values():
+            spin.setEnabled(not locked)
+        self.seed_spin.setEnabled(not locked)
+        self.stratified_check.setEnabled(not locked)
 
     def _on_preview_clicked(self) -> None:
         self._refresh_preview()

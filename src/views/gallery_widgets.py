@@ -29,6 +29,7 @@ from qfluentwidgets import (
     Flyout,
     FlyoutViewBase,
     PillPushButton,
+    PushButton,
     RoundMenu,
     SearchLineEdit,
     Slider,
@@ -146,6 +147,9 @@ class FilterBar(CardWidget):
     filterChanged = Signal()
     textChanged = Signal(str)
     thumbSizeChanged = Signal(int)
+    rulesRequested = Signal()         # 打开「自定义筛选规则」弹窗
+    rulesCleared = Signal()           # 清除自定义规则
+    statsRequested = Signal()         # 打开「标签统计」弹窗
 
     def __init__(self, parent=None, with_size: bool = True):
         super().__init__(parent)
@@ -168,9 +172,29 @@ class FilterBar(CardWidget):
         self.mark_btn = self._menu_button("标记", FluentIcon.FLAG, "mark")
         layout.addWidget(self.mark_btn)
 
+        # 自定义筛选规则 + 标签统计（参照 DLT 的筛选规则 / 统计入口）
+        self.rules_btn = PushButton("规则", self)
+        self.rules_btn.setCheckable(True)
+        self.rules_btn.setToolTip("按条件组合筛选（名称 / 尺寸 / 标注 / 标记…）")
+        self.rules_btn.clicked.connect(lambda: self.rulesRequested.emit())
+        layout.addWidget(self.rules_btn)
+
+        self.rules_clear_btn = TransparentToolButton(self)
+        self.rules_clear_btn.setIcon(FluentIcon.DELETE)
+        self.rules_clear_btn.setToolTip("清除自定义筛选规则")
+        self.rules_clear_btn.setFixedSize(24, 24)
+        self.rules_clear_btn.setVisible(False)
+        self.rules_clear_btn.clicked.connect(lambda: self.rulesCleared.emit())
+        layout.addWidget(self.rules_clear_btn)
+
+        self.stats_btn = PushButton("统计", self)
+        self.stats_btn.setToolTip("按标签类别 / 数据集拆分 / 图像标记统计数量与占比")
+        self.stats_btn.clicked.connect(lambda: self.statsRequested.emit())
+        layout.addWidget(self.stats_btn)
+
         self.search = SearchLineEdit(self)
         self.search.setPlaceholderText("输入筛选文本")
-        self.search.setFixedWidth(200)
+        self.search.setFixedWidth(180)
         self.search.textChanged.connect(lambda _t: self.textChanged.emit(self.text()))
         self.search.searchSignal.connect(lambda _t: self.textChanged.emit(self.text()))
         layout.addWidget(self.search)
@@ -335,6 +359,17 @@ class FilterBar(CardWidget):
 
     def set_summary(self, shown: int, total: int) -> None:
         self.summary.setText(f"显示 {shown} / {total} 张")
+
+    def set_rule_summary(self, count: int, description: str = "") -> None:
+        """更新规则按钮状态（条数 + 悬停显示规则内容）。"""
+        self.rules_btn.setText(f"规则 {count}" if count else "规则")
+        self.rules_btn.setChecked(bool(count))
+        self.rules_clear_btn.setVisible(bool(count))
+        self.rules_btn.setToolTip(
+            f"当前规则：{description}" if description else
+            "按条件组合筛选（名称 / 尺寸 / 标注 / 标记…）"
+        )
+        self.rules_clear_btn.setToolTip(f"清除规则：{description}" if description else "清除自定义筛选规则")
 
     def set_thumb_steps(self, steps) -> None:
         """配置尺寸档位（与 `ThumbnailGrid.set_thumb_steps` 保持一致）。"""
@@ -570,3 +605,99 @@ class TagCard(CardWidget):
             Action("删除标记", triggered=lambda: self.deleteRequested.emit(name))
         )
         menu.exec(chip.mapToGlobal(position))
+
+
+class DisplayBar(CardWidget):
+    """显示增强条：亮度 / 对比度 / 类别名叠加（**只影响显示，不改动图片**）。
+
+    与 Halcon DLT 一致 —— 暗光 / 过曝的工业图在不修改原文件的前提下调亮看清，
+    调整结果不会写回图片，也不会进入训练数据。
+    """
+
+    changed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setSpacing(8)
+
+        layout.addWidget(StrongBodyLabel("显示", self))
+
+        layout.addWidget(CaptionLabel("亮度", self))
+        self.brightness = Slider(Qt.Orientation.Horizontal, self)
+        self.brightness.setRange(-100, 100)
+        self.brightness.setValue(0)
+        self.brightness.setFixedWidth(110)
+        self.brightness.setToolTip("显示亮度（仅影响显示）")
+        layout.addWidget(self.brightness)
+
+        layout.addWidget(CaptionLabel("对比度", self))
+        self.contrast = Slider(Qt.Orientation.Horizontal, self)
+        self.contrast.setRange(-100, 100)
+        self.contrast.setValue(0)
+        self.contrast.setFixedWidth(110)
+        self.contrast.setToolTip("显示对比度（仅影响显示）")
+        layout.addWidget(self.contrast)
+
+        self.name_check = CheckBox("类别名", self)
+        self.name_check.setToolTip("在缩略图上叠加类别名")
+        layout.addWidget(self.name_check)
+
+        self.name_width = Slider(Qt.Orientation.Horizontal, self)
+        self.name_width.setRange(25, 100)
+        self.name_width.setValue(60)
+        self.name_width.setFixedWidth(80)
+        self.name_width.setToolTip("类别名框宽度（占缩略图比例）")
+        layout.addWidget(self.name_width)
+
+        self.reset_btn = PushButton("复位", self)
+        self.reset_btn.setToolTip("恢复默认显示")
+        layout.addWidget(self.reset_btn)
+        layout.addStretch(1)
+
+        self.hint = CaptionLabel("仅影响显示，不改动图片", self)
+        layout.addWidget(self.hint)
+
+        self._syncing = False
+        self.brightness.valueChanged.connect(self._on_change)
+        self.contrast.valueChanged.connect(self._on_change)
+        self.name_width.valueChanged.connect(self._on_change)
+        self.name_check.toggled.connect(self._on_change)
+        self.reset_btn.clicked.connect(self.reset)
+
+    # -----------------------------------------------------------
+    def values(self) -> dict:
+        return {
+            "brightness": self.brightness.value() / 100.0,
+            "contrast": self.contrast.value() / 100.0,
+            "show_class_names": bool(self.name_check.isChecked()),
+            "name_width": self.name_width.value() / 100.0,
+        }
+
+    def _on_change(self, *_args) -> None:
+        if self._syncing:
+            return
+        values = self.values()
+        if not any((values["brightness"], values["contrast"])):
+            text = "仅影响显示，不改动图片"
+        else:
+            text = (
+                f"仅影响显示 · 亮度 {values['brightness']:+.2f} · "
+                f"对比度 {values['contrast']:+.2f}"
+            )
+        self.hint.setText(text)
+        self.changed.emit()
+
+    def reset(self) -> None:
+        """恢复默认显示参数。"""
+        self._syncing = True
+        try:
+            self.brightness.setValue(0)
+            self.contrast.setValue(0)
+            self.name_width.setValue(60)
+            self.name_check.setChecked(False)
+        finally:
+            self._syncing = False
+        self.hint.setText("仅影响显示，不改动图片")
+        self.changed.emit()

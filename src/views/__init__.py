@@ -4,7 +4,6 @@ from .annotate_tab import AnnotateTab
 from .evaluate_tab import EvaluateTab
 from .export_tab import ExportTab
 from .gallery_tab import GalleryTab
-from .model_tab import ModelTab
 from .project_tab import ProjectTab
 from .review_tab import ReviewTab
 from .split_tab import SplitTab
@@ -15,7 +14,6 @@ __all__ = [
     "EvaluateTab",
     "ExportTab",
     "GalleryTab",
-    "ModelTab",
     "ProjectTab",
     "ReviewTab",
     "SplitTab",

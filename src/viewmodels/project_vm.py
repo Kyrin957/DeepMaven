@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QTimer, Signal
 
 from src.models.project import Project
 from src.services.project_format import ProjectFormatError
@@ -21,17 +21,23 @@ class ProjectViewModel(QObject):
     对外暴露信号：
         projectChanged:  当前项目发生变更（打开/新建）。
         recentUpdated:   最近项目列表已更新。
+        recoverableChanged: 可恢复项目列表变化。
         message:         供界面提示的消息（(level, text)）。
     """
 
     projectChanged = Signal(object)      # Project
     recentUpdated = Signal(list)         # list[dict]
+    recoverableChanged = Signal(list)    # list[dict]
     message = Signal(str, str)           # level, text
 
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
         self._config = ConfigManager()
         self._service = ProjectService(self._config)
+        # 自动保存：定时把项目写入 <项目>.mprj.bak（间隔取自偏好设置）
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.timeout.connect(self._on_autosave)
+        self._apply_autosave_interval()
 
     # -----------------------------------------------------------
     # 查询
@@ -71,6 +77,7 @@ class ProjectViewModel(QObject):
         logger.info("新建项目: %s (%s)", project.name, project.params.get("path"))
         self.projectChanged.emit(project)
         self.recentUpdated.emit(self.recent_projects())
+        self._start_autosave()
         self.message.emit("success", f"项目已创建：{project.name}")
         return project
 
@@ -84,6 +91,7 @@ class ProjectViewModel(QObject):
         logger.info("打开项目: %s", path)
         self.projectChanged.emit(project)
         self.recentUpdated.emit(self.recent_projects())
+        self._start_autosave()
         self.message.emit("success", f"已打开项目：{project.name}")
         return project
 
@@ -116,6 +124,61 @@ class ProjectViewModel(QObject):
         self.recentUpdated.emit(self.recent_projects())
         self.message.emit("success", "项目已保存")
         return True
+
+    # -----------------------------------------------------------
+    # 自动保存与崩溃恢复
+    # -----------------------------------------------------------
+    def _apply_autosave_interval(self) -> None:
+        """按偏好设置调整自动保存间隔（0 表示关闭）。"""
+        seconds = self._config.autosave_seconds
+        if seconds <= 0:
+            self._autosave_timer.stop()
+        else:
+            self._autosave_timer.setInterval(seconds * 1000)
+
+    def _start_autosave(self) -> None:
+        self._apply_autosave_interval()
+        if self._config.autosave_seconds > 0 and self.has_project():
+            self._autosave_timer.start()
+
+    def _on_autosave(self) -> None:
+        """定时把当前项目写入备份文件（未修改则跳过）。"""
+        project = self.project
+        if project is None or not project.dirty:
+            return
+        self._service.autosave(project)
+        self.recoverableChanged.emit(self.recoverable_projects())
+
+    def load_preferences(self) -> None:
+        """偏好设置变化后重新应用（自动保存间隔等）。"""
+        self._start_autosave()
+
+    def recoverable_projects(self) -> list[dict]:
+        """最近项目里存在较新自动备份的项目（可恢复）。"""
+        items: list[dict] = []
+        for entry in self.recent_projects():
+            path = str(entry.get("path") or "")
+            info = ProjectService.recoverable(path) if path else None
+            if info:
+                info["name"] = str(entry.get("name") or Path(path).stem)
+                items.append(info)
+        return items
+
+    def recover_project(self, backup: str) -> Project | None:
+        """用自动备份恢复项目并打开它。"""
+        try:
+            target = ProjectService.recover(backup)
+        except (OSError, ProjectFormatError) as exc:
+            self.message.emit("error", f"恢复失败：{exc}")
+            return None
+        self.message.emit("success", "已从自动备份恢复")
+        self.recoverableChanged.emit(self.recoverable_projects())
+        return self.open_project(str(target))
+
+    def discard_backup(self, backup: str) -> None:
+        """忽略（删除）某个自动备份。"""
+        ProjectService.discard_backup(backup)
+        self.recoverableChanged.emit(self.recoverable_projects())
 
     def save_project_as(self, path: str) -> bool:
         """项目另存为，并把当前项目切换到新文件。"""

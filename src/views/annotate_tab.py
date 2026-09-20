@@ -13,8 +13,10 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QDoubleSpinBox,
     QFileDialog,
+    QFormLayout,
     QHBoxLayout,
     QLabel,
     QListWidget,
@@ -27,6 +29,7 @@ from qfluentwidgets import (
     BodyLabel,
     CaptionLabel,
     CardWidget,
+    CheckBox,
     ComboBox,
     LineEdit,
     PrimaryPushButton,
@@ -44,6 +47,7 @@ from src.views.data_widgets import side_column
 from src.views.widgets import (
     MODE_BOX,
     MODE_BROWSE,
+    MODE_MASK,
     MODE_POLYGON,
     THUMB_SMALL,
     AnnotationCanvas,
@@ -68,6 +72,7 @@ class AnnotateTab(QWidget):
         self._done = 0
         self._total = 0
         self._syncing = False
+        self._edit_before: list | None = None     # 几何编辑前的标注快照（撤销用）
         # 本页不可见时只记录待渲染的图片，切回本页再画缩略图
         self._pending_paths: list[str] = []
         self._stale = True
@@ -159,6 +164,7 @@ class AnnotateTab(QWidget):
             (MODE_BROWSE, "浏览"),
             (MODE_BOX, "矩形"),
             (MODE_POLYGON, "多边形"),
+            (MODE_MASK, "掩码"),
         ):
             self.mode_seg.addItem(key, text, onClick=lambda k=key: self._on_mode(k))
         layout.addWidget(self.mode_seg)
@@ -182,6 +188,27 @@ class AnnotateTab(QWidget):
         layout.addWidget(self.rotate_btn)
         self.rotate_spin.setVisible(False)
         self.rotate_btn.setVisible(False)
+
+        # 掩码工具（画笔 / 橡皮 / 生成轮廓）
+        self.brush_spin = QSpinBox(card)
+        self.brush_spin.setRange(2, 300)
+        self.brush_spin.setValue(24)
+        self.brush_spin.setSuffix(" px")
+        self.brush_spin.setFixedWidth(84)
+        self.erase_check = CheckBox("橡皮", card)
+        self.brush_label = BodyLabel("笔刷", card)
+        self.outline_btn = PushButton("生成轮廓", card)
+        self.mask_clear_btn = PushButton("清除掩码", card)
+        for widget in (self.brush_label, self.brush_spin, self.erase_check,
+                       self.outline_btn, self.mask_clear_btn):
+            layout.addWidget(widget)
+            widget.setVisible(False)
+
+        # 孔洞（多边形模式下的子工具）
+        self.hole_check = CheckBox("孔洞", card)
+        self.hole_check.setToolTip("画出的多边形从选中实例中挖掉")
+        layout.addWidget(self.hole_check)
+        self.hole_check.setVisible(False)
 
         layout.addStretch(1)
 
@@ -304,10 +331,57 @@ class AnnotateTab(QWidget):
         item_layout.setSpacing(6)
         item_layout.addWidget(StrongBodyLabel("标注对象", item_card))
         self.item_list = QListWidget(item_card)
-        self.item_list.setMinimumHeight(120)
+        self.item_list.setMinimumHeight(110)
+        # 支持多选（Ctrl 点选 / Shift 连选），与画布选中同步
+        self.item_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
         item_layout.addWidget(self.item_list)
+
+        action_row = QHBoxLayout()
         self.delete_btn = PushButton("删除选中", item_card)
-        item_layout.addWidget(self.delete_btn)
+        self.select_all_btn = PushButton("全选", item_card)
+        action_row.addWidget(self.delete_btn)
+        action_row.addWidget(self.select_all_btn)
+        item_layout.addLayout(action_row)
+
+        # 数值编辑（参照 DLT 的「编辑选中标注」表）
+        self.edit_card = CardWidget(self)
+        edit_layout = QVBoxLayout(self.edit_card)
+        edit_layout.setContentsMargins(14, 12, 14, 12)
+        edit_layout.setSpacing(6)
+        edit_layout.addWidget(StrongBodyLabel("编辑选中", self.edit_card))
+        form = QFormLayout()
+        form.setSpacing(6)
+        self.item_class_combo = ComboBox(self.edit_card)
+        self.item_class_combo.currentIndexChanged.connect(
+            lambda _i: self._on_item_class_changed()
+        )
+        form.addRow("类别", self.item_class_combo)
+
+        self.geo_spins: dict[str, QDoubleSpinBox] = {}
+        for key, text in (("x", "X"), ("y", "Y"), ("w", "宽"), ("h", "高")):
+            spin = QDoubleSpinBox(self.edit_card)
+            spin.setRange(0.0, 100000.0)
+            spin.setDecimals(1)
+            spin.setFixedWidth(92)
+            form.addRow(text, spin)
+            self.geo_spins[key] = spin
+
+        self.angle_spin = QDoubleSpinBox(self.edit_card)
+        self.angle_spin.setRange(-360.0, 360.0)
+        self.angle_spin.setDecimals(1)
+        self.angle_spin.setSuffix(" °")
+        self.angle_spin.setFixedWidth(92)
+        form.addRow("旋转", self.angle_spin)
+        edit_layout.addLayout(form)
+
+        edit_row = QHBoxLayout()
+        self.apply_geo_btn = PushButton("应用", self.edit_card)
+        self.apply_angle_btn = PushButton("旋转", self.edit_card)
+        edit_row.addWidget(self.apply_geo_btn)
+        edit_row.addWidget(self.apply_angle_btn)
+        edit_layout.addLayout(edit_row)
 
         note_card = CardWidget(self)
         note_layout = QVBoxLayout(note_card)
@@ -322,7 +396,8 @@ class AnnotateTab(QWidget):
         note_layout.addWidget(self.note_btn)
 
         return side_column(
-            navigator_card, display_card, item_card, note_card, width=252
+            navigator_card, display_card, item_card, self.edit_card, note_card,
+            width=268,
         )
 
     # -----------------------------------------------------------
@@ -345,10 +420,33 @@ class AnnotateTab(QWidget):
         self.rotate_btn.clicked.connect(self._on_rotate)
         self.canvas.deleteRequested.connect(self._on_delete)
         self.canvas.selectionChanged.connect(self._on_canvas_selection)
+        self.canvas.selectionListChanged.connect(self._on_selection_list)
+        self.canvas.classRequested.connect(self._on_class_key)
+        self.canvas.imageStepRequested.connect(vm.step_image)
+        # 画布内的几何编辑（拖动 / 微调 / 孔洞 / 旋转）先快照、后登记撤销
+        self.canvas.editStarted.connect(self._on_edit_started)
+        self.canvas.editFinished.connect(self._on_edit_finished)
         self.navigator.attach(self.canvas)
 
         self.grid.imageActivated.connect(self._on_grid_activated)
         self.item_list.currentRowChanged.connect(self._on_item_row)
+        self.item_list.itemSelectionChanged.connect(self._on_list_selection)
+
+        # 掩码 / 孔洞 / 数值编辑
+        self.brush_spin.valueChanged.connect(
+            lambda value: self.canvas.set_brush_size(float(value))
+        )
+        self.erase_check.stateChanged.connect(
+            lambda _s: self.canvas.set_mask_erase(self.erase_check.isChecked())
+        )
+        self.outline_btn.clicked.connect(self._on_generate_outline)
+        self.mask_clear_btn.clicked.connect(self._on_clear_mask)
+        self.hole_check.stateChanged.connect(
+            lambda _s: self.canvas.set_hole_mode(self.hole_check.isChecked())
+        )
+        self.apply_geo_btn.clicked.connect(self._on_apply_geometry)
+        self.apply_angle_btn.clicked.connect(self._on_apply_angle)
+        self.select_all_btn.clicked.connect(self.canvas.select_all)
 
         self.prev_btn.clicked.connect(vm.prev_image)
         self.next_btn.clicked.connect(vm.next_image)
@@ -376,14 +474,16 @@ class AnnotateTab(QWidget):
     # -----------------------------------------------------------
     def _refresh_classes(self) -> None:
         classes = self._vm.class_items()
-        self.class_combo.blockSignals(True)
-        self.class_combo.clear()
-        for cls in classes:
-            self.class_combo.addItem(cls.name, userData=cls.cls_id)
-        self.class_combo.blockSignals(False)
+        for combo in (self.class_combo, self.item_class_combo):
+            combo.blockSignals(True)
+            combo.clear()
+            for cls in classes:
+                combo.addItem(cls.name, userData=cls.cls_id)
+            combo.blockSignals(False)
         self.canvas.set_classes(classes)
         if classes:
             self.canvas.set_pending_class(self.class_combo.currentData())
+        self._sync_property_fields()
 
     def _on_classes_changed(self, _classes) -> None:
         self._refresh_classes()
@@ -398,6 +498,142 @@ class AnnotateTab(QWidget):
     # -----------------------------------------------------------
     def _on_mode(self, key: str) -> None:
         self.canvas.set_mode(key)
+        is_mask = key == MODE_MASK
+        for widget in (self.brush_label, self.brush_spin, self.erase_check,
+                       self.outline_btn, self.mask_clear_btn):
+            widget.setVisible(is_mask)
+        self.hole_check.setVisible(key == MODE_POLYGON)
+        self.hole_check.setChecked(False)
+
+    # -----------------------------------------------------------
+    # 掩码 / 孔洞 / 数值编辑
+    # -----------------------------------------------------------
+    def _on_generate_outline(self) -> None:
+        """掩码 → 多边形实例（孔洞自动并入外轮廓）。"""
+        count = self.canvas.generate_from_mask()
+        if count:
+            self.status_message(f"已生成 {count} 个实例")
+        else:
+            self.status_message("掩码为空")
+
+    def _on_clear_mask(self) -> None:
+        self.canvas.clear_mask()
+        self.status_message("掩码已清空")
+
+    def _on_class_key(self, position: int) -> None:
+        """数字键 1-9 选类别。"""
+        if 0 <= position < self.class_combo.count():
+            self.class_combo.setCurrentIndex(position)
+
+    def _on_edit_started(self) -> None:
+        """画布开始几何编辑：先快照，供撤销回退。"""
+        self._edit_before = self._vm.snapshot_items()
+
+    def _on_edit_finished(self, label: str) -> None:
+        if self._edit_before is None:
+            return
+        self._vm.push_undo(
+            label or "修改标注", self._edit_before, key=f"edit:{self._vm.index}"
+        )
+        self._edit_before = None
+        self._sync_property_fields()
+
+    def _on_selection_list(self, indexes: list) -> None:
+        """画布多选 → 同步列表与属性面板。"""
+        self._syncing = True
+        try:
+            self.item_list.blockSignals(True)
+            self.item_list.clearSelection()
+            for index in indexes:
+                if 0 <= index < self.item_list.count():
+                    self.item_list.item(index).setSelected(True)
+            if 0 <= self._canvas_selected < self.item_list.count():
+                self.item_list.setCurrentRow(self._canvas_selected)
+            self.item_list.blockSignals(False)
+        finally:
+            self._syncing = False
+        self._sync_property_fields()
+
+    def _on_list_selection(self) -> None:
+        """列表多选 → 同步画布。"""
+        if self._syncing:
+            return
+        indexes = sorted(
+            self.item_list.row(item) for item in self.item_list.selectedItems()
+        )
+        if not indexes:
+            return
+        current = self.item_list.currentRow()
+        primary = current if current in indexes else indexes[-1]
+        self.canvas.select_many(indexes, primary=primary)
+        self._canvas_selected = primary
+        self._sync_property_fields()
+
+    def _sync_property_fields(self) -> None:
+        """把主选中标注的位置 / 尺寸填进数值框。"""
+        current = self._vm.current
+        primary = self._canvas_selected
+        valid = (
+            current is not None
+            and 0 <= primary < len(current.items)
+        )
+        for widget in (
+            *self.geo_spins.values(), self.angle_spin,
+            self.apply_geo_btn, self.apply_angle_btn, self.item_class_combo,
+        ):
+            widget.setEnabled(valid)
+        if not valid:
+            return
+        item = current.items[primary]
+        width = max(1, int(current.width or 1))
+        height = max(1, int(current.height or 1))
+        x1, y1, x2, y2 = item.bounds()
+        self._syncing = True
+        try:
+            self.geo_spins["x"].setValue(x1 * width)
+            self.geo_spins["y"].setValue(y1 * height)
+            self.geo_spins["w"].setValue(max(0.0, (x2 - x1) * width))
+            self.geo_spins["h"].setValue(max(0.0, (y2 - y1) * height))
+            position = self.item_class_combo.findData(item.cls_id)
+            self.item_class_combo.setCurrentIndex(max(0, position))
+        finally:
+            self._syncing = False
+
+    def _on_apply_geometry(self) -> None:
+        """按数值框设置位置与尺寸（像素）。"""
+        if self._canvas_selected < 0:
+            self.status_message("请先选择标注对象")
+            return
+        applied = self._vm.set_geometry(
+            self._canvas_selected,
+            self.geo_spins["x"].value(), self.geo_spins["y"].value(),
+            self.geo_spins["w"].value(), self.geo_spins["h"].value(),
+        )
+        if applied:
+            self.status_message("已应用位置与尺寸")
+
+    def _on_apply_angle(self) -> None:
+        delta = self.angle_spin.value()
+        if not delta:
+            self.status_message("请先设置旋转角度")
+            return
+        if self.canvas.rotate_selected(delta):
+            self.angle_spin.setValue(0.0)
+            self.status_message(f"已旋转 {delta:+.1f}°")
+        else:
+            self.status_message("请先选择标注对象")
+
+    def _on_item_class_changed(self) -> None:
+        """编辑卡的类别下拉：批量修改选中标注的类别。"""
+        if self._syncing:
+            return
+        cls_id = self.item_class_combo.currentData()
+        indexes = self.canvas.selection()
+        if cls_id is None or not indexes:
+            return
+        changed = self._vm.set_class_for(indexes, int(cls_id))
+        if changed:
+            self.status_message(f"已修改 {changed} 个标注的类别")
 
     def apply_project_type(self) -> None:
         """按项目类型限定标注方式（项目类型决定标注工具，参照 DLT）。"""
@@ -406,7 +642,7 @@ class AnnotateTab(QWidget):
             "box": MODE_BOX, "obb": MODE_BOX, "polygon": MODE_POLYGON,
         }.get(mode, MODE_BROWSE)
         self.mode_seg.setCurrentItem(target)
-        self.canvas.set_mode(target)
+        self._on_mode(target)
 
         is_obb = mode == "obb"
         self.rotate_spin.setVisible(is_obb)
@@ -524,20 +760,23 @@ class AnnotateTab(QWidget):
 
     def _on_canvas_selection(self, index: int) -> None:
         self._canvas_selected = index
-        if 0 <= index < self.item_list.count():
-            self.item_list.blockSignals(True)
-            self.item_list.setCurrentRow(index)
-            self.item_list.blockSignals(False)
+        self._sync_property_fields()
 
     def _on_item_row(self, row: int) -> None:
         if row >= 0:
             self.canvas.select(row)
 
     def _on_delete(self) -> None:
-        if self._canvas_selected < 0:
+        """删除选中的标注（支持多选）。"""
+        indexes = self.canvas.selection()
+        if not indexes and self._canvas_selected >= 0:
+            indexes = [self._canvas_selected]
+        if not indexes:
             self.status_message("请先选择标注对象")
             return
-        self._vm.remove_annotation(self._canvas_selected)
+        removed = self._vm.remove_many(indexes)
+        if removed:
+            self.status_message(f"已删除 {removed} 个标注")
 
     # -----------------------------------------------------------
     # 导入 / 导出
@@ -620,10 +859,13 @@ class AnnotateTab(QWidget):
         self.item_list.clear()
         if annotation is not None:
             for index, item in enumerate(annotation.items):
-                kind = "矩形" if item.is_box else "多边形"
+                kind = {"box": "矩形", "polygon": "多边形", "mask": "掩码"}.get(
+                    item.kind, item.kind
+                )
                 name = names.get(item.cls_id, item.cls_id)
                 self.item_list.addItem(f"{index + 1}. {name} · {kind}")
         self.item_list.blockSignals(False)
+        self._sync_property_fields()
 
     def _refresh_marks(self) -> None:
         self.grid.set_annotated(self._vm.annotated_flags())

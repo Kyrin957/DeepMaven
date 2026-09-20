@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import shutil
+from datetime import datetime
 from pathlib import Path
 
 from src.models.project import Project
@@ -95,6 +97,83 @@ class ProjectService:
         self._write(project.params["path"], self._container.data)
         project.mark_saved()
         logger.info("已保存项目: %s", project.params["path"])
+
+    # -----------------------------------------------------------
+    # 自动保存与崩溃恢复
+    # -----------------------------------------------------------
+    @staticmethod
+    def backup_path(path: str | Path) -> Path:
+        """自动备份文件路径：<项目>.mprj.bak"""
+        target = Path(path)
+        return target.with_suffix(target.suffix + ".bak")
+
+    def autosave(self, project: Project | None = None) -> Path | None:
+        """把当前项目写入 `<项目>.bak`（不改变「未保存」标记）。
+
+        Returns:
+            备份文件路径；无法写入（无项目 / 文件不存在）时返回 None。
+        """
+        project = project or self.project
+        if project is None:
+            return None
+        raw = str(project.params.get("path", "") or "")
+        path = Path(raw)
+        if not path.is_file():
+            return None
+        try:
+            container = (
+                self._container or ProjectContainer.create(project, {})
+            ).rebuild(project)
+            backup = self.backup_path(path)
+            backup.write_bytes(container.data)
+        except (OSError, ValueError) as exc:
+            logger.warning("自动保存失败: %s", exc)
+            return None
+        self._container = container
+        logger.info("自动保存：%s", backup)
+        return backup
+
+    @staticmethod
+    def recoverable(project_path: str | Path) -> dict | None:
+        """检查是否有可恢复的自动备份（备份比项目文件新）。"""
+        path = Path(project_path)
+        if not path.is_file():
+            return None
+        backup = ProjectService.backup_path(path)
+        if not backup.is_file():
+            return None
+        try:
+            if backup.stat().st_mtime <= path.stat().st_mtime:
+                return None
+        except OSError:
+            return None
+        return {
+            "path": str(path),
+            "backup": str(backup),
+            "time": datetime.fromtimestamp(backup.stat().st_mtime).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+        }
+
+    @staticmethod
+    def recover(backup: str | Path) -> Path:
+        """用自动备份覆盖项目文件（备份随后删除）。"""
+        backup = Path(backup)
+        if not backup.is_file():
+            raise ProjectFormatError(f"备份文件不存在: {backup}")
+        # 备份名形如 xxx.mprj.bak → 去掉 .bak 即项目文件
+        target = Path(str(backup)[:-4])
+        shutil.copy2(backup, target)
+        backup.unlink()
+        logger.info("已从自动备份恢复项目: %s", target)
+        return target
+
+    @staticmethod
+    def discard_backup(backup: str | Path) -> None:
+        path = Path(backup)
+        if path.is_file():
+            path.unlink()
+            logger.info("已忽略自动备份: %s", path)
 
     def save_as(self, new_path: str | Path, project: Project | None = None) -> Path:
         """把当前项目另存为新的 .mprj，并把当前项目切换到新位置。

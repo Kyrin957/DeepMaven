@@ -17,6 +17,7 @@ from pathlib import Path
 
 from src.models.dataset import Dataset
 from src.models.project_file import ClassDef, ProjectFile
+from src.models.split import DEFAULT_SPLIT_DIR, Split
 from src.models.training import (
     EvaluationConfig,
     ExportConfig,
@@ -65,6 +66,9 @@ class Project:
     export: ExportConfig = field(default_factory=ExportConfig)
     model: dict = field(default_factory=dict)
     classes: list[ClassDef] = field(default_factory=list)
+    # 一个项目可以有多套数据拆分（Halcon DLT 思路），训练时选用其中一套
+    splits: list[Split] = field(default_factory=list)
+    active_split_id: int = 0
     params: dict = field(default_factory=dict)
     files: list[ProjectFile] = field(default_factory=list)
 
@@ -113,6 +117,54 @@ class Project:
                 return c
         return None
 
+    # -----------------------------------------------------------
+    # 数据拆分（一个项目可有多套）
+    # -----------------------------------------------------------
+    def split_by_id(self, split_id: int) -> Split | None:
+        for split in self.splits:
+            if split.split_id == int(split_id):
+                return split
+        return None
+
+    def split_by_name(self, name: str) -> Split | None:
+        for split in self.splits:
+            if split.name == name:
+                return split
+        return None
+
+    def next_split_id(self) -> int:
+        return max((split.split_id for split in self.splits), default=-1) + 1
+
+    def active_split(self) -> Split | None:
+        """当前选中的拆分（不存在则回退到第一套）。"""
+        return self.split_by_id(self.active_split_id) or (
+            self.splits[0] if self.splits else None
+        )
+
+    def ensure_splits(self, layout: str = "") -> Split:
+        """确保项目至少有一套拆分；旧项目按 Dataset 的划分字段迁移一套。"""
+        if not self.splits:
+            dataset = self.dataset
+            name = str(self.params.get("split_name") or "").strip() or DEFAULT_SPLIT_DIR
+            self.splits.append(Split(
+                split_id=0,
+                name=name,
+                train=float(dataset.split_train or 0.7),
+                val=float(dataset.split_val or 0.2),
+                test=float(dataset.split_test or 0.1),
+                seed=int(dataset.seed or 0),
+                stratified=bool(dataset.stratified),
+                layout=layout or ("classify" if self.model_type == "classify"
+                                  else "detect"),
+                output_dir=str(dataset.output_path or ""),
+                data_yaml=str(dataset.data_yaml or ""),
+                classes=list(dataset.class_names or []),
+            ))
+            self.active_split_id = self.splits[0].split_id
+        if self.split_by_id(self.active_split_id) is None:
+            self.active_split_id = self.splits[0].split_id
+        return self.active_split()
+
     def touch(self) -> None:
         """标记项目已修改。"""
         self.updated_at = _now_iso()
@@ -140,13 +192,15 @@ class Project:
             "export": self.export.to_dict(),
             "model": self.model,
             "classes": [c.to_dict() for c in self.classes],
+            "splits": [split.to_dict() for split in self.splits],
+            "active_split_id": self.active_split_id,
             "params": self.params,
             "files": [f.to_dict() for f in self.files],
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "Project":
-        return cls(
+        project = cls(
             name=data.get("name", "未命名项目"),
             model_type=data.get("model_type", "detect"),
             description=data.get("description", ""),
@@ -160,9 +214,14 @@ class Project:
             export=ExportConfig.from_dict(data.get("export", {})),
             model=data.get("model", {}),
             classes=[ClassDef.from_dict(c) for c in data.get("classes", [])],
+            splits=[Split.from_dict(s) for s in data.get("splits", [])],
+            active_split_id=data.get("active_split_id", 0),
             params=data.get("params", {}),
             files=[ProjectFile.from_dict(f) for f in data.get("files", [])],
         )
+        # 旧项目（没有 splits 字段）按 Dataset 的划分字段迁移出一套拆分
+        project.ensure_splits()
+        return project
 
     # 兼容旧接口：保留 path 属性（指向 .mprj 文件）
     @property
