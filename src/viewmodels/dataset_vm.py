@@ -153,16 +153,15 @@ class DatasetViewModel(QObject):
     def _import(
         self, images: list, options: dict | None, roots: list
     ) -> Dataset | None:
-        """导入的公共实现：排序 → 去重 → 初步标注 → 合并顺序 → 重建统计。
+        """导入的公共实现：去重 → 初步标注 → 合并顺序 → 重建统计。
 
         options 支持的键：
-            sort      "name"（默认）/ "time"：按文件名或修改时间升序
-            reverse   bool：反向顺序（把排序结果整体倒过来）
-            position  "right"（默认）/ "left"：新图片插到已有图库的右侧 / 左侧
-            label_map dict：{图片所在文件夹: 标签名}，用于按子文件夹自动标注
-            label     str：兜底标注（文件夹没填标签时用它；"" = 不标注）
-            files     list：只导入这些图片（来源文件夹下的子集）
-            dedupe    bool：是否跳过与图库中已有图片内容重复的图片
+            label_map   dict：{图片所在文件夹: 类别名}，用于按子文件夹自动标注
+            class_kinds dict：{类别名: "normal" / "abnormal"}，异常检测的类别类型
+            label       str：兜底标注（文件夹没填类别时用它；"" = 不标注）
+            files       list：只导入这些图片（来源文件夹下的子集）
+            dedupe      bool：是否跳过与图库中已有图片内容重复的图片
+            annotate    bool：是否在导入时按上面的映射标注（False = 只导入图片）
         """
         project = self._project_vm.project if self._project_vm else None
         if project is None:
@@ -170,10 +169,8 @@ class DatasetViewModel(QObject):
             return None
         options = dict(options or {})
 
-        # 1) 排序（+ 反向顺序）
-        ordered = self._service.sort_images(images, str(options.get("sort", "name")))
-        if options.get("reverse"):
-            ordered.reverse()
+        # 1) 导入顺序：按所选范围的自然顺序（读取顺序不作为导入选项）
+        ordered = [Path(path) for path in images]
 
         # 2) 来源目录：已有目录 + 本次新增目录
         merged_roots: list[Path] = []
@@ -201,12 +198,19 @@ class DatasetViewModel(QObject):
             )
             return None
 
-        # 4) 自动标注：图片所在文件夹 → 标签（label_map），没填标签即「无标签」
+        # 4) 自动标注：图片所在文件夹 → 类别（label_map），没填类别即「无标签」；
+        #    annotate=False 时只导入图片，不写类别
+        annotate = bool(options.get("annotate", True))
         label_map = {
             str(folder): str(name)
             for folder, name in (options.get("label_map") or {}).items()
-        }
-        fallback = str(options.get("label", "") or "").strip()
+        } if annotate else {}
+        fallback = str(options.get("label", "") or "").strip() if annotate else ""
+        kinds = {
+            str(name): str(kind)
+            for name, kind in (options.get("class_kinds") or {}).items()
+            if str(kind) in ("normal", "abnormal")
+        } if annotate else {}
         applied: dict[str, int] = {}
         if label_map or fallback:
             overrides = self._params_dict("class_overrides", create=True)
@@ -226,14 +230,19 @@ class DatasetViewModel(QObject):
             for name in applied:
                 if not any(str(cls.name) == name for cls in project.classes):
                     CategoryService.add(project.classes, name)
+        # 异常检测的类别类型（良好 / 异常）：良好与异常下都可以有多个类别
+        for name, kind in kinds.items():
+            target = next(
+                (cls for cls in project.classes if str(cls.name) == name), None
+            )
+            if target is None:
+                target = CategoryService.add(project.classes, name)
+            CategoryService.set_kind(project.classes, target.cls_id, kind)
 
-        # 5) 合并顺序：新图片插入已有图库的左侧 / 右侧
+        # 5) 合并顺序：新图片追加到图库末尾
         order = self._order_list() or [str(path) for path in self.images()]
         new_paths = [str(path) for path in accepted]
-        position = "left" if str(options.get("position", "right")) == "left" else "right"
-        merged_order = (
-            new_paths + order if position == "left" else order + new_paths
-        )
+        merged_order = order + new_paths
         project.params["image_order"] = list(dict.fromkeys(merged_order))
 
         # 重新导入的图片视为「回到数据集」，从已移除清单里摘掉
@@ -265,8 +274,7 @@ class DatasetViewModel(QObject):
         )
         self._inherit_settings(dataset, previous)
 
-        where = "左侧（最前）" if position == "left" else "右侧（最后）"
-        notice = f"导入 {len(accepted)} 张（插入到{where}）"
+        notice = f"导入 {len(accepted)} 张"
         if skipped:
             notice += f"，跳过内容重复 {skipped} 张"
         if applied:
@@ -276,13 +284,15 @@ class DatasetViewModel(QObject):
             )
             if len(applied) > 4:
                 brief += f" 等 {len(applied)} 类"
-            notice += f"，已按标签标注：{brief}"
+            notice += f"，已按类别标注：{brief}"
+        elif annotate is False:
+            notice += "，未标注"
         self._set_dataset(dataset, notice=notice)
         if dedupe:
             self._hash_cache = {**known, **hashes}
         logger.info(
-            "导入数据集 %s: 新增 %s 张（%s），跳过重复 %s 张，合计 %s 张",
-            dataset.name, len(accepted), position, skipped, dataset.image_count,
+            "导入数据集 %s: 新增 %s 张，跳过重复 %s 张，合计 %s 张",
+            dataset.name, len(accepted), skipped, dataset.image_count,
         )
         return dataset
 
@@ -2066,6 +2076,11 @@ class DatasetViewModel(QObject):
     def notify(self, text: str, level: str = "info") -> None:
         """供界面反馈本地操作结果的提示通道。"""
         self.message.emit(level, text)
+
+    def is_anomaly(self) -> bool:
+        """项目是否为异常检测（导入弹窗据此显示「类别类型」列）。"""
+        project = self._project_vm.project if self._project_vm else None
+        return str(getattr(project, "model_type", "")) == "anomaly"
 
     def split_layout(self) -> str:
         """按项目类型返回数据集结构（声明在任务注册表）。

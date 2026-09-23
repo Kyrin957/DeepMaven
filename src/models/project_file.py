@@ -62,14 +62,25 @@ class ProjectFile:
 
 @dataclass
 class ClassDef:
-    """一个缺陷类别定义。"""
+    """一个缺陷类别定义。
+
+    Attributes:
+        kind: 类别类型（异常检测专用）：""（未指定）/ "normal"（良好）/
+            "abnormal"（异常）；良好与异常下都可以有多个类别。
+    """
 
     cls_id: int = 0
     name: str = ""
     color: str = "#66CCFF"
+    kind: str = ""
 
     def to_dict(self) -> dict:
-        return {"cls_id": self.cls_id, "name": self.name, "color": self.color}
+        return {
+            "cls_id": self.cls_id,
+            "name": self.name,
+            "color": self.color,
+            "kind": self.kind,
+        }
 
     @classmethod
     def from_dict(cls, data: dict) -> "ClassDef":
@@ -77,4 +88,5 @@ class ClassDef:
             cls_id=data.get("cls_id", 0),
             name=data.get("name", ""),
             color=data.get("color", "#66CCFF"),
+            kind=data.get("kind", ""),
         )

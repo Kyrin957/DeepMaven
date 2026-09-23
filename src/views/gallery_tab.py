@@ -505,42 +505,27 @@ class GalleryTab(QWidget):
             self._import_dialog("files", paths)
 
     def _import_dialog(self, mode: str, selection: list) -> None:
-        """打开「导入图像」选项弹窗，按选项完成排序 / 插入位置 / 初步标注。"""
-        classes = (
-            [cls.name for cls in self._category_vm.classes]
-            if self._category_vm is not None else []
-        )
-        existing = self._vm.images()
+        """打开「导入图像」弹窗，按选项完成导入与初步标注。"""
+        classes = self._category_vm.classes if self._category_vm is not None else []
         dialog = ImportImagesDialog(
             self.window(),
             mode=mode,
             initial=selection,
-            has_dataset=bool(existing),
-            classes=classes,
-            existing_count=len(existing),
+            is_anomaly=self._vm.is_anomaly(),
+            existing_kinds={
+                str(cls.name): str(getattr(cls, "kind", "")) for cls in classes
+            },
         )
         if not dialog.exec():
             return
 
         data = dialog.result_data()
-        label = str(data.get("label") or "")
-        if label:
-            # OK / NG 这类快捷初步标注：项目里还没有对应类别时先建类再导入
-            self._ensure_class(label)
         if str(data.get("mode")) == "folder":
             paths = list(data.get("paths") or [])
             if paths:
                 self._vm.import_images(paths[0], data)
         else:
             self._vm.import_files(list(data.get("paths") or []), data)
-
-    def _ensure_class(self, name: str) -> None:
-        """确保项目类别表里存在该类别（初步标注用）。"""
-        if self._category_vm is None:
-            return
-        if any(str(cls.name) == name for cls in self._category_vm.classes):
-            return
-        self._category_vm.add_class(name)
 
     def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         if event.mimeData().hasUrls():

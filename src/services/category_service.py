@@ -80,6 +80,15 @@ class CategoryService:
         raise KeyError(f"类别不存在: {cls_id}")
 
     @staticmethod
+    def set_kind(classes: list[ClassDef], cls_id: int, kind: str) -> None:
+        """设置类别类型（异常检测：normal=良好 / abnormal=异常，"" 为未指定）。"""
+        for cls in classes:
+            if cls.cls_id == cls_id:
+                cls.kind = str(kind)
+                return
+        raise KeyError(f"类别不存在: {cls_id}")
+
+    @staticmethod
     def remove(classes: list[ClassDef], cls_id: int) -> None:
         """删除类别并重排 id（保持 0..n-1 连续）。"""
         classes[:] = [c for c in classes if c.cls_id != cls_id]
