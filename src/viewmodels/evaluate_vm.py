@@ -11,9 +11,12 @@ from src.services.anomalib_service import AnomalibService
 from src.services.evaluation_service import EvaluationService
 from src.services.inference_service import InferenceService
 from src.services.report_service import ReportService
+from src.services.segmentation_service import SegmentationService
 from src.utils.constants import DATA_DIR, SPLIT_LABELS
 from src.utils.image_ops import overlay_heatmap
 from src.utils.logger import get_logger
+from src.utils.tasks import eval_views as _eval_views
+from src.utils.tasks import task_of as _task_of
 from src.utils.workers import FunctionWorker
 from src.viewmodels.project_vm import ProjectViewModel
 
@@ -21,13 +24,6 @@ logger = get_logger("evaluate_vm")
 
 # 评估可视化（result.plot() 落盘）的缓存目录
 _EVAL_PLOT_DIR = DATA_DIR / "eval"
-
-# 遍历任务类型：项目类型直接对应任务，其余回退为对象检测
-_TRAIN_TASKS = ("detect", "obb", "segment", "classify", "anomaly")
-
-
-def _task_of(model_type: str) -> str:
-    return model_type if model_type in _TRAIN_TASKS else "detect"
 
 
 def _sort_eval_rows(rows: list, key: str) -> list:
@@ -577,6 +573,14 @@ class EvaluateViewModel(QObject):
     def eval_result(self) -> dict:
         return dict(self._eval)
 
+    def eval_views(self) -> tuple[str, ...]:
+        """当前结果的视图集（任务注册表声明），界面据此显示对应结果卡片。"""
+        task = str(self._eval.get("task") or "")
+        if not task:
+            project = self._project_vm.project if self._project_vm else None
+            task = _task_of(project.model_type) if project is not None else "detect"
+        return _eval_views(task)
+
     @property
     def eval_rows(self) -> list:
         return list(self._eval.get("rows") or [])
@@ -618,6 +622,10 @@ class EvaluateViewModel(QObject):
 
     def _recompute(self) -> None:
         """按当前行记录重算混淆矩阵与指标。"""
+        if str(self._eval.get("task") or "") == "semantic":
+            # 语义分割的指标是像素级统计，不能由图级行记录重算
+            self.evaluationReady.emit(dict(self._eval))
+            return
         rows = list(self._eval.get("rows") or [])
         names = list(self._eval.get("class_names") or [])
         with_background = bool(self._eval.get("with_background"))
@@ -668,6 +676,9 @@ class EvaluateViewModel(QObject):
         task = _task_of(project.model_type) if project is not None else "classify"
         if task == "anomaly" or Path(weights).suffix.lower() == ".ckpt":
             self._run_anomaly_evaluation(weights)
+            return
+        if task == "semantic":
+            self._run_segmentation_evaluation(weights)
             return
         if not EvaluationService.is_available():
             self.message.emit("error", "未安装 Ultralytics，无法执行评估")
@@ -790,9 +801,87 @@ class EvaluateViewModel(QObject):
         self._sort_rows()          # 沿用上次的排序方式
         self.evaluationReady.emit(dict(self._eval))
         metrics = self._eval.get("metrics") or {}
-        self.message.emit(
-            "success",
-            f"评估完成：准确率 {float(metrics.get('accuracy') or 0) * 100:.1f}%",
+        if str(self._eval.get("task") or "") == "semantic":
+            text = f"评估完成：mIoU {float(metrics.get('miou') or 0) * 100:.1f}%"
+        else:
+            text = f"评估完成：准确率 {float(metrics.get('accuracy') or 0) * 100:.1f}%"
+        self.message.emit("success", text)
+
+    # -----------------------------------------------------------
+    # 语义分割（U-Net）
+    # -----------------------------------------------------------
+    def _run_segmentation_evaluation(self, weights: str) -> None:
+        """逐图预测掩码并与真值对比（mIoU / Dice / 像素准确率）。"""
+        plan = self._segmentation_pairs()
+        if plan is None:
+            return
+        pairs, names = plan
+        # 叠加图配色按类别 id - 1 取色，因此去掉「背景」那一个
+        palette = self.class_colors(names)[1:]
+        plot_dir = self._prepare_plot_dir()
+
+        def job(progress, _is_cancelled):
+            return SegmentationService.evaluate_checkpoint(
+                weights, pairs, names,
+                plot_dir=plot_dir, palette=palette, progress=progress,
+            )
+
+        def done(payload: dict) -> None:
+            metrics = dict(payload.get("metrics") or {})
+            self._apply_evaluation({
+                "task": "semantic",
+                "class_names": payload.get("class_names") or names,
+                "rows": payload.get("rows") or [],
+                "matrix": metrics.get("matrix") or [],
+                "with_background": False,
+                "metrics": metrics,
+            })
+
+        self._start_worker(job, "语义分割评估", on_done=done)
+
+    def _segmentation_pairs(self) -> tuple | None:
+        """评估用的（图, 掩码）对与类别名（背景在最前）。"""
+        project = self._project_vm.project if self._project_vm else None
+        folder = self._config.eval_folder.strip()
+        if folder:
+            base = Path(folder)
+            if not base.is_dir():
+                self.message.emit("warning", "评估目录不存在")
+                return None
+        else:
+            if project is None:
+                self.message.emit("warning", "请先创建或打开项目")
+                return None
+            split = (
+                project.split_by_id(self._config.eval_split_id) or project.active_split()
+            )
+            if split is None or not split.ready:
+                self.message.emit("warning", "请先选择已生成的拆分")
+                return None
+            base = Path(split.output_dir)
+
+        subsets = list(self._config.eval_subsets) or [self._config.eval_subset or "val"]
+        pairs: list = []
+        for subset in subsets:
+            pairs.extend(SegmentationService.pairs_for(base, subset))
+        pairs = self._sample_pairs(pairs, max(1, int(self._config.max_images or 200)))
+        if not pairs:
+            self.message.emit("warning", "评估集里没有「图 + 掩码」对")
+            return None
+        names = ["背景"] + list(getattr(project, "class_names", []) or [])
+        return pairs, names
+
+    def _sample_pairs(self, pairs: list, limit: int) -> list:
+        """（图, 掩码）对的抽样（与图片抽样同一套随机种子规则）。"""
+        if len(pairs) <= limit:
+            return list(pairs)
+        if not self._config.eval_random:
+            return list(pairs[:limit])
+        import random
+
+        rng = random.Random(int(self._config.eval_seed or 0))
+        return sorted(
+            rng.sample(list(pairs), int(limit)), key=lambda item: str(item[0])
         )
 
     def _run_anomaly_evaluation(self, ckpt: str) -> None:

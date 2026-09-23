@@ -49,6 +49,13 @@ _REPORT_FORMATS = [
     ("md", "Markdown (.md)"),
 ]
 
+# 导出后回归结论的显示文案（状态 → 表格文字）
+_REGRESSION_LABELS = {"pass": "通过", "fail": "未通过", "skip": "跳过"}
+
+
+def _regression_label(item: dict) -> str:
+    return _REGRESSION_LABELS.get(str(item.get("regression") or ""), "—")
+
 
 class ExportTab(QWidget):
     """模型导出页。"""
@@ -261,8 +268,8 @@ class ExportTab(QWidget):
 
         history_card, history_layout = self._card("导出记录")
         self.history_table = TableWidget(history_card)
-        self.history_table.setColumnCount(3)
-        self.history_table.setHorizontalHeaderLabels(["时间", "格式", "大小"])
+        self.history_table.setColumnCount(4)
+        self.history_table.setHorizontalHeaderLabels(["时间", "格式", "大小", "回归"])
         self.history_table.verticalHeader().setVisible(False)
         self.history_table.setEditTriggers(TableWidget.EditTrigger.NoEditTriggers)
         self.history_table.horizontalHeader().setSectionResizeMode(
@@ -312,6 +319,7 @@ class ExportTab(QWidget):
                 self.weights_edit.setText(config.weights_path or "")
             if self.out_edit.text() != config.output_dir:
                 self.out_edit.setText(config.output_dir or "")
+            self._reload_formats()
             index = self.format_combo.findData(config.format)
             if index >= 0:
                 self.format_combo.setCurrentIndex(index)
@@ -381,10 +389,33 @@ class ExportTab(QWidget):
             str(int(metrics.get("total") or 0)),
         )
 
+    def _reload_formats(self) -> None:
+        """按选中模型的后端重建格式下拉（异常检测只有模型包）。"""
+        options = self._vm.export_options()
+        signature = "|".join(str(item["key"]) for item in options)
+        if not options or getattr(self, "_format_signature", "") == signature:
+            return
+        previous = str(self.format_combo.currentData() or "")
+        # 保留外层的同步标记（本方法可能在外层同步过程中被调用）
+        outer_syncing = self._syncing
+        self._syncing = True
+        try:
+            self.format_combo.clear()
+            for item in options:
+                self.format_combo.addItem(
+                    str(item["label"]), userData=str(item["key"])
+                )
+            index = self.format_combo.findData(previous)
+            self.format_combo.setCurrentIndex(max(0, index))
+        finally:
+            self._syncing = outer_syncing
+        self._format_signature = signature
+
     def _on_selection(self, info: dict) -> None:
         """模型概览随选中模型变化。"""
         if not info:
             return
+        self._reload_formats()
         self.model_name.setText(str(info.get("name") or "—"))
         weights = str(info.get("weights") or "")
         self.model_path.setText(weights if weights else "尚未选择模型")
@@ -413,10 +444,14 @@ class ExportTab(QWidget):
                 str(item.get("time", ""))[-8:],
                 str(item.get("format", "")),
                 f"{float(item.get('size') or 0):.2f} MB",
+                _regression_label(item),
             ]
             for column, text in enumerate(values):
                 self.history_table.setItem(row, column, QTableWidgetItem(text))
             self.history_table.item(row, 0).setToolTip(str(item.get("path", "")))
+            self.history_table.item(row, 3).setToolTip(
+                str(item.get("regression_detail", ""))
+            )
 
     # -----------------------------------------------------------
     # 交互

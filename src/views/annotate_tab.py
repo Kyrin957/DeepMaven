@@ -49,6 +49,7 @@ from src.views.widgets import (
     MODE_BROWSE,
     MODE_MASK,
     MODE_POLYGON,
+    MODE_TEXT,
     THUMB_SMALL,
     AnnotationCanvas,
     Navigator,
@@ -160,13 +161,7 @@ class AnnotateTab(QWidget):
         layout.setSpacing(10)
 
         self.mode_seg = SegmentedWidget(card)
-        for key, text in (
-            (MODE_BROWSE, "浏览"),
-            (MODE_BOX, "矩形"),
-            (MODE_POLYGON, "多边形"),
-            (MODE_MASK, "掩码"),
-        ):
-            self.mode_seg.addItem(key, text, onClick=lambda k=key: self._on_mode(k))
+        self._reload_tools("box")           # 默认工具集（文本框工具仅 OCR 项目出现）
         layout.addWidget(self.mode_seg)
         self.mode_seg.setCurrentItem(MODE_BOX)
 
@@ -374,6 +369,14 @@ class AnnotateTab(QWidget):
         self.angle_spin.setSuffix(" °")
         self.angle_spin.setFixedWidth(92)
         form.addRow("旋转", self.angle_spin)
+
+        # 文本框转写（OCR 项目选中文本框时出现）
+        self.text_edit = LineEdit(self.edit_card)
+        self.text_edit.setPlaceholderText("文本内容")
+        self.text_edit.textEdited.connect(self._on_text_edited)
+        form.addRow("文本", self.text_edit)
+        self._edit_form = form
+        form.setRowVisible(self.text_edit, False)
         edit_layout.addLayout(form)
 
         edit_row = QHBoxLayout()
@@ -496,6 +499,24 @@ class AnnotateTab(QWidget):
     # -----------------------------------------------------------
     # 交互
     # -----------------------------------------------------------
+    def _reload_tools(self, mode: str) -> None:
+        """按标注方式重建工具条：OCR 项目为「浏览 + 文本」，其余为原四件套。"""
+        tools = (
+            [(MODE_BROWSE, "浏览"), (MODE_TEXT, "文本")]
+            if mode == "text"
+            else [
+                (MODE_BROWSE, "浏览"), (MODE_BOX, "矩形"),
+                (MODE_POLYGON, "多边形"), (MODE_MASK, "掩码"),
+            ]
+        )
+        signature = "|".join(key for key, _text in tools)
+        if getattr(self, "_tool_signature", "") == signature:
+            return
+        self.mode_seg.clear()
+        for key, text in tools:
+            self.mode_seg.addItem(key, text, onClick=lambda k=key: self._on_mode(k))
+        self._tool_signature = signature
+
     def _on_mode(self, key: str) -> None:
         self.canvas.set_mode(key)
         is_mask = key == MODE_MASK
@@ -583,6 +604,7 @@ class AnnotateTab(QWidget):
         ):
             widget.setEnabled(valid)
         if not valid:
+            self._edit_form.setRowVisible(self.text_edit, False)
             return
         item = current.items[primary]
         width = max(1, int(current.width or 1))
@@ -596,8 +618,20 @@ class AnnotateTab(QWidget):
             self.geo_spins["h"].setValue(max(0.0, (y2 - y1) * height))
             position = self.item_class_combo.findData(item.cls_id)
             self.item_class_combo.setCurrentIndex(max(0, position))
+            # 转写：仅文本框（OCR）显示该行
+            self.text_edit.setText(str(item.text or ""))
+            self.text_edit.setEnabled(item.is_text)
+            self._edit_form.setRowVisible(self.text_edit, item.is_text)
         finally:
             self._syncing = False
+
+    def _on_text_edited(self, text: str) -> None:
+        """录入 / 修改文本框转写。"""
+        if self._syncing or self._canvas_selected < 0:
+            return
+        if self._vm.set_text(self._canvas_selected, text):
+            self.status_message("已更新文本")
+            self._rebuild_item_list(self._vm.current)
 
     def _on_apply_geometry(self) -> None:
         """按数值框设置位置与尺寸（像素）。"""
@@ -640,7 +674,9 @@ class AnnotateTab(QWidget):
         mode = self._vm.annotation_mode()
         target = {
             "box": MODE_BOX, "obb": MODE_BOX, "polygon": MODE_POLYGON,
+            "text": MODE_TEXT,
         }.get(mode, MODE_BROWSE)
+        self._reload_tools(mode)
         self.mode_seg.setCurrentItem(target)
         self._on_mode(target)
 
@@ -859,11 +895,13 @@ class AnnotateTab(QWidget):
         self.item_list.clear()
         if annotation is not None:
             for index, item in enumerate(annotation.items):
-                kind = {"box": "矩形", "polygon": "多边形", "mask": "掩码"}.get(
-                    item.kind, item.kind
-                )
+                kind = {"box": "矩形", "polygon": "多边形", "mask": "掩码",
+                        "text": "文本"}.get(item.kind, item.kind)
                 name = names.get(item.cls_id, item.cls_id)
-                self.item_list.addItem(f"{index + 1}. {name} · {kind}")
+                label = f"{index + 1}. {name} · {kind}"
+                if item.is_text:
+                    label += f"：{item.text or '（空）'}"
+                self.item_list.addItem(label)
         self.item_list.blockSignals(False)
         self._sync_property_fields()
 

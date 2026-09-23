@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+from src.utils.tasks import project_types, task_spec
+
 # ---------------------------------------------------------------
 # 应用信息
 # ---------------------------------------------------------------
@@ -21,8 +23,8 @@ RUNS_DIR = PROJECT_ROOT / "runs"
 # ---------------------------------------------------------------
 # 自定义文件头魔数（确保通用解压/识别工具无法直接打开）
 PROJECT_MAGIC = b"DMJPRJ"
-# 容器格式版本号
-PROJECT_VERSION = 1
+# 容器格式版本号（v2：项目新增 backend 字段；v1 项目仍可打开，见 project_format）
+PROJECT_VERSION = 2
 # 支持的扩展名
 PROJECT_EXTS = {".mprj"}
 # 文件对话框过滤器
@@ -62,100 +64,19 @@ YOLO_MODEL_VARIANTS = [
     {"key": "yolo26x", "label": "YOLO26x", "desc": "新一代最高精度", "imgsz": 640},
 ]
 
-# 任务类型
-TASK_TYPES = [
-    {"key": "detect", "label": "目标检测 (Detect)"},
-    {"key": "segment", "label": "实例分割 (Segment)"},
-    {"key": "classify", "label": "图像分类 (Classify)"},
-    {"key": "anomaly", "label": "异常检测 (Anomaly)"},
-]
-
 # 任务类型 → YOLO 权重名后缀（拼出 yolo11n / yolo11n-seg / yolo11n-cls / yolo11n-obb）
+# 任务清单与后缀声明在任务注册表（src/utils/tasks.py），此处派生供旧调用点使用
 TASK_MODEL_SUFFIX = {
-    "detect": "",
-    "segment": "-seg",
-    "classify": "-cls",
-    "obb": "-obb",
+    spec["key"]: spec["model_suffix"]
+    for spec in project_types() if spec["model_suffix"]
 }
 
 # ---------------------------------------------------------------
-# 项目类型（深度学习任务）——参照 Halcon DLT 的「深度学习方法」
-# 每个类型决定：标注方式、模型后缀、数据图表与训练任务
-#     annotation: none / box / obb / polygon
-#     supported : 当前后端（Ultralytics）是否可直接训练
+# 项目类型（深度学习任务）——定义在任务注册表 src/utils/tasks.py
+# 每个类型的能力（标注方式 / 模型后缀 / 支持状态 / 数据布局 / 指标 /
+# 可用后端 / 所需导航页）由 tasks.TaskSpec 声明，此处派生旧结构供界面读取
 # ---------------------------------------------------------------
-PROJECT_TYPES = [
-    {
-        "key": "classify",
-        "label": "分类",
-        "short": "整图归类",
-        "detail": "整张图像归入一个类别",
-        "annotation": "none",
-        "model_suffix": "-cls",
-        "supported": True,
-        "note": "无需框选，类别由目录决定",
-    },
-    {
-        "key": "anomaly",
-        "label": "异常检测",
-        "short": "仅用正常样本",
-        "detail": "只用正常样本训练",
-        "annotation": "none",
-        "model_suffix": "",
-        "supported": True,
-        "note": "建议 2GB 以上显存",
-    },
-    {
-        "key": "detect",
-        "label": "对象检测",
-        "short": "轴对齐矩形",
-        "detail": "水平矩形框标出缺陷",
-        "annotation": "box",
-        "model_suffix": "",
-        "supported": True,
-        "note": "标注成本低",
-    },
-    {
-        "key": "obb",
-        "label": "对象检测·旋转框",
-        "short": "带角度矩形",
-        "detail": "带旋转角度的矩形框",
-        "annotation": "obb",
-        "model_suffix": "-obb",
-        "supported": True,
-        "note": "拖出矩形后用「角度」微调",
-    },
-    {
-        "key": "segment",
-        "label": "实例分割",
-        "short": "多边形轮廓",
-        "detail": "多边形勾出缺陷轮廓",
-        "annotation": "polygon",
-        "model_suffix": "-seg",
-        "supported": True,
-        "note": "标注成本较高",
-    },
-    {
-        "key": "semantic",
-        "label": "语义分割",
-        "short": "逐像素分类",
-        "detail": "逐像素分类",
-        "annotation": "polygon",
-        "model_suffix": "",
-        "supported": False,
-        "note": "规划中，当前后端不支持",
-    },
-    {
-        "key": "ocr",
-        "label": "Deep OCR",
-        "short": "字符识别",
-        "detail": "识别图中字符",
-        "annotation": "none",
-        "model_suffix": "",
-        "supported": False,
-        "note": "规划中，当前后端不支持",
-    },
-]
+PROJECT_TYPES = project_types()
 
 # 项目类型 → 标注模式（供标注页限定可用工具）
 PROJECT_ANNOTATION = {
@@ -165,10 +86,7 @@ PROJECT_ANNOTATION = {
 
 def project_type(key: str) -> dict:
     """按 key 取项目类型定义（找不到时回退为对象检测）。"""
-    for item in PROJECT_TYPES:
-        if item["key"] == key:
-            return item
-    return PROJECT_TYPES[2]
+    return task_spec(key).to_dict()
 
 # 异常检测（Anomalib）数据目录约定
 ANOMALY_NORMAL_DIR = "normal"

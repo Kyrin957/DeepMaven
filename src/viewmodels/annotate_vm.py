@@ -347,6 +347,20 @@ class AnnotateViewModel(QObject):
         self.push_undo("修改标注", before, key=f"geom:{self._index}:{index}")
         return True
 
+    def set_text(self, index: int, text: str) -> bool:
+        """设置某标注项的转写文本（OCR 文本框；空串表示清除）。"""
+        if self._current is None or not (0 <= index < len(self._current.items)):
+            return False
+        item = self._current.items[index]
+        if str(item.text or "") == str(text or ""):
+            return False
+        before = self.snapshot_items()
+        item.text = str(text or "")
+        self._dirty = True
+        self.annotationLoaded.emit(self._current)
+        self.push_undo("修改文本", before, key=f"text:{self._index}:{index}")
+        return True
+
     def step_image(self, step: int) -> None:
         """翻图：±N 张；|step| 很大时跳到首 / 末张（PageUp / PageDown 用）。"""
         if not self._images:

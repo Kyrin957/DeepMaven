@@ -18,7 +18,7 @@
 | 组件 | 选型 |
 |------|------|
 | GUI 框架 | PySide6 6.11 + PySide6-Fluent-Widgets 1.11（Fluent Design，支持亮暗主题） |
-| 深度学习 | PyTorch + Ultralytics（YOLO11 / YOLO26，支持检测/分割/分类任务） |
+| 深度学习 | PyTorch + Ultralytics（YOLO11 / YOLO26：检测 / 旋转框 / 实例分割 / 分类）、Anomalib（异常检测）、自研轻量 U-Net（语义分割） |
 | 图像处理 | OpenCV |
 | 项目存储 | 自研单文件 `.mprj` 容器（加密清单 + ZIP 载荷 + 完整性校验） |
 | 可视化 | Matplotlib |
@@ -63,7 +63,8 @@ DeepMaven/
     ├── viewmodels/          # 业务逻辑：6 个 ViewModel（project / dataset / model / train / evaluate / export）
     ├── views/               # 界面：main_window + base_page + 6 个导航页
     ├── services/            # 服务：project_format / project_service / dataset_service / yolo_service / export_service
-    └── utils/               # 工具：constants / config / logger
+    │   └── backends/        # 后端适配层：base / yolo / anomalib（按任务查表取后端）
+    └── utils/               # 工具：constants / tasks（任务注册表）/ config / logger
 ```
 
 ## 项目文件格式（`.mprj`）

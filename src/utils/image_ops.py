@@ -273,6 +273,60 @@ def colorize_heat(heat, width: int, height: int):
                         cv2.COLOR_BGR2RGB)
 
 
+# 语义分割掩码叠加的默认配色（按类别 id - 1 取色）
+_MASK_PALETTE = ["#0F6CBD", "#0F7B0F", "#C42B1C", "#B16CEA", "#E8A33D", "#4A5459"]
+
+
+def mask_color(color: str) -> tuple[int, int, int]:
+    """把 "#RRGGBB" 转成 RGB 三元组（解析失败时回退品牌蓝）。"""
+    text = str(color or "").lstrip("#")
+    if len(text) != 6:
+        return (15, 108, 189)
+    try:
+        return tuple(int(text[index:index + 2], 16) for index in (0, 2, 4))
+    except ValueError:
+        return (15, 108, 189)
+
+
+def overlay_mask(image_path, mask, target, alpha: float = 0.45, palette=None) -> str:
+    """把类别掩码叠加到原图上（语义分割的预测对比图）。
+
+    Args:
+        mask: 2D 数组（0 = 背景，其余为类别 id）
+        palette: 类别颜色（"#RRGGBB" 列表），按「id - 1」取色
+        alpha: 掩码不透明度（0~1）
+    """
+    try:
+        import numpy as np
+        from PIL import Image as PILImage
+    except ImportError as exc:
+        logger.warning("生成掩码叠加图需要 Pillow / numpy：%s", exc)
+        return ""
+
+    colors = list(palette or _MASK_PALETTE)
+    try:
+        with PILImage.open(image_path) as handle:
+            base = handle.convert("RGB")
+        values = np.asarray(mask).astype("int32")
+        if values.ndim != 2 or values.size == 0:
+            return ""
+        height, width = values.shape
+        canvas = np.asarray(
+            base.resize((width, height), PILImage.Resampling.BILINEAR), dtype="float32"
+        )
+        overlay = canvas.copy()
+        for index, color in enumerate(colors):
+            region = values == (index + 1)
+            if not region.any():
+                continue
+            overlay[region] = np.asarray(mask_color(color), dtype="float32")
+        blended = (canvas * (1 - alpha) + overlay * alpha).astype("uint8")
+    except Exception as exc:  # noqa: BLE001 - 图片异常不应中断评估
+        logger.warning("生成掩码叠加图失败 %s: %s", image_path, exc)
+        return ""
+    return save_rgb(blended, target)
+
+
 def overlay_heatmap(image_path, heat, target, alpha: float = 0.55) -> str:
     """把异常热力图叠加到原图上（评估页「热图」视图）。
 

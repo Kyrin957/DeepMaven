@@ -2,6 +2,7 @@
 
 from .annotation_canvas import (
     MODE_BOX,
+    MODE_TEXT,
     MODE_BROWSE,
     MODE_MASK,
     MODE_POLYGON,
@@ -42,6 +43,7 @@ __all__ = [
     "ThumbnailGrid",
     "MODE_BROWSE",
     "MODE_BOX",
+    "MODE_TEXT",
     "MODE_MASK",
     "MODE_POLYGON",
 ]

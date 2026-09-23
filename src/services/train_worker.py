@@ -21,48 +21,10 @@ import time
 import traceback
 from pathlib import Path
 
+from src.services.worker_utils import emit, use_utf8_stdio, wait_if_paused
+
 # 批次级进度事件的限流间隔（秒）
 _ITERATION_INTERVAL = 0.5
-
-
-def emit(event: dict) -> None:
-    """向父进程输出一行 JSON 事件。"""
-    sys.stdout.write(json.dumps(event, ensure_ascii=False) + "\n")
-    sys.stdout.flush()
-
-
-def use_utf8_stdio() -> None:
-    """把标准输出 / 错误切到 UTF-8（Windows 中文控制台默认 GBK 会中断输出）。"""
-    for stream in (sys.stdout, sys.stderr):
-        reconfigure = getattr(stream, "reconfigure", None)
-        if not callable(reconfigure):
-            continue
-        try:
-            reconfigure(encoding="utf-8", errors="replace")
-        except (ValueError, OSError):
-            continue
-
-
-def wait_if_paused(pause_file: str, poll: float = 0.5) -> bool:
-    """若「暂停标记文件」存在则阻塞等待（在轮边界调用）。
-
-    父进程通过创建 / 删除该文件来请求暂停与继续；子进程被终止时等待也随之结束。
-
-    Returns:
-        是否真的暂停过（供上报状态用）。
-    """
-    if not pause_file:
-        return False
-    from pathlib import Path
-
-    marker = Path(pause_file)
-    if not marker.exists():
-        return False
-    emit({"type": "status", "status": "paused", "text": "已暂停（等待继续）"})
-    while marker.exists():
-        time.sleep(max(0.05, float(poll)))
-    emit({"type": "status", "status": "running", "text": "已继续训练"})
-    return True
 
 
 def build_parser() -> argparse.ArgumentParser:

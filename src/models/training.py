@@ -305,6 +305,8 @@ class ExportConfig:
     for_inference: bool = True         # 针对推断优化：固定尺寸 + 图精简
     for_api: bool = False              # 针对 API 优化：动态尺寸，便于服务端变尺寸输入
     half: bool = False                 # 半精度（FP16）导出：体积更小，需 GPU
+    # 异常检测（Anomalib）模型名：导出模型包时需要（Padim / Patchcore ...）
+    anomaly_model: str = ""
     # 历次导出记录（时间 / 格式 / 路径 / 大小）
     history: list[dict] = field(default_factory=list)
 
@@ -325,6 +327,7 @@ class ExportConfig:
             "for_inference": self.for_inference,
             "for_api": self.for_api,
             "half": self.half,
+            "anomaly_model": self.anomaly_model,
             "history": self.history,
         }
 
@@ -341,5 +344,6 @@ class ExportConfig:
             for_inference=data.get("for_inference", True),
             for_api=data.get("for_api", False),
             half=data.get("half", False),
+            anomaly_model=data.get("anomaly_model", ""),
             history=list(data.get("history", []) or []),
         )

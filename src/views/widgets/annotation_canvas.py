@@ -31,13 +31,14 @@ from PySide6.QtWidgets import (
     QGraphicsView,
 )
 
-from src.models.annotation import BOX, POLYGON, Annotation
+from src.models.annotation import BOX, POLYGON, TEXT, Annotation
 from src.utils.geometry import area, merge_holes, rotate, translate
 
 MODE_BROWSE = "browse"
 MODE_BOX = "box"
 MODE_POLYGON = "polygon"
 MODE_MASK = "mask"
+MODE_TEXT = "text"      # OCR：拖出文本框，转写在对象列表 / 编辑区录入
 
 _MIN_SIZE = 3.0        # 小于该像素尺寸的框视为误触
 _FALLBACK_COLOR = "#66CCFF"
@@ -696,7 +697,7 @@ class AnnotationCanvas(QGraphicsView):
             self._paint_mask(scene_pos)
             return
 
-        if self._mode == MODE_BOX:
+        if self._mode in (MODE_BOX, MODE_TEXT):
             self._drawing = True
             self._start = scene_pos
             self._rubber = QGraphicsRectItem(QRectF(scene_pos, scene_pos))
@@ -804,7 +805,8 @@ class AnnotationCanvas(QGraphicsView):
             self._drawing = False
             if rect.width() >= _MIN_SIZE and rect.height() >= _MIN_SIZE:
                 points = self._to_normalized([rect.topLeft(), rect.bottomRight()])
-                self.annotationAdded.emit(self._pending_class, BOX, points)
+                kind = TEXT if self._mode == MODE_TEXT else BOX
+                self.annotationAdded.emit(self._pending_class, kind, points)
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         if self._mode == MODE_POLYGON:

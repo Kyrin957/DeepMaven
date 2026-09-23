@@ -205,18 +205,42 @@ class ProjectViewModel(QObject):
         self.projectChanged.emit(None)
         self.message.emit("info", "项目已关闭")
 
+    def project_artifacts(self, path: str) -> dict:
+        """删除前列出会一并清理的内容（供确认对话框）。
+
+        未打开的项目会轻量读取清单，以便把旧版放在项目文件同级的
+        拆分产物目录也列出来。
+        """
+        project = self._service.project if self.current_path == path else None
+        if project is None:
+            try:
+                project, _cover = self._service.peek_project(path)
+            except (ProjectFormatError, OSError, ValueError) as exc:
+                logger.warning("读取项目清单失败（仅影响删除清单）：%s", exc)
+                project = None
+        return self._service.artifacts(path, project)
+
     def delete_project(self, path: str) -> None:
-        """删除项目文件（.mprj）并从最近列表移除。"""
+        """删除项目文件、项目文件夹（拆分 / 训练 / 导出产物）与备份。"""
+        was_current = self.current_path == path
+        project = self._service.project if was_current else None
         try:
-            self._service.delete_project(path)
+            result = self._service.delete_project(path, project)
         except OSError as exc:
             self.message.emit("error", f"删除项目失败：{exc}")
             return
+
         remaining = [p for p in self.recent_projects() if p.get("path") != path]
         self._config.set("recent_projects", _json(remaining))
-        was_current = self.current_path == path
         self.recentUpdated.emit(self.recent_projects())
-        self.message.emit("success", "项目文件已删除")
+
+        failed = list(result.get("failed") or [])
+        removed = list(result.get("removed") or [])
+        if failed:
+            self.message.emit("warning", f"部分内容未能删除：{failed[0][0]}")
+        else:
+            self.message.emit("success", f"项目已删除（{len(removed)} 项）")
+
         if was_current:
             self._service.close()
             self.projectChanged.emit(None)

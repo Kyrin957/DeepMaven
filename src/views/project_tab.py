@@ -44,7 +44,7 @@ from src.utils.constants import (
     project_type,
 )
 from src.viewmodels.project_vm import ProjectViewModel
-from src.views.dialogs import NewProjectDialog
+from src.views.dialogs import DeleteProjectDialog, NewProjectDialog
 
 _COVER_W, _COVER_H = 184, 116
 _COLUMNS = 4
@@ -382,7 +382,7 @@ class ProjectTab(QWidget):
         menu.addAction(Action("打开项目所在文件夹", triggered=lambda: self._open_folder(path)))
         menu.addSeparator()
         menu.addAction(Action("从最近项目记录中移除", triggered=lambda: self._on_remove_recent(path)))
-        menu.addAction(Action("删除项目文件", triggered=lambda: self._on_delete_project(path)))
+        menu.addAction(Action("删除项目", triggered=lambda: self._on_delete_project(path)))
         menu.exec(position)
 
     def _open_folder(self, path: str) -> None:
@@ -397,16 +397,11 @@ class ProjectTab(QWidget):
         self._reload_recent()
 
     def _on_delete_project(self, path: str) -> None:
+        """删除项目：列出项目文件、项目文件夹与其中的训练产物后一次清理。"""
         name = Path(path).stem
-        box = MessageBox(
-            "删除项目文件",
-            f"确定要删除项目「{name}」的文件吗？\n{path}\n\n"
-            "不可撤销；数据集与模型文件不会被删除。",
-            self,
-        )
-        box.yesButton.setText("删除")
-        box.cancelButton.setText("取消")
-        if not box.exec():
+        info = self._vm.project_artifacts(path)
+        dialog = DeleteProjectDialog(name, info, self.window())
+        if not dialog.exec():
             return
         self._vm.delete_project(path)
         self._reload_recent()

@@ -29,8 +29,9 @@ class ShortcutManager(QObject):
 
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
-        self._items: list[tuple[str, str, str]] = []
-        self._shortcuts: list[QShortcut] = []
+        # (分组, 功能, 快捷键, 标签)：标签用于整组撤销（如页面切换键位重建）
+        self._items: list[tuple[str, str, str, str]] = []
+        self._shortcuts: list[tuple[str, QShortcut]] = []
 
     # -----------------------------------------------------------
     # 注册
@@ -43,11 +44,13 @@ class ShortcutManager(QObject):
         name: str,
         group: str = "通用",
         global_scope: bool = False,
+        tag: str = "",
     ) -> QShortcut:
         """在 `widget` 上注册快捷键并登记到总览。
 
         Args:
             global_scope: True 时在整个窗口生效（如页面切换、撤销），否则仅焦点在该控件内生效。
+            tag: 分组标签，可按标签整组撤销（见 `remove_tag`）。
         """
         shortcut = QShortcut(QKeySequence(sequence), widget)
         shortcut.setContext(
@@ -55,17 +58,29 @@ class ShortcutManager(QObject):
             else Qt.ShortcutContext.WidgetWithChildrenShortcut
         )
         shortcut.activated.connect(callback)
-        self._shortcuts.append(shortcut)
-        self._record(group, name, sequence)
+        self._shortcuts.append((str(tag), shortcut))
+        self._record(group, name, sequence, tag)
         return shortcut
 
-    def record(self, group: str, name: str, sequence: str) -> None:
+    def remove_tag(self, tag: str) -> None:
+        """撤销该标签下的全部快捷键（含总览登记），用于键位动态重建。"""
+        self._items = [row for row in self._items if row[3] != tag]
+        keep: list[tuple[str, QShortcut]] = []
+        for item_tag, shortcut in self._shortcuts:
+            if item_tag == tag:
+                shortcut.setEnabled(False)
+                shortcut.deleteLater()
+                continue
+            keep.append((item_tag, shortcut))
+        self._shortcuts = keep
+
+    def record(self, group: str, name: str, sequence: str, tag: str = "") -> None:
         """只登记到总览（快捷键本身由菜单 QAction 等提供）。"""
         pretty = QKeySequence(sequence).toString(QKeySequence.SequenceFormat.NativeText)
-        self._items.append((group, name, pretty or sequence))
+        self._items.append((group, name, pretty or sequence, str(tag)))
 
-    def _record(self, group: str, name: str, sequence: str) -> None:
-        self.record(group, name, sequence)
+    def _record(self, group: str, name: str, sequence: str, tag: str = "") -> None:
+        self.record(group, name, sequence, tag)
 
     # -----------------------------------------------------------
     # 总览
@@ -73,10 +88,11 @@ class ShortcutManager(QObject):
     def items(self) -> list[tuple[str, str, str]]:
         """[(分组, 功能, 快捷键)]，按分组顺序排列。"""
         order = {name: index for index, name in enumerate(GROUP_ORDER)}
-        return sorted(
+        rows = sorted(
             self._items,
             key=lambda row: (order.get(row[0], len(order)), row[2], row[1]),
         )
+        return [(group, name, sequence) for group, name, sequence, _tag in rows]
 
     def count(self) -> int:
         return len(self._items)

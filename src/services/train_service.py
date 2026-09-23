@@ -12,8 +12,9 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
 
 from src.models.training import TrainingConfig
+from src.services.backends import resolve as resolve_backend
+from src.services.backends.base import pause_file as _pause_file
 from src.utils.constants import PROJECT_ROOT
-from src.utils.device import normalize_device
 from src.utils.logger import get_logger
 
 logger = get_logger("train")
@@ -53,15 +54,10 @@ class TrainService(QObject):
         if self.is_running():
             self.failed.emit("训练已在运行中")
             return False
-        if config.task_type == "anomaly":
-            if not config.anomaly_root or not Path(config.anomaly_root).is_dir():
-                self.failed.emit(
-                    f"异常检测数据目录不存在：{config.anomaly_root or '（未设置）'}"
-                )
-                return False
-        elif not config.data_yaml or not Path(config.data_yaml).exists():
-            # 检测/分割为 data.yaml 文件；分类任务直接使用数据集目录
-            self.failed.emit(f"数据集配置不存在：{config.data_yaml or '（未设置）'}")
+        # 启动前校验由任务对应的后端提供（检测 / 分类看 data.yaml，异常看数据目录）
+        problem = resolve_backend(config).validate(config)
+        if problem is not None:
+            self.failed.emit(problem.message)
             return False
 
         cwd = Path(project_root or PROJECT_ROOT)
@@ -104,8 +100,7 @@ class TrainService(QObject):
     @staticmethod
     def pause_file(config: TrainingConfig) -> Path:
         """暂停标记文件：父进程与训练子进程约定的控制文件。"""
-        root = Path(config.project_dir or (PROJECT_ROOT / "runs"))
-        return root / "train.pause"
+        return _pause_file(config)
 
     def pause(self) -> bool:
         """请求暂停训练（在当前轮结束后生效）。"""
@@ -141,75 +136,8 @@ class TrainService(QObject):
 
     @staticmethod
     def build_args(config: TrainingConfig) -> list[str]:
-        """构造子进程命令行参数（异常检测走独立的 Anomalib 子进程）。"""
-        if config.task_type == "anomaly":
-            return TrainService._anomaly_args(config)
-        return TrainService._yolo_args(config)
-
-    @staticmethod
-    def _anomaly_args(config: TrainingConfig) -> list[str]:
-        """异常检测（Anomalib）参数。"""
-        args = [
-            "-m", "src.services.anomaly_worker",
-            "--root", config.anomaly_root,
-            "--model", config.model_key or "Padim",
-            "--epochs", str(config.epochs),
-            "--batch", str(config.batch),
-            "--normal-dir", config.anomaly_normal_dir,
-            "--abnormal-dir", config.anomaly_abnormal_dir,
-            "--output", config.project_dir or str(PROJECT_ROOT / "runs" / "anomaly"),
-            "--seed", str(config.seed),
-            "--device", normalize_device(config.device),
-        ]
-        if not config.anomaly_pretrained:
-            args.append("--no-pretrained")
-        return args
-
-    @staticmethod
-    def _yolo_args(config: TrainingConfig) -> list[str]:
-        """YOLO 训练参数（覆盖训练页「设置」里的全部参数）。"""
-        args = [
-            "-m", "src.services.train_worker",
-            "--data", config.data_yaml,
-            "--weights", config.weights_path or f"{config.model_key}.pt",
-            "--epochs", str(config.epochs),
-            "--batch", str(config.batch),
-            "--imgsz", str(config.imgsz),
-            "--lr", str(config.lr),
-            "--optimizer", config.optimizer,
-            "--weight-decay", str(config.weight_decay),
-            "--momentum", str(config.momentum),
-            "--warmup-epochs", str(config.warmup_epochs),
-            "--patience", str(config.patience),
-            "--cos-lr" if config.cos_lr else "--no-cos-lr",
-            "--deterministic" if config.deterministic else "--no-deterministic",
-            "--close-mosaic", str(config.close_mosaic),
-            "--val" if config.val else "--no-val",
-            "--cache" if config.cache else "--no-cache",
-            "--single-cls" if config.single_cls else "--no-single-cls",
-            "--rect" if config.rect else "--no-rect",
-            "--dropout", str(config.dropout),
-            "--device", normalize_device(config.device),
-            "--workers", str(config.workers),
-            "--seed", str(config.seed),
-            "--project", config.project_dir or str(PROJECT_ROOT / "runs"),
-            "--name", config.model_key,
-            "--augment" if config.augment else "--no-augment",
-            "--hflip", str(config.hflip),
-            "--vflip", str(config.vflip),
-            "--degrees", str(config.degrees),
-            "--scale", str(config.scale),
-            "--translate", str(config.translate),
-            "--hsv-h", str(config.hsv_h),
-            "--hsv-s", str(config.hsv_s),
-            "--hsv-v", str(config.hsv_v),
-            "--mosaic", str(config.mosaic),
-            "--mixup", str(config.mixup),
-            "--pause-file", str(TrainService.pause_file(config)),
-        ]
-        if config.resume:
-            args.append("--resume")
-        return args
+        """构造子进程命令行参数（由任务对应的后端适配器提供）。"""
+        return resolve_backend(config).build_args(config)
 
     # -----------------------------------------------------------
     # 输出解析

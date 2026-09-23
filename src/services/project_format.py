@@ -17,7 +17,8 @@
     * ZIP 归档条目名混淆为内容哈希 ID（f_<sha256[:16]>.bin），真实
       虚拟路径只存在于加密 manifest 中。
     * 每条文件记录携带 SHA256，装载时逐条校验，防篡改/损坏。
-    * 版本号守卫：不支持的更高版本拒绝打开。
+    * 版本号守卫：不支持的更高版本拒绝打开；v1 项目仍可打开（按 v1 密钥解密，
+      保存时升级为当前版本，读入时补齐 backend 字段）。
 """
 
 from __future__ import annotations
@@ -43,21 +44,24 @@ _KEY_SALT = b"DeepMaven/.mprj/container"
 
 FLAG_MANIFEST_ENCRYPTED = 0x0001
 
+# 可打开的容器版本（v1 项目仍可读；保存时统一写为 PROJECT_VERSION）
+SUPPORTED_VERSIONS = (1, PROJECT_VERSION)
+
 
 # ---------------------------------------------------------------
 # 加密 / 哈希
 # ---------------------------------------------------------------
-def _derive_key() -> bytes:
+def _derive_key(version: int = PROJECT_VERSION) -> bytes:
     """由固定盐 + 魔数 + 版本派生加密密钥（确定性）。"""
-    return hashlib.sha256(_KEY_SALT + PROJECT_MAGIC + struct.pack(">H", PROJECT_VERSION)).digest()
+    return hashlib.sha256(_KEY_SALT + PROJECT_MAGIC + struct.pack(">H", version)).digest()
 
 
-def _xor_cipher(data: bytes) -> bytes:
+def _xor_cipher(data: bytes, version: int = PROJECT_VERSION) -> bytes:
     """XOR 流式加密/解密（对称、确定性）。
 
     用密钥迭代 sha256 展开足够长的密钥流，与明文异或。
     """
-    key = _derive_key()
+    key = _derive_key(version)
     keystream = bytearray()
     counter = 0
     while len(keystream) < len(data):
@@ -67,12 +71,12 @@ def _xor_cipher(data: bytes) -> bytes:
     return bytes(a ^ b for a, b in zip(data, ks))
 
 
-def encrypt_manifest(payload: bytes) -> bytes:
-    return _xor_cipher(payload)
+def encrypt_manifest(payload: bytes, version: int = PROJECT_VERSION) -> bytes:
+    return _xor_cipher(payload, version)
 
 
-def decrypt_manifest(payload: bytes) -> bytes:
-    return _xor_cipher(payload)
+def decrypt_manifest(payload: bytes, version: int = PROJECT_VERSION) -> bytes:
+    return _xor_cipher(payload, version)
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -120,9 +124,10 @@ class ProjectContainer:
         magic, version, flags, _reserved, manifest_len = _HEADER.unpack_from(data, 0)
         if magic != PROJECT_MAGIC:
             raise ProjectFormatError("文件头无效：非 DeepMaven 项目文件 (.mprj)")
-        if version != PROJECT_VERSION:
+        if version not in SUPPORTED_VERSIONS:
+            supported = " / ".join(f"v{item}" for item in SUPPORTED_VERSIONS)
             raise ProjectFormatError(
-                f"不支持的项目格式版本 v{version}（当前支持 v{PROJECT_VERSION}）"
+                f"不支持的项目格式版本 v{version}（当前支持 {supported}）"
             )
 
         manifest_off = _HEADER_SIZE
@@ -132,7 +137,8 @@ class ProjectContainer:
 
         manifest_cipher = data[manifest_off:manifest_end]
         if flags & FLAG_MANIFEST_ENCRYPTED:
-            manifest_cipher = decrypt_manifest(manifest_cipher)
+            # 密钥由版本派生：旧版本文件必须按写入时的版本解密
+            manifest_cipher = decrypt_manifest(manifest_cipher, version)
         try:
             raw_dict = json.loads(manifest_cipher.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:

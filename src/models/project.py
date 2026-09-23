@@ -24,6 +24,7 @@ from src.models.training import (
     TrainingConfig,
 )
 from src.utils.constants import APP_VERSION
+from src.utils.tasks import default_backend_for
 
 
 def _now_iso() -> str:
@@ -36,7 +37,8 @@ class Project:
 
     Attributes:
         name: 项目名称。
-        model_type: 模型类型（detect / segment / classify）。
+        model_type: 项目类型 / 任务（detect / segment / classify / anomaly / ...）。
+        backend: 训练后端 key（yolo / anomalib / ...），决定训练与产物识别实现。
         description: 项目描述。
         created_at: 创建时间（ISO 字符串）。
         updated_at: 最近修改时间。
@@ -54,6 +56,8 @@ class Project:
 
     name: str = "未命名项目"
     model_type: str = "detect"
+    # 训练后端 key（声明在 src/services/backends）：空表示按项目类型推导
+    backend: str = ""
     description: str = ""
     created_at: str = field(default_factory=_now_iso)
     updated_at: str = field(default_factory=_now_iso)
@@ -74,6 +78,11 @@ class Project:
 
     # 内存态：是否有未保存的变更（不参与序列化）
     _dirty: bool = field(default=False, compare=False, repr=False)
+
+    def __post_init__(self) -> None:
+        """旧项目（没有 backend 字段）按项目类型补齐后端 key。"""
+        if not self.backend:
+            self.backend = default_backend_for(self.model_type)
 
     # -----------------------------------------------------------
     # 便捷属性
@@ -181,6 +190,7 @@ class Project:
         return {
             "name": self.name,
             "model_type": self.model_type,
+            "backend": self.backend,
             "description": self.description,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -203,6 +213,7 @@ class Project:
         project = cls(
             name=data.get("name", "未命名项目"),
             model_type=data.get("model_type", "detect"),
+            backend=data.get("backend", ""),
             description=data.get("description", ""),
             created_at=data.get("created_at", _now_iso()),
             updated_at=data.get("updated_at", _now_iso()),

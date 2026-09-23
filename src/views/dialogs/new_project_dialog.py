@@ -34,6 +34,7 @@ from qfluentwidgets import (
 )
 
 from src.utils.constants import PROJECT_FILE_FILTER, PROJECT_TYPES, project_type
+from src.utils.tasks import backend_candidates
 
 _COLUMNS = 3
 _UNSUPPORTED_COLOR = "#6A6A6A"
@@ -239,7 +240,7 @@ class NewProjectDialog(MessageBoxBase):
         if selectable:
             self.detail_note.setText(
                 f"标注方式：{_annotation_text(item['annotation'])}\n"
-                f"训练模型：YOLO11{item['model_suffix'] or ''}\n\n"
+                f"训练模型：{_model_text(item)}\n\n"
                 f"{item['note']}"
             )
         else:
@@ -345,4 +346,20 @@ def _annotation_text(mode: str) -> str:
         "box": "轴对齐矩形框",
         "obb": "矩形框 + 角度微调",
         "polygon": "多边形轮廓",
+        "text": "文本框 + 转写",
     }.get(mode, mode)
+
+
+# 训练模型显示名（按任务声明的后端，见 src/utils/tasks.py）
+_BACKEND_MODELS = {"yolo": "YOLO11", "anomalib": "Anomalib", "ocr": "PaddleOCR"}
+
+
+def _model_text(item: dict) -> str:
+    """详情面板的「训练模型」文案：不再一律写 YOLO。"""
+    candidates = backend_candidates(item["key"])
+    name = _BACKEND_MODELS.get(candidates[0] if candidates else "", "")
+    if not name:
+        return "—"
+    if name == "YOLO11":
+        name += item.get("model_suffix") or ""
+    return name

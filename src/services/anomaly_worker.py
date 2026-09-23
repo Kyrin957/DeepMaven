@@ -13,26 +13,7 @@ import traceback
 from pathlib import Path
 
 
-def emit(event: dict) -> None:
-    """向父进程输出一行 JSON 事件。"""
-    sys.stdout.write(json.dumps(event, ensure_ascii=False) + "\n")
-    sys.stdout.flush()
-
-
-def use_utf8_stdio() -> None:
-    """把标准输出 / 错误切到 UTF-8。
-
-    Windows 中文控制台默认 GBK，Anomalib / Lightning 会经 rich 输出带 • 等
-    字符的进度条，GBK 编不出来会直接抛 UnicodeEncodeError 中断训练。
-    """
-    for stream in (sys.stdout, sys.stderr):
-        reconfigure = getattr(stream, "reconfigure", None)
-        if not callable(reconfigure):
-            continue
-        try:
-            reconfigure(encoding="utf-8", errors="replace")
-        except (ValueError, OSError):
-            continue
+from src.services.worker_utils import emit, use_utf8_stdio
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -8,8 +8,11 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Signal
 
 from src.models.training import ExportConfig
+from src.services import backends
+from src.services.dataset_service import DatasetService
 from src.services.evaluation_service import FP_REASON_LABELS
-from src.services.export_service import ExportService
+from src.services.project_service import ProjectService
+from src.services.regression_service import RegressionService
 from src.services.report_service import ModelReport
 from src.utils.constants import (
     EXPORT_FORMATS,
@@ -20,6 +23,7 @@ from src.utils.constants import (
 )
 from src.utils.device import device_label
 from src.utils.logger import get_logger
+from src.utils.tasks import task_of
 from src.utils.workers import FunctionWorker
 from src.viewmodels.project_vm import ProjectViewModel
 
@@ -30,6 +34,11 @@ _HISTORY_LIMIT = 20
 
 
 def _format_label(key: str) -> str:
+    """导出格式显示名（含各后端自有的格式，如异常检测的模型包）。"""
+    for adapter in backends.all_backends():
+        for item in adapter.export_options():
+            if item["key"] == key:
+                return str(item["label"])
     item = next((fmt for fmt in EXPORT_FORMATS if fmt["key"] == key), None)
     return str((item or {}).get("label") or key)
 
@@ -56,6 +65,23 @@ def _size_mb(path: str | Path) -> float:
         return Path(path).stat().st_size / (1024 * 1024)
     except OSError:
         return 0.0
+
+
+def _export_message(result, regression: dict) -> str:
+    """导出完成提示：产物名 + 回归结论（+ 降级说明）。"""
+    name = Path(str(getattr(result, "path", ""))).name
+    label = {
+        "pass": "回归通过",
+        "fail": "回归未通过",
+        "skip": "回归跳过",
+    }.get(str(regression.get("status") or ""), "")
+    text = f"导出完成：{name}"
+    if label:
+        text += f" · {label}"
+    note = str(getattr(result, "note", "") or "")
+    if note:
+        text += f" · {note}"
+    return text
 
 
 class ExportViewModel(QObject):
@@ -91,6 +117,13 @@ class ExportViewModel(QObject):
             project.export if project is not None
             else ExportConfig(output_dir="runs/export")
         )
+        if project is not None:
+            # 导出件落在项目文件夹里（旧项目仍是旧默认值时补齐）
+            path = str(project.params.get("path") or "")
+            if path and str(self._config.output_dir or "").strip() in ("", "runs/export"):
+                self._config.output_dir = str(
+                    ProjectService.project_dir(path) / "export"
+                )
         self.configChanged.emit(self._config)
         self.selectionChanged.emit(self.selection())
         self.historyChanged.emit(self.export_history())
@@ -123,6 +156,7 @@ class ExportViewModel(QObject):
 
     def set_weights(self, path: str) -> None:
         self._config.weights_path = path
+        self._sync_backend_fields()
         self._emit()
         self.selectionChanged.emit(self.selection())
 
@@ -171,9 +205,42 @@ class ExportViewModel(QObject):
         if not (0 <= index < len(records)):
             return False
         self._config.weights_path = records[index]["weights"]
+        self._sync_backend_fields()
         self._emit()
         self.selectionChanged.emit(self.selection())
         return True
+
+    # -----------------------------------------------------------
+    # 后端与导出格式
+    # -----------------------------------------------------------
+    def task_key(self) -> str:
+        """当前项目的训练任务（未打开项目时按对象检测）。"""
+        project = self.project
+        return task_of(project.model_type) if project is not None else "detect"
+
+    def backend(self):
+        """当前选中权重对应的后端适配器（.ckpt 走异常检测）。"""
+        return backends.for_weights(str(self._config.weights_path or ""), self.task_key())
+
+    def export_options(self) -> list[dict]:
+        """当前后端可用的导出格式（异常检测只有模型包）。"""
+        return self.backend().export_options()
+
+    def _sync_backend_fields(self) -> None:
+        """按选中的权重补齐后端需要的字段（异常检测的模型包要模型名）。"""
+        weights = str(self._config.weights_path or "")
+        if not weights.lower().endswith(".ckpt"):
+            return
+        project = self.project
+        training = getattr(project, "training", None) if project is not None else None
+        record = next(
+            (item for item in self.records() if item["weights"] == weights), None
+        )
+        model_key = str(
+            (record or {}).get("model") or getattr(training, "model_key", "") or ""
+        )
+        if model_key:
+            self._config.anomaly_model = model_key
 
     def selection(self) -> dict:
         """当前导出对象的信息（供「模型概览」展示）。"""
@@ -389,7 +456,7 @@ class ExportViewModel(QObject):
     # 执行
     # -----------------------------------------------------------
     def export(self) -> None:
-        """在后台线程执行模型导出。"""
+        """在后台线程执行模型导出，导出后自动做一次精度回归。"""
         if self.is_busy():
             self.message.emit("warning", "已有任务在运行")
             return
@@ -402,26 +469,66 @@ class ExportViewModel(QObject):
 
         config = self._config
         config.apply_options()      # 把「优化方向」换算成 dynamic / simplify
+        adapter = self.backend()
+        task = self.task_key()
+        images = self._regression_images()
         self.exportStarted.emit()
 
         def job(progress, _is_cancelled):
             progress(10, f"导出为 {_format_label(config.format)}")
-            return ExportService().export(config)
+            result = adapter.export(
+                config, progress=lambda percent, text: progress(
+                    10 + int(percent * 0.7), text
+                )
+            )
+            progress(85, "导出后回归")
+            regression = RegressionService.verify(
+                result, config.weights_path, task, images, backend=adapter
+            )
+            return {"export": result, "regression": regression}
 
-        def done(path):
-            self._remember_export(str(path))
-            self.exportFinished.emit(str(path))
-            self.message.emit("success", f"导出完成：{Path(str(path)).name}")
+        def done(payload):
+            result = payload.get("export")
+            regression = dict(payload.get("regression") or {})
+            self._remember_export(result, regression)
+            self.exportFinished.emit(str(getattr(result, "path", "")))
+            self.message.emit("success", _export_message(result, regression))
 
         self._start_worker(job, "模型导出", on_done=done)
 
-    def _remember_export(self, path: str) -> None:
-        """记录一次导出（时间 / 格式 / 路径 / 大小）。"""
+    def _regression_images(self, limit: int = 8) -> list[str]:
+        """回归用样本图：拆分验证集优先，其次训练集（分类与检测布局不同）。"""
+        project = self.project
+        if project is None:
+            return []
+        split = project.active_split()
+        if split is None or not split.ready:
+            return []
+        root = Path(split.output_dir)
+        classify = self.task_key() == "classify"
+        candidates = ["val", "train"] if classify else ["images/val", "images/train"]
+        for name in candidates:
+            folder = root / name
+            if not folder.is_dir():
+                continue
+            images = DatasetService.scan_images(folder)[:limit]
+            if images:
+                return [str(item) for item in images]
+        return []
+
+    def _remember_export(self, result, regression: dict) -> None:
+        """记录一次导出（时间 / 格式 / 路径 / 大小 / 回归结论）。"""
+        path = Path(str(getattr(result, "path", "")))
+        files = list(getattr(result, "files", ()) or ())
         self._config.history.append({
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "format": str(self._config.format),
+            "format": str(getattr(result, "format", "") or self._config.format),
             "path": str(path),
-            "size": round(_size_mb(path), 3),
+            "size": round(float(result.size_mb()), 3) if result is not None else 0.0,
+            "files": len(files) or 1,
+            "backend": self.backend().key,
+            "regression": str(regression.get("status") or ""),
+            "regression_detail": str(regression.get("detail") or ""),
             "for_inference": bool(self._config.for_inference),
             "for_api": bool(self._config.for_api),
         })

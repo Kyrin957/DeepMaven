@@ -28,6 +28,18 @@ from src.utils.logger import get_logger
 logger = get_logger("project")
 
 
+def _force_remove(func, path, _exc_info) -> None:
+    """rmtree 回调：只读文件先去掉只读属性再删（Windows 常见）。"""
+    import os
+    import stat as stat_module
+
+    try:
+        os.chmod(path, stat_module.S_IWRITE)
+        func(path)
+    except OSError as exc:  # noqa: BLE001 - 单条失败继续删其余
+        logger.warning("删除 %s 失败：%s", path, exc)
+
+
 class ProjectService:
     """.mprj 项目文件的管理。"""
 
@@ -69,6 +81,8 @@ class ProjectService:
         project.params["path"] = str(path)
         self._container = ProjectContainer.create(project, {})
         self._write(path, self._container.data)
+        # 与 Halcon DLT 一致：项目文件旁边建同名目录存放拆分 / 训练 / 导出产物
+        self.project_dir(path).mkdir(parents=True, exist_ok=True)
         self._config.add_recent_project(str(path), project.name)
         logger.info("新建项目: %s (%s)", project.name, path)
         return project
@@ -97,6 +111,106 @@ class ProjectService:
         self._write(project.params["path"], self._container.data)
         project.mark_saved()
         logger.info("已保存项目: %s", project.params["path"])
+
+    # -----------------------------------------------------------
+    # 项目文件夹（参照 Halcon DLT：与项目文件同级的同名目录）
+    # -----------------------------------------------------------
+    @staticmethod
+    def project_dir(path: str | Path) -> Path:
+        """项目文件夹：`<项目文件所在目录>/<项目文件名（不含扩展名）>/`。
+
+        拆分产物、训练产物、导出件都写在这里，删除项目时一并清理
+        （见 `artifacts()` / `delete_project()`）。
+        """
+        target = Path(path)
+        return target.parent / target.stem
+
+    @staticmethod
+    def _is_inside(path: Path, parent: Path) -> bool:
+        """path 是否位于 parent 之内（用于避免误删项目目录之外的用户数据）。"""
+        try:
+            path.resolve().relative_to(parent.resolve())
+            return True
+        except (ValueError, OSError):
+            return False
+
+    @classmethod
+    def artifacts(cls, path: str | Path, project: Project | None = None) -> dict:
+        """列出删除该项目会一并清理的内容（供确认对话框与删除使用）。
+
+        Returns:
+            {"file": 项目文件, "folder": 项目文件夹, "backup": 备份文件,
+             "models": [训练产物], "extra": [文件夹之外的旧产物目录]}
+        """
+        target = Path(path)
+        folder = cls.project_dir(target)
+        models: list[Path] = []
+        if folder.is_dir():
+            for pattern in ("*.pt", "*.ckpt", "*.torchscript"):
+                models.extend(
+                    item for item in folder.rglob(pattern) if item.is_file()
+                )
+
+        # 旧版项目把拆分 / 增强产物放在项目文件同级目录，这里一并列出；
+        # 只认「项目文件所在目录之内」的路径，避免误删用户放在别处的数据
+        extra: list[Path] = []
+        if project is not None:
+            parent = target.parent
+            for split in getattr(project, "splits", []) or []:
+                raw = str(getattr(split, "output_dir", "") or "")
+                candidate = Path(raw) if raw else None
+                if candidate is None or not candidate.is_dir():
+                    continue
+                if cls._is_inside(candidate, folder):
+                    continue
+                if cls._is_inside(candidate, parent):
+                    extra.append(candidate)
+
+        return {
+            "file": target,
+            "folder": folder,
+            "backup": cls.backup_path(target),
+            "models": sorted(models),
+            "extra": sorted({item for item in extra}),
+        }
+
+    @classmethod
+    def delete_project(
+        cls, path: str | Path, project: Project | None = None
+    ) -> dict:
+        """删除项目文件、项目文件夹与备份文件。
+
+        Returns:
+            {"removed": [已删除路径], "failed": [(路径, 原因)]}
+        """
+        info = cls.artifacts(path, project)
+        removed: list[str] = []
+        failed: list[tuple[str, str]] = []
+
+        for folder in (info["folder"], *info["extra"]):
+            if not folder.is_dir():
+                continue
+            try:
+                shutil.rmtree(folder, onerror=_force_remove)
+                removed.append(str(folder))
+            except OSError as exc:
+                failed.append((str(folder), str(exc)))
+
+        for item in (info["backup"], info["file"]):
+            if item is None or not item.is_file():
+                continue
+            try:
+                item.unlink()
+                removed.append(str(item))
+            except OSError as exc:
+                failed.append((str(item), str(exc)))
+
+        logger.info(
+            "已删除项目「%s」：%d 项%s",
+            Path(path).stem, len(removed),
+            f"，{len(failed)} 项失败" if failed else "",
+        )
+        return {"removed": removed, "failed": failed}
 
     # -----------------------------------------------------------
     # 自动保存与崩溃恢复
@@ -209,8 +323,8 @@ class ProjectService:
         logger.info("已关闭当前项目")
 
     @staticmethod
-    def delete_project(path: str | Path) -> None:
-        """删除 .mprj 项目文件。"""
+    def remove_project_file(path: str | Path) -> None:
+        """只删除 .mprj 项目文件（保留项目文件夹）。"""
         target = Path(path)
         if target.is_file():
             target.unlink()

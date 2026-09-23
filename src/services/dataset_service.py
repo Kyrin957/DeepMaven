@@ -537,6 +537,11 @@ class DatasetService:
             dataset/images/{train,val,test}/ + dataset/labels/{train,val,test}/
         layout="classify"：
             dataset/{train,val,test}/<类别名>/  （Ultralytics 分类按目录扫描）
+        layout="ocr_det_rec"：
+            在检测结构之上追加 OCR 产物（见 `_write_ocr_products`）
+        layout="mask"：
+            dataset/images/{train,val,test}/ + dataset/masks/{train,val,test}/
+            （掩码为单通道 PNG，像素值 = cls_id + 1，0 为背景）
 
         Args:
             stratified: 是否分层抽样（分类任务恒按类别分层）。
@@ -556,7 +561,7 @@ class DatasetService:
             images = [Path(p) for p in images]
         stats = {
             "total": len(images), "train": 0, "val": 0, "test": 0,
-            "labels": 0, "linked": 0, "copied": 0, "layout": layout,
+            "labels": 0, "masks": 0, "linked": 0, "copied": 0, "layout": layout,
         }
         if not images:
             logger.warning("无图片可划分: %s", source)
@@ -579,6 +584,43 @@ class DatasetService:
             )
             return stats
 
+        if layout == "mask":
+            from src.services.annotation_service import AnnotationService
+
+            if label_index is None:
+                label_index = DatasetService.build_label_index(source)
+            buckets = DatasetService.split_members(
+                images, label_index, split=split, seed=seed,
+                stratified=stratified, layout=layout,
+            )
+            for sub in SPLIT_SUBDIRS:
+                img_dir = target / "images" / sub
+                mask_dir = target / "masks" / sub
+                img_dir.mkdir(parents=True, exist_ok=True)
+                mask_dir.mkdir(parents=True, exist_ok=True)
+                for img in buckets[sub]:
+                    DatasetService._count_place(stats, img, img_dir / img.name)
+                    stats[sub] += 1
+                    size = DatasetService.image_size(img)
+                    if size is None:
+                        logger.warning("读取图片尺寸失败，掩码跳过：%s", img)
+                        continue
+                    label = label_index.get(img.stem)
+                    annotation = (
+                        AnnotationService.load_yolo(label, size[0], size[1])
+                        if label is not None else None
+                    )
+                    mask = DatasetService.mask_from_annotation(
+                        annotation, size[0], size[1]
+                    )
+                    mask.save(mask_dir / f"{img.stem}.png")
+                    stats["masks"] += 1
+            logger.info(
+                "掩码数据集划分完成 train=%s val=%s test=%s（掩码 %s 张）",
+                stats["train"], stats["val"], stats["test"], stats["masks"],
+            )
+            return stats
+
         if label_index is None:
             label_index = DatasetService.build_label_index(source)
         buckets = DatasetService.split_members(
@@ -598,11 +640,153 @@ class DatasetService:
                 if label is not None:
                     DatasetService._place(label, lab_dir / label.name)
                     stats["labels"] += 1
+        if layout == "ocr_det_rec":
+            DatasetService._write_ocr_products(target, buckets, label_index, stats)
         logger.info(
             "数据集划分完成（分层=%s）train=%s val=%s test=%s",
             stratified, stats["train"], stats["val"], stats["test"],
         )
         return stats
+
+    @staticmethod
+    def image_size(path: str | Path) -> tuple[int, int] | None:
+        """读取图片尺寸；失败返回 None。"""
+        from PIL import Image
+
+        try:
+            with Image.open(path) as handle:
+                return int(handle.width), int(handle.height)
+        except Exception as exc:  # noqa: BLE001 - 图片损坏或格式异常
+            logger.warning("读取图片尺寸失败 %s: %s", path, exc)
+            return None
+
+    @staticmethod
+    def mask_from_annotation(annotation, width: int, height: int):
+        """把标注栅格化为类别掩码（PIL 单通道：0 = 背景，cls_id + 1 = 类别）。
+
+        矩形按框填充，多边形 / 掩码按顶点填充；文本框不属于分割目标，忽略。
+        """
+        from PIL import Image, ImageDraw
+
+        mask = Image.new("L", (max(1, int(width)), max(1, int(height))), 0)
+        if annotation is None:
+            return mask
+        draw = ImageDraw.Draw(mask)
+        for item in annotation.items:
+            if item.is_text:
+                continue
+            value = min(255, max(1, int(item.cls_id) + 1))
+            if item.is_rect:
+                x1, y1, x2, y2 = item.bounds()
+                draw.rectangle(
+                    [x1 * width, y1 * height, x2 * width, y2 * height], fill=value,
+                )
+                continue
+            points = [(px * width, py * height) for px, py in item.points]
+            if len(points) >= 3:
+                draw.polygon(points, fill=value)
+            elif len(points) == 2:
+                draw.rectangle(
+                    [points[0][0], points[0][1], points[1][0], points[1][1]],
+                    fill=value,
+                )
+        return mask
+
+    @staticmethod
+    def _write_ocr_products(
+        target: Path, buckets: dict, label_index: dict, stats: dict
+    ) -> None:
+        """写 OCR 训练产物（检测标签带转写 + 识别裁切图）。
+
+            ocr/det/<split>.txt      每行 `图片路径<TAB>[{"transcription","points","difficult"}]`
+                                     （PaddleOCR 检测数据格式，坐标为像素）
+            ocr/rec/<split>/         按文本框裁切的小图
+            ocr/rec_gt_<split>.txt   每行 `裁切图路径<TAB>文本`
+
+        没有转写的框只进检测标签、不进识别集（数量记入 `ocr_skipped`）。
+        """
+        import json
+
+        from PIL import Image
+
+        from src.services.annotation_service import AnnotationService
+
+        det_dir = target / "ocr" / "det"
+        rec_dir = target / "ocr" / "rec"
+        det_rows = rec_rows = skipped = 0
+
+        for sub in SPLIT_SUBDIRS:
+            det_lines: list[str] = []
+            rec_lines: list[str] = []
+            for image in buckets.get(sub, []):
+                label = label_index.get(image.stem)
+                if label is None:
+                    continue
+                try:
+                    with Image.open(image) as handle:
+                        width, height = handle.size
+                        source = handle.convert("RGB")
+                except Exception as exc:  # noqa: BLE001 - 单张读失败不影响整体
+                    logger.warning("读取 OCR 图片失败 %s: %s", image, exc)
+                    continue
+
+                annotation = AnnotationService.load_yolo(label, width, height)
+                entries: list[dict] = []
+                for index, item in enumerate(annotation.items):
+                    if not item.is_rect:
+                        continue
+                    x1, y1, x2, y2 = item.bounds()
+                    entries.append({
+                        "transcription": str(item.text or ""),
+                        "points": [
+                            [round(x1 * width, 2), round(y1 * height, 2)],
+                            [round(x2 * width, 2), round(y1 * height, 2)],
+                            [round(x2 * width, 2), round(y2 * height, 2)],
+                            [round(x1 * width, 2), round(y2 * height, 2)],
+                        ],
+                        "difficult": False,
+                    })
+                    if not item.text:
+                        skipped += 1
+                        continue
+                    # 归一化坐标乘回像素时会有浮点误差（如 11.9999），
+                    # 截断会让裁切框少 1 像素，因此按四舍五入取整并夹到图内
+                    crop = source.crop((
+                        max(0, round(x1 * width)), max(0, round(y1 * height)),
+                        min(width, round(x2 * width)), min(height, round(y2 * height)),
+                    ))
+                    if crop.width < 2 or crop.height < 2:
+                        skipped += 1
+                        continue
+                    name = f"{image.stem}_{index}.jpg"
+                    folder = rec_dir / sub
+                    folder.mkdir(parents=True, exist_ok=True)
+                    crop.save(folder / name, quality=95)
+                    rec_lines.append(f"ocr/rec/{sub}/{name}\t{item.text}")
+                    rec_rows += 1
+
+                if entries:
+                    det_rows += 1
+                    det_lines.append(
+                        f"images/{sub}/{image.name}\t"
+                        + json.dumps(entries, ensure_ascii=False)
+                    )
+
+            if det_lines:
+                det_dir.mkdir(parents=True, exist_ok=True)
+                (det_dir / f"{sub}.txt").write_text(
+                    "\n".join(det_lines) + "\n", encoding="utf-8"
+                )
+            if rec_lines:
+                (target / "ocr" / f"rec_gt_{sub}.txt").write_text(
+                    "\n".join(rec_lines) + "\n", encoding="utf-8"
+                )
+
+        stats.update({"ocr_det": det_rows, "ocr_rec": rec_rows, "ocr_skipped": skipped})
+        logger.info(
+            "OCR 数据已生成：检测 %s 张 / 识别 %s 张（缺转写 %s 个框）",
+            det_rows, rec_rows, skipped,
+        )
 
     @staticmethod
     def _place(source: Path, destination: Path) -> str:

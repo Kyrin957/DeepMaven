@@ -10,7 +10,7 @@ import json
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from src.models.annotation import BOX, POLYGON, Annotation, ImageAnnotation
+from src.models.annotation import BOX, POLYGON, TEXT, Annotation, ImageAnnotation
 from src.utils.logger import get_logger
 
 logger = get_logger("annotation")
@@ -38,6 +38,83 @@ class AnnotationService:
     def label_path_for(image_path: str | Path, label_dir: str | Path) -> Path:
         """按 YOLO 约定返回图片对应的标签文件路径。"""
         return Path(label_dir) / f"{Path(image_path).stem}.txt"
+
+    # -----------------------------------------------------------
+    # OCR 文本（旁路存储）
+    # -----------------------------------------------------------
+    @staticmethod
+    def text_sidecar_path(label_path: str | Path) -> Path:
+        """文本框转写的旁路文件路径。
+
+        YOLO txt 的一行只有「类别 + 坐标」，放不下转写文本，因此单独存放：
+        `<标签目录>/texts/<图片主干>.txt`，每行 `cx cy<TAB>文本`，
+        以**归一化中心点**为锚点；框被移动或删除后该条转写即失效（不会串到别的框）。
+        """
+        label_path = Path(label_path)
+        return label_path.parent / "texts" / f"{label_path.stem}.txt"
+
+    @staticmethod
+    def save_texts(annotation: ImageAnnotation, label_path: str | Path) -> Path | None:
+        """写出文本转写；没有文本框时删除旧旁路文件。"""
+        items = [item for item in annotation.items if item.is_text]
+        path = AnnotationService.text_sidecar_path(label_path)
+        if not items:
+            if path.exists():
+                try:
+                    path.unlink()
+                except OSError as exc:
+                    logger.warning("删除文本框旁路文件失败 %s: %s", path, exc)
+            return None
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines: list[str] = []
+        for item in items:
+            cx, cy = item.center
+            text = str(item.text or "").replace("\t", " ").replace("\n", " ")
+            lines.append(f"{cx:.6f} {cy:.6f}\t{text}")
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
+
+    @staticmethod
+    def load_texts(
+        annotation: ImageAnnotation, label_path: str | Path, tolerance: float = 2e-3
+    ) -> int:
+        """把旁路文件里的转写按中心点绑回矩形项（并标记为文本框），返回绑定条数。"""
+        path = AnnotationService.text_sidecar_path(label_path)
+        if not path.is_file():
+            return 0
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            logger.warning("读取文本框旁路文件失败 %s: %s", path, exc)
+            return 0
+
+        entries: list[tuple[float, float, str]] = []
+        for line in lines:
+            head, _, text = line.partition("\t")
+            parts = head.split()
+            if len(parts) < 2:
+                continue
+            try:
+                entries.append((float(parts[0]), float(parts[1]), text))
+            except ValueError:
+                continue
+
+        bound = 0
+        used: set[int] = set()
+        for item in annotation.items:
+            if not item.is_rect:
+                continue
+            cx, cy = item.center
+            for index, (ex, ey, text) in enumerate(entries):
+                if index in used:
+                    continue
+                if abs(ex - cx) <= tolerance and abs(ey - cy) <= tolerance:
+                    used.add(index)
+                    item.kind = TEXT
+                    item.text = text
+                    bound += 1
+                    break
+        return bound
 
     # -----------------------------------------------------------
     # YOLO
@@ -82,6 +159,8 @@ class AnnotationService:
                 annotation.items.append(Annotation(
                     cls_id=cls_id, kind=POLYGON, points=points,
                 ))
+        # 文本框转写（OCR）：按中心点绑回矩形项
+        AnnotationService.load_texts(annotation, label_path)
         return annotation
 
     @staticmethod
@@ -92,7 +171,7 @@ class AnnotationService:
 
         lines: list[str] = []
         for item in annotation.items:
-            if item.is_box:
+            if item.is_rect:
                 x1, y1, x2, y2 = item.bounds()
                 values = [
                     (x1 + x2) / 2, (y1 + y2) / 2, abs(x2 - x1), abs(y2 - y1),
@@ -108,6 +187,8 @@ class AnnotationService:
         label_path.write_text(
             "\n".join(lines) + ("\n" if lines else ""), encoding="utf-8"
         )
+        # 文本框转写单独落盘（YOLO txt 无承载字段）
+        AnnotationService.save_texts(annotation, label_path)
         return label_path
 
     # -----------------------------------------------------------

@@ -15,6 +15,7 @@ from src.services.category_service import CategoryService
 from src.services.quality_service import QualityService
 from src.services.augment_service import AugmentService
 from src.services.dataset_service import DatasetService
+from src.services.project_service import ProjectService
 from src.utils.constants import (
     COVER_ENTRY_NAME,
     DEFAULT_AUGMENT_NAME,
@@ -25,6 +26,7 @@ from src.utils.constants import (
     UNLABELED_LABEL,
 )
 from src.utils.logger import get_logger
+from src.utils.tasks import dataset_layout
 from src.utils.workers import FunctionWorker
 from src.viewmodels.project_vm import ProjectViewModel
 
@@ -650,14 +652,15 @@ class DatasetViewModel(QObject):
             return
 
         mprj = Path(project.params.get("path", ""))
-        out_dir = mprj.parent / self.split_name()
+        # 产物写进项目文件夹（与 Halcon DLT 一致：删除项目时一并清理）
+        out_dir = ProjectService.project_dir(mprj) / self.split_name()
         split = (
             self._dataset.split_train,
             self._dataset.split_val,
             self._dataset.split_test,
         )
         # 分类任务输出 train/<类别>/ 目录结构，检测/分割输出 images+labels 结构
-        layout = "classify" if project.model_type == "classify" else "detect"
+        layout = self.split_layout()
         # 图库可能由多个文件夹累加而成，划分按界面上看到的图片清单进行
         library = self.images()
         label_index = self.label_index()
@@ -918,7 +921,7 @@ class DatasetViewModel(QObject):
 
         label_index = self.source_label_index()
         mprj = Path(project.params.get("path", ""))
-        out_dir = mprj.parent / DEFAULT_AUGMENT_NAME
+        out_dir = ProjectService.project_dir(mprj) / DEFAULT_AUGMENT_NAME
 
         def job(progress, is_cancelled):
             stats = AugmentService.augment_dataset(
@@ -2065,10 +2068,16 @@ class DatasetViewModel(QObject):
         self.message.emit(level, text)
 
     def split_layout(self) -> str:
-        """按项目类型返回数据集结构：分类用目录结构，其余用 YOLO 检测结构。"""
+        """按项目类型返回数据集结构（声明在任务注册表）。
+
+        已实现四种：分类（目录结构）、检测（images / labels）、OCR（检测结构
+        + det / rec 产物）、语义分割（images + masks）；异常检测的
+        normal / abnormal 结构待后续阶段接入，未实现的一律回退为检测结构。
+        """
         project = self._project_vm.project if self._project_vm else None
-        if project is not None and project.model_type == "classify":
-            return "classify"
+        layout = dataset_layout(project.model_type) if project is not None else "detect"
+        if layout in ("classify", "ocr_det_rec", "mask"):
+            return layout
         return "detect"
 
     def preview_split(self) -> dict:
@@ -2156,7 +2165,7 @@ class DatasetViewModel(QObject):
         if not mprj.name:
             return None
 
-        dest = mprj.parent / f"{mprj.stem}_files"
+        dest = ProjectService.project_dir(mprj) / "files"
         try:
             payloads = self._project_vm.service.read_files(project, paths)
         except (KeyError, ValueError, OSError) as exc:

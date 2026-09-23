@@ -55,6 +55,7 @@ from src.services.evaluation_service import (
     MISSED,
 )
 from src.utils.constants import PLOT_COLORS
+from src.utils.tasks import VIEW_ANOMALY, VIEW_DETECT, VIEW_SEGMENT
 from src.viewmodels.evaluate_vm import EvaluateViewModel
 from src.views.data_widgets import side_column
 from src.views.widgets import (
@@ -285,8 +286,30 @@ class EvaluateTab(QWidget):
         anomaly_layout.addWidget(self.anomaly_hint)
         self.anomaly_card.setVisible(False)
 
+        # 语义分割：像素级指标 + 逐类 IoU（仅语义分割任务显示）
+        self.segment_card, segment_layout = self._card("语义分割")
+        self.seg_tiles: dict[str, BodyLabel] = {}
+        for key, title in (
+            ("miou", "mIoU"), ("dice", "Dice"), ("pixel_acc", "像素准确率"),
+        ):
+            row = QHBoxLayout()
+            row.addWidget(CaptionLabel(title, self.segment_card))
+            value = BodyLabel("—", self.segment_card)
+            value.setAlignment(Qt.AlignmentFlag.AlignRight)
+            row.addWidget(value, 1)
+            segment_layout.addLayout(row)
+            self.seg_tiles[key] = value
+        self.seg_table = TableWidget(self.segment_card)
+        self.seg_table.setColumnCount(3)
+        self.seg_table.setHorizontalHeaderLabels(["类别", "IoU", "Dice"])
+        self.seg_table.verticalHeader().setVisible(False)
+        self.seg_table.setEditTriggers(TableWidget.EditTrigger.NoEditTriggers)
+        self.seg_table.setMinimumHeight(150)
+        segment_layout.addWidget(self.seg_table)
+        self.segment_card.setVisible(False)
+
         return side_column(
-            config_card, overview_card, self.anomaly_card, width=310
+            config_card, overview_card, self.anomaly_card, self.segment_card, width=310
         )
 
     def _make_threshold(self, label, default, layout, parent):
@@ -871,13 +894,21 @@ class EvaluateTab(QWidget):
         self._instances = []
         self._reload_true_combo(names)
         self._reload_class_filter(names)
-        self._fill_tiles(metrics)
+        segment = VIEW_SEGMENT in self._vm.eval_views()
+        self._fill_tiles(metrics, segment=segment)
         self._fill_fp_summary(metrics)
         self._fill_overview(metrics)
-        self.matrix_view.set_data(result.get("matrix") or [], names, colors)
-        self._fill_class_table(metrics.get("per_class") or [], names, colors)
-        self._fill_matrix_hint(result, names, colors)
+        if segment:
+            # 语义分割是像素级统计，图级混淆矩阵 / 类别指标不适用
+            self.matrix_view.set_data([], [])
+            self.matrix_hint.setText("")
+            self.class_table.setRowCount(0)
+        else:
+            self.matrix_view.set_data(result.get("matrix") or [], names, colors)
+            self._fill_class_table(metrics.get("per_class") or [], names, colors)
+            self._fill_matrix_hint(result, names, colors)
         self._fill_anomaly(result)
+        self._fill_segment(result)
         # 重新下发结果时（例如调阈值、改真实标签）保持当前选中行不变
         keep = self._vm.eval_index()
         self._apply_filter(select_first=False)
@@ -891,6 +922,8 @@ class EvaluateTab(QWidget):
             label.setText("—")
         self.fp_row.setVisible(False)
         self.anomaly_card.setVisible(False)
+        self.segment_card.setVisible(False)
+        self.seg_table.setRowCount(0)
         self.hist_view.set_data([])
         self._instances = []
         self.pie.set_data([], "")
@@ -903,7 +936,12 @@ class EvaluateTab(QWidget):
         self.prob_chart.set_data([])
         self.preview.clear()
 
-    def _fill_tiles(self, metrics: dict) -> None:
+    def _fill_tiles(self, metrics: dict, segment: bool = False) -> None:
+        if segment:
+            # 语义分割的指标是像素级的（见「语义分割」卡片），图级指标置空
+            for label in self._tiles.values():
+                label.setText("—")
+            return
         self._tiles["wrong"].setText(str(int(metrics.get("wrong") or 0)))
         self._tiles["accuracy"].setText(self._percent(metrics.get("accuracy")))
         self._tiles["top1"].setText(self._percent(metrics.get("top1_error")))
@@ -918,9 +956,9 @@ class EvaluateTab(QWidget):
         return f"{float(value or 0) * 100:.2f}%"
 
     def _fill_fp_summary(self, metrics: dict) -> None:
-        """误检细分汇总（仅检测族显示：整图/实例两种粒度都用得上）。"""
+        """误检细分汇总（按任务的视图集：检测族才显示，整图/实例两种粒度都用得上）。"""
         summary = metrics.get("fp_summary") or {}
-        show = bool(summary) and bool(self._vm.eval_result.get("with_background"))
+        show = bool(summary) and VIEW_DETECT in self._vm.eval_views()
         self.fp_row.setVisible(show)
         if not show:
             return
@@ -929,8 +967,8 @@ class EvaluateTab(QWidget):
         self._fp_tiles["total"].setText(str(int(summary.get("total") or 0)))
 
     def _fill_anomaly(self, result: dict) -> None:
-        """异常检测：分数直方图 + 阈值 / 容忍度回填（仅异常任务显示该卡片）。"""
-        show = str(result.get("task") or "") == "anomaly" and bool(result.get("rows"))
+        """异常检测：分数直方图 + 阈值 / 容忍度回填（按任务的视图集显示卡片）。"""
+        show = VIEW_ANOMALY in self._vm.eval_views() and bool(result.get("rows"))
         self.anomaly_card.setVisible(show)
         if not show:
             return
@@ -957,6 +995,26 @@ class EvaluateTab(QWidget):
             f"判定异常 {flagged} 张 · 实际异常 {truth} 张 · "
             f"准确率 {self._percent(metrics.get('accuracy'))}"
         )
+
+    def _fill_segment(self, result: dict) -> None:
+        """语义分割：像素级指标与逐类 IoU（按任务的视图集显示该卡片）。"""
+        show = VIEW_SEGMENT in self._vm.eval_views() and bool(result.get("rows"))
+        self.segment_card.setVisible(show)
+        if not show:
+            return
+        metrics = result.get("metrics") or {}
+        for key, label in self.seg_tiles.items():
+            value = metrics.get(key)
+            label.setText(self._percent(value) if value is not None else "—")
+        per_class = list(metrics.get("per_class") or [])
+        self.seg_table.setRowCount(len(per_class))
+        for row, item in enumerate(per_class):
+            for column, text in enumerate((
+                str(item.get("name") or ""),
+                f"{float(item.get('iou') or 0):.3f}",
+                f"{float(item.get('dice') or 0):.3f}",
+            )):
+                self.seg_table.setItem(row, column, QTableWidgetItem(text))
 
     def _on_anomaly_threshold(self, raw: int) -> None:
         if self._syncing:

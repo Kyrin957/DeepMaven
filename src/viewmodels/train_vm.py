@@ -17,11 +17,14 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Signal
 
 from src.models.training import TrainingConfig
+from src.services.backends import resolve as resolve_backend
 from src.services.dataset_service import DatasetService
+from src.services.project_service import ProjectService
 from src.services.train_service import TrainService
 from src.utils.constants import DATA_DIR
 from src.utils.image_ops import build_param_preview
 from src.utils.logger import get_logger
+from src.utils.tasks import task_metrics, task_of
 from src.viewmodels.project_vm import ProjectViewModel
 
 logger = get_logger("train_vm")
@@ -56,33 +59,8 @@ def _sum_loss(metrics: dict, prefix: str) -> float | None:
     return total if found else None
 
 
-# 各任务的评价指标（曲线名, 候选键名）
-_METRIC_SPECS = {
-    "classify": [
-        ("Top1 准确率", ("metrics/accuracy_top1",)),
-        ("Top5 准确率", ("metrics/accuracy_top5",)),
-    ],
-    "anomaly": [
-        ("AUROC", ("image_AUROC", "image_AUROC_macro", "pixel_AUROC")),
-    ],
-}
-_DETECT_METRICS = [
-    ("mAP50", ("metrics/mAP50(B)", "metrics/mAP50")),
-    ("mAP50-95", ("metrics/mAP50-95(B)", "metrics/mAP50-95")),
-    ("Precision", ("metrics/precision(B)", "metrics/precision")),
-    ("Recall", ("metrics/recall(B)", "metrics/recall")),
-]
-
-# 可训练的任务类型：项目类型直接对应训练任务，其余（如语义分割）回退为对象检测
-_TRAIN_TASKS = ("detect", "obb", "segment", "classify", "anomaly")
-
 # 训练记录保留条数
 _HISTORY_LIMIT = 20
-
-
-def _task_of(model_type: str) -> str:
-    """项目类型 → 训练任务。"""
-    return model_type if model_type in _TRAIN_TASKS else "detect"
 
 
 class TrainViewModel(QObject):
@@ -129,7 +107,13 @@ class TrainViewModel(QObject):
         """
         self._config = project.training if project is not None else TrainingConfig()
         if project is not None:
-            self._config.task_type = _task_of(project.model_type)
+            self._config.task_type = task_of(project.model_type)
+            # 训练产物落在项目文件夹里（旧项目未设置保存目录时补齐默认值）
+            path = str(project.params.get("path") or "")
+            if path and not str(self._config.project_dir or "").strip():
+                self._config.project_dir = str(
+                    ProjectService.project_dir(path) / "runs"
+                )
         self.configChanged.emit(self._config)
         self.statusChanged.emit(self._config.status)
         self.progressChanged.emit(self._config.progress)
@@ -538,14 +522,10 @@ class TrainViewModel(QObject):
         if self.is_running():
             self.message.emit("warning", "训练已在运行中")
             return
-        if self._config.task_type == "anomaly":
-            if not self._config.anomaly_root:
-                self.message.emit(
-                    "warning", "请选择含 normal/ 与 abnormal/ 的目录"
-                )
-                return
-        elif not self._config.data_yaml:
-            self.message.emit("warning", "请先在数据拆分页完成划分，生成数据集配置")
+        # 启动条件由任务对应的后端决定（检测 / 分类看 data.yaml，异常看数据目录）
+        problem = resolve_backend(self._config).validate(self._config)
+        if problem is not None:
+            self.message.emit("warning", problem.hint or problem.message)
             return
 
         # 训练参数随项目持久化，避免程序重启后丢失
@@ -1030,10 +1010,14 @@ class TrainViewModel(QObject):
         if split is not None:
             split.locked = True
 
+        setup = self.active_setup()
         self.add_history({
             "name": _now_text(),
             "task": config.task_type,
             "model": config.model_key,
+            # 训练设置归属：多套参数横向比较时据此区分
+            "setup_id": int(setup.get("setup_id") or 0),
+            "setup_name": str(setup.get("name") or ""),
             "split_id": int(config.split_id),
             "split_name": str(
                 config.split_name or (split.name if split is not None else "")
@@ -1058,21 +1042,29 @@ class TrainViewModel(QObject):
             self._set_status("error")
 
     def _register_artifacts(self, summary: dict) -> None:
-        """把 best.pt / last.pt / results.csv 归档进当前项目。"""
+        """把后端产物（best / last 权重 + results.csv）归档进当前项目。"""
         project = self._project_vm.project if self._project_vm else None
         if project is None:
             return
 
+        run_folder = _run_folder_name(
+            summary, self._config, self._config.history
+        )
+        if self._config.history:
+            # 记录归档目录，便于回溯该次训练的产物位置
+            self._config.history[-1]["archive_folder"] = f"runs/{run_folder}"
         items: list[tuple[str, str, bytes]] = []
-        for key in ("best", "last"):
-            path = Path(summary.get(key) or "")
-            if path.is_file():
-                items.append(("model", f"runs/{path.name}", path.read_bytes()))
-        save_dir = Path(summary.get("save_dir") or "")
-        if save_dir:
-            results = save_dir / "results.csv"
-            if results.is_file():
-                items.append(("run", "runs/results.csv", results.read_bytes()))
+        for artifact in resolve_backend(self._config).artifacts(summary):
+            try:
+                payload = artifact.path.read_bytes()
+            except OSError as exc:
+                logger.warning("读取训练产物失败 %s: %s", artifact.path, exc)
+                continue
+            items.append((
+                artifact.kind,
+                f"runs/{run_folder}/{artifact.path.name}",
+                payload,
+            ))
         if not items:
             return
 
@@ -1111,8 +1103,8 @@ class TrainViewModel(QObject):
 
 
 def _metric_specs(task: str) -> list:
-    """任务 → 评价指标列表 [(曲线名, 候选键名)]。"""
-    return _METRIC_SPECS.get(task, _DETECT_METRICS)
+    """任务 → 评价指标列表 [(曲线名, 候选键名)]（声明在任务注册表）。"""
+    return list(task_metrics(task))
 
 
 def _merge_points(target: list, points: list) -> None:
@@ -1130,6 +1122,40 @@ def _now_text() -> str:
     from datetime import datetime
 
     return datetime.now().strftime("%m-%d %H:%M")
+
+
+def _safe_name(text: str) -> str:
+    """替换路径片段里的非法字符（虚拟路径也保持可读）。"""
+    cleaned = "".join(
+        "_" if char in '\\/:*?"<>|' else char for char in str(text or "")
+    ).strip()
+    return cleaned or "run"
+
+
+def _run_folder_name(summary: dict, config, history: list | None = None) -> str:
+    """归档目录名 = 后端保存目录名（或模型名）+ 时间戳。
+
+    异常检测与语义分割的输出目录由配置固定，多次训练会互相覆盖；
+    加上时间戳后每次训练各有独立归档（虚拟路径 `runs/<目录>/...`）。
+    少数情况下（同一秒内完成两次）时间戳会重复，此时后缀递增序号。
+    """
+    from datetime import datetime
+
+    base = Path(str(summary.get("save_dir") or "")).name
+    if not base:
+        base = str(getattr(config, "model_key", "") or "run")
+    name = f"{_safe_name(base)}-{datetime.now().strftime('%m%d-%H%M%S')}"
+    # 记录里存的是 `runs/<目录>`，这里统一取末段目录名再比较
+    used = {
+        Path(str(item.get("archive_folder") or "")).name
+        for item in (history or [])
+    }
+    if name not in used:
+        return name
+    index = 2
+    while f"{name}-{index}" in used:
+        index += 1
+    return f"{name}-{index}"
 
 
 def parse_results_csv(path) -> dict[str, list[tuple[float, float]]]:

@@ -43,12 +43,11 @@ from qfluentwidgets import (
     TextEdit,
 )
 
-from src.services.anomalib_service import AnomalibService
+from src.services.backends import for_task as backend_for_task
 from src.utils.constants import (
     OPTIMIZERS,
     SPLIT_COLORS,
     SPLIT_LABELS,
-    TASK_MODEL_SUFFIX,
     YOLO_MODEL_VARIANTS,
 )
 from src.utils.device import device_label, device_options
@@ -711,8 +710,10 @@ class TrainTab(QWidget):
     def _build_model_table_card(self) -> CardWidget:
         card, layout = self._card("训练模型")
         self.model_table = TableWidget(card)
-        self.model_table.setColumnCount(4)
-        self.model_table.setHorizontalHeaderLabels(["选择", "时间", "拆分", "最佳"])
+        self.model_table.setColumnCount(5)
+        self.model_table.setHorizontalHeaderLabels(
+            ["选择", "时间", "拆分", "设置", "最佳"]
+        )
         self.model_table.verticalHeader().setVisible(False)
         self.model_table.setEditTriggers(TableWidget.EditTrigger.NoEditTriggers)
         self.model_table.setFixedHeight(150)
@@ -731,9 +732,9 @@ class TrainTab(QWidget):
     def _build_compare_metric_card(self) -> CardWidget:
         card, layout = self._card("指标对比")
         self.compare_models = TableWidget(card)
-        self.compare_models.setColumnCount(6)
+        self.compare_models.setColumnCount(7)
         self.compare_models.setHorizontalHeaderLabels(
-            ["时间", "拆分", "模型", "最佳指标", "最佳轮次", "最终 Loss"]
+            ["时间", "拆分", "设置", "模型", "最佳指标", "最佳轮次", "最终 Loss"]
         )
         self.compare_models.verticalHeader().setVisible(False)
         self.compare_models.setEditTriggers(TableWidget.EditTrigger.NoEditTriggers)
@@ -919,21 +920,14 @@ class TrainTab(QWidget):
             self._syncing = False
 
     def _reload_variants(self, task: str) -> None:
-        """按任务类型重建模型下拉（避免重复添加）。"""
+        """按任务类型重建模型下拉（候选由任务对应的后端提供，避免重复添加）。"""
         signature = str(task)
         if getattr(self, "_variant_task", "") == signature:
             return
         previous = str(self.variant_combo.currentData() or "")
         self.variant_combo.clear()
-        if task == "anomaly":
-            for name in AnomalibService.available_models():
-                self.variant_combo.addItem(name, userData=name)
-        else:
-            suffix = TASK_MODEL_SUFFIX.get(task, "")
-            for variant in YOLO_MODEL_VARIANTS:
-                self.variant_combo.addItem(
-                    variant["label"], userData=f"{variant['key']}{suffix}"
-                )
+        for candidate in backend_for_task(task).candidates(task):
+            self.variant_combo.addItem(candidate["label"], userData=candidate["key"])
         self._variant_task = signature
         index = self.variant_combo.findData(previous)
         self.variant_combo.setCurrentIndex(max(0, index))
@@ -1066,9 +1060,13 @@ class TrainTab(QWidget):
 
     def _on_history(self, records: list) -> None:
         """刷新左侧训练记录与「对比」页的模型列表。"""
+        # 只有多套训练设置时才在记录里标注归属，单套设置下不增加噪音
+        multi_setup = len(self._vm.setups()) > 1
         self.history_list.setRowCount(len(records))
         for row, record in enumerate(records):
             name = str(record.get("name", ""))
+            if multi_setup and record.get("setup_name"):
+                name = f"{name} · {record['setup_name']}"
             best = record.get("best_value") or 0.0
             label = str(record.get("best_label") or "")
             self.history_list.setItem(row, 0, QTableWidgetItem(name))
@@ -1101,7 +1099,11 @@ class TrainTab(QWidget):
                     row, 2,
                     QTableWidgetItem(str(record.get("split_name") or "—")),
                 )
-                self.model_table.setItem(row, 3, QTableWidgetItem(
+                self.model_table.setItem(
+                    row, 3,
+                    QTableWidgetItem(str(record.get("setup_name") or "—")),
+                )
+                self.model_table.setItem(row, 4, QTableWidgetItem(
                     f"{record.get('best_label') or ''} "
                     f"{float(record.get('best_value') or 0):.4f}".strip()
                 ))
@@ -1131,12 +1133,15 @@ class TrainTab(QWidget):
         """按勾选的训练记录重建对比曲线与指标表。"""
         records = self._vm.history()
         loss_series, metric_series, rows = [], [], []
+        multi_setup = len(self._vm.setups()) > 1
         for index, record in enumerate(records):
             if not self._model_checked(index):
                 continue
             curves = self._vm.run_curves(index)
             color = _METRIC_COLORS[len(rows) % len(_METRIC_COLORS)]
             label = str(record.get("name") or f"#{index + 1}")
+            if multi_setup and record.get("setup_name"):
+                label = f"{label} · {record['setup_name']}"
             loss = curves.get("loss")
             if loss:
                 loss_series.append((label, color, loss[1]))
@@ -1157,6 +1162,7 @@ class TrainTab(QWidget):
             values = [
                 str(record.get("name", "")),
                 str(record.get("split_name") or "—"),
+                str(record.get("setup_name") or "—"),
                 str(record.get("model") or "—"),
                 f"{best_label} {best_value:.4f}".strip(),
                 str(record.get("best_epoch") or "—"),

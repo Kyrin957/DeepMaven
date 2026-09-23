@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMenuBar,
     QVBoxLayout,
+    QWidget,
 )
 from qfluentwidgets import (
     FluentIcon,
@@ -45,6 +46,20 @@ from src.utils.constants import (
 from src.utils.config import ConfigManager
 from src.utils.history import stack
 from src.utils.logger import get_logger
+from src.utils.tasks import (
+    DEFAULT_TASK,
+    PAGE_ANNOTATE,
+    PAGE_EVALUATE,
+    PAGE_EXPORT,
+    PAGE_GALLERY,
+    PAGE_ORDER,
+    PAGE_PROJECT,
+    PAGE_REVIEW,
+    PAGE_SPLIT,
+    PAGE_TRAIN,
+    task_of,
+    task_spec,
+)
 from src.viewmodels import (
     AnnotateViewModel,
     CategoryViewModel,
@@ -338,68 +353,113 @@ class MainWindow(FluentWindow):
         except Exception as exc:  # noqa: BLE001 - 界面同步失败不应阻断打开流程
             logger.warning("按项目类型同步界面失败: %s", exc)
 
+        # 项目任务决定可用页面与 Alt+1..N 编号
+        try:
+            task = task_of(project.model_type) if project is not None else DEFAULT_TASK
+            self._apply_task_pages(task)
+        except Exception as exc:  # noqa: BLE001 - 页面门控失败不应阻断打开流程
+            logger.warning("按任务同步页面失败: %s", exc)
+
     # -----------------------------------------------------------
     # 导航页注册
     # -----------------------------------------------------------
     def _init_navigation(self) -> None:
+        # 页面 key（见 src/utils/tasks.py 的 PAGE_*）→ 控件 / 标题 / 导航项
+        self._pages: dict[str, QWidget] = {}
+        self._page_titles: dict[str, str] = {}
+        self._nav_items: dict[str, object] = {}
+
         self.project_tab = ProjectTab(self.project_vm, self.dataset_vm, self)
         self.project_tab.setObjectName("projectTab")
-        self.addSubInterface(
-            self.project_tab, FluentIcon.FOLDER, "项目管理",
-            position=NavigationItemPosition.TOP,
-        )
+        self._add_page(PAGE_PROJECT, self.project_tab, FluentIcon.FOLDER, "项目管理")
 
         self.gallery_tab = GalleryTab(self.dataset_vm, self.category_vm, self)
         self.gallery_tab.setObjectName("galleryTab")
-        self.addSubInterface(
-            self.gallery_tab, FluentIcon.PHOTO, "图库导入",
-            position=NavigationItemPosition.TOP,
-        )
+        self._add_page(PAGE_GALLERY, self.gallery_tab, FluentIcon.PHOTO, "图库导入")
 
         self.annotate_tab = AnnotateTab(self.annotate_vm, self.category_vm, self)
         self.annotate_tab.setObjectName("annotateTab")
-        self.addSubInterface(
-            self.annotate_tab, FluentIcon.BRUSH, "图像标注",
-            position=NavigationItemPosition.TOP,
-        )
+        self._add_page(PAGE_ANNOTATE, self.annotate_tab, FluentIcon.BRUSH, "图像标注")
 
         self.review_tab = ReviewTab(self.dataset_vm, self.category_vm, self)
         self.review_tab.setObjectName("reviewTab")
-        self.addSubInterface(
-            self.review_tab, FluentIcon.CHECKBOX, "标注检查",
-            position=NavigationItemPosition.TOP,
-        )
+        self._add_page(PAGE_REVIEW, self.review_tab, FluentIcon.CHECKBOX, "标注检查")
 
         self.split_tab = SplitTab(self.dataset_vm, self.category_vm, self)
         self.split_tab.setObjectName("splitTab")
-        self.addSubInterface(
-            self.split_tab, FluentIcon.LIBRARY, "数据拆分",
-            position=NavigationItemPosition.TOP,
-        )
+        self._add_page(PAGE_SPLIT, self.split_tab, FluentIcon.LIBRARY, "数据拆分")
 
         # 训练页同时承载「模型与权重」（原「模型管理」页已并入此页）
         self.train_tab = TrainTab(
             self.train_vm, self.model_vm, self.dataset_vm, self
         )
         self.train_tab.setObjectName("trainTab")
-        self.addSubInterface(
-            self.train_tab, FluentIcon.TRAIN, "模型训练",
-            position=NavigationItemPosition.TOP,
-        )
+        self._add_page(PAGE_TRAIN, self.train_tab, FluentIcon.TRAIN, "模型训练")
 
         self.evaluate_tab = EvaluateTab(self.evaluate_vm, self)
         self.evaluate_tab.setObjectName("evaluateTab")
-        self.addSubInterface(
-            self.evaluate_tab, FluentIcon.VIEW, "模型评估",
-            position=NavigationItemPosition.TOP,
-        )
+        self._add_page(PAGE_EVALUATE, self.evaluate_tab, FluentIcon.VIEW, "模型评估")
 
         self.export_tab = ExportTab(self.export_vm, self)
         self.export_tab.setObjectName("exportTab")
-        self.addSubInterface(
-            self.export_tab, FluentIcon.DOWNLOAD, "模型导出",
-            position=NavigationItemPosition.TOP,
+        self._add_page(PAGE_EXPORT, self.export_tab, FluentIcon.DOWNLOAD, "模型导出")
+
+    def _add_page(self, key: str, page: QWidget, icon, title: str) -> None:
+        """注册一个导航页并记录 key（供按任务的页面门控使用）。"""
+        self._pages[key] = page
+        self._page_titles[key] = title
+        self._nav_items[key] = self.addSubInterface(
+            page, icon, title, position=NavigationItemPosition.TOP,
         )
+
+    # -----------------------------------------------------------
+    # 按任务显示页面
+    # -----------------------------------------------------------
+    def _current_task(self) -> str:
+        """当前项目的训练任务（未打开项目时为默认任务）。"""
+        project = self.project_vm.project
+        return task_of(project.model_type) if project is not None else DEFAULT_TASK
+
+    def _apply_task_pages(self, task: str) -> None:
+        """按任务的页面清单显示 / 隐藏导航页，并重建 Alt+1..N。
+
+        页面如需按任务调整自身（可用工具、参数区），实现 `apply_task(spec)`
+        即可，这里统一调用；任务差异用控件可用性表达，不写说明文字。
+        第 1 期已实现的任务都用全部 8 页（界面无变化），机制先就位，
+        供 OCR 等只需部分页面的任务使用（见《开发文档.md》§8.4.1）。
+        """
+        spec = task_spec(task)
+        pages = [key for key in PAGE_ORDER if key in spec.pages]
+        for key, item in self._nav_items.items():
+            item.setVisible(key in pages)
+        self._rebuild_page_shortcuts(pages)
+        for page in self._pages.values():
+            hook = getattr(page, "apply_task", None)
+            if not callable(hook):
+                continue
+            try:
+                hook(spec)
+            except Exception as exc:  # noqa: BLE001 - 单页同步失败不应阻断
+                logger.warning("%s 按任务同步失败: %s", type(page).__name__, exc)
+        # 当前页若被隐藏（如任务不需要它），退回第一个可见页
+        current = self.stackedWidget.currentWidget()
+        visible = [self._pages[key] for key in pages]
+        if pages and current is not None and current not in visible:
+            self.switchTo(visible[0])
+        logger.info("任务 %s 的可见页面：%s", task, " / ".join(pages))
+
+    def _rebuild_page_shortcuts(self, pages: list[str]) -> None:
+        """按可见页顺序重建 Alt+1..N（隐藏页不占用编号）。"""
+        self.shortcuts.remove_tag("页面切换")
+        for index, key in enumerate(pages, start=1):
+            page = self._pages.get(key)
+            if page is None:
+                continue
+            title = self._page_titles.get(key, key)
+            self.shortcuts.register(
+                self, f"Alt+{index}", lambda target=page: self.switchTo(target),
+                f"打开{title}页", group="通用", global_scope=True, tag="页面切换",
+            )
 
     # -----------------------------------------------------------
     # 快捷键 / 撤销重做
@@ -408,17 +468,7 @@ class MainWindow(FluentWindow):
         """注册全局与页面级快捷键，并登记到 F1 总览。"""
         self.shortcuts = ShortcutManager(self)
         manager = self.shortcuts
-        pages = [
-            ("项目管理", self.project_tab), ("图库导入", self.gallery_tab),
-            ("图像标注", self.annotate_tab), ("标注检查", self.review_tab),
-            ("数据拆分", self.split_tab), ("模型训练", self.train_tab),
-            ("模型评估", self.evaluate_tab), ("模型导出", self.export_tab),
-        ]
-        for index, (name, page) in enumerate(pages, start=1):
-            manager.register(
-                self, f"Alt+{index}", lambda target=page: self.switchTo(target),
-                f"打开{name}页", group="通用", global_scope=True,
-            )
+        # 页面切换键（Alt+1..N）与页面显隐一起按任务生成，见 _apply_task_pages
 
         # 以下快捷键由菜单 QAction 提供（此处只登记到总览，避免重复注册）
         for group, name, sequence in (
@@ -462,6 +512,9 @@ class MainWindow(FluentWindow):
             ("T / V / E 拆分角标", "点击角标"),
         ):
             manager.record("标注", name, sequence)
+
+        # 按当前任务确定可见页面与 Alt+1..N 编号
+        self._apply_task_pages(self._current_task())
 
     def _undo(self) -> None:
         label = stack().undo()

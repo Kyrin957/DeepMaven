@@ -1,6 +1,7 @@
 """对话框组件。"""
 
 from .class_edit_dialog import ClassEditDialog, ColorPicker
+from .delete_project_dialog import DeleteProjectDialog
 from .filter_rules_dialog import FilterRulesDialog
 from .import_images_dialog import ImportImagesDialog
 from .label_stats_dialog import LabelStatsDialog
@@ -12,6 +13,7 @@ from .tag_edit_dialog import TagEditDialog
 __all__ = [
     "ClassEditDialog",
     "ColorPicker",
+    "DeleteProjectDialog",
     "FilterRulesDialog",
     "ImagePreviewDialog",
     "ImportImagesDialog",
