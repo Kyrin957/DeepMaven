@@ -1,8 +1,10 @@
-"""数据拆分页：划分比例配置、拆分预览与数据增强。
+"""数据拆分页：划分比例配置、拆分预览。
 
 布局参照 Halcon DLT 的拆分视图：
     左侧：拆分设置 / 拆分概览（环形图 + 图例）
-    右侧：类别分布预览（条形图）、拆分产物、数据增强
+    右侧：类别分布预览（条形图）、拆分产物
+
+数据增强只在训练页做（在线增强），本页不提供离线增强。
 """
 
 from __future__ import annotations
@@ -10,12 +12,10 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
-    QDoubleSpinBox,
+    QGridLayout,
     QHBoxLayout,
-    QLabel,
     QListWidget,
     QListWidgetItem,
     QSpinBox,
@@ -33,7 +33,7 @@ from qfluentwidgets import (
     StrongBodyLabel,
 )
 
-from src.services.augment_service import AugmentConfig, AugmentService
+from src.services.dataset_service import DatasetService
 from src.utils.constants import SPLIT_COLORS, SPLIT_LABELS, UNLABELED_LABEL
 from src.viewmodels.category_vm import CategoryViewModel
 from src.viewmodels.dataset_vm import DatasetViewModel
@@ -41,6 +41,8 @@ from src.views.data_widgets import side_column
 from src.views.widgets import BarChart, LegendList, PieChart
 
 _COLOR_UNLABELED = "#8A8A8A"
+# 异常检测的类别显示名（对应 ClassDef.kind）
+_KIND_LABELS = {"normal": "良好图像", "abnormal": "异常图像"}
 
 
 class SplitTab(QWidget):
@@ -56,6 +58,9 @@ class SplitTab(QWidget):
         self._vm = dataset_vm
         self._category_vm = category_vm
         self._syncing = False
+        # 异常检测的按类别分配（表格数据源）
+        self._anomaly_totals: dict[str, int] = {}
+        self._anomaly_plan: dict[str, dict[str, int]] = {}
         self._build_ui()
         self._bind()
         self.refresh()
@@ -109,17 +114,21 @@ class SplitTab(QWidget):
         layout.addLayout(name_row)
 
         self.ratio_spins: dict[str, QSpinBox] = {}
+        self.ratio_rows: dict[str, QWidget] = {}
         for key in ("train", "val", "test"):
-            row = QHBoxLayout()
-            row.addWidget(CaptionLabel(SPLIT_LABELS[key], self.setting_card))
-            spin = QSpinBox(self.setting_card)
+            row_widget = QWidget(self.setting_card)
+            row = QHBoxLayout(row_widget)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.addWidget(CaptionLabel(SPLIT_LABELS[key], row_widget))
+            spin = QSpinBox(row_widget)
             spin.setRange(0, 100)
             spin.setSuffix(" %")
             spin.setValue({"train": 70, "val": 20, "test": 10}[key])
             spin.valueChanged.connect(lambda _v: self._on_ratio_changed())
             row.addWidget(spin, 1)
-            layout.addLayout(row)
+            layout.addWidget(row_widget)
             self.ratio_spins[key] = spin
+            self.ratio_rows[key] = row_widget
 
         seed_row = QHBoxLayout()
         seed_row.addWidget(CaptionLabel("随机种子", self.setting_card))
@@ -135,6 +144,10 @@ class SplitTab(QWidget):
             lambda _s: self._on_stratified_changed()
         )
         layout.addWidget(self.stratified_check)
+
+        # 异常检测：按类别分配（良好 / 异常 × 训练 / 验证 / 测试）
+        self.anomaly_card = self._build_anomaly_card()
+        layout.addWidget(self.anomaly_card)
 
         button_row = QHBoxLayout()
         button_row.setSpacing(6)
@@ -157,6 +170,132 @@ class SplitTab(QWidget):
         return side_column(
             self.list_card, self.setting_card, self.overview_card, width=300
         )
+
+    # -----------------------------------------------------------
+    # 异常检测：按类别分配表（参照 DLT 的创建拆分）
+    # -----------------------------------------------------------
+    def _build_anomaly_card(self) -> QWidget:
+        """良好 / 异常 × 训练 / 验证 / 测试 的数量与百分比。
+
+        异常图的「训练」格禁用：异常检测只用正常样本训练，异常图进验证 /
+        测试。约束用控件可用性表达，不写说明文字。
+        """
+        holder = QWidget(self.setting_card)
+        grid = QGridLayout(holder)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(4)
+        grid.setVerticalSpacing(4)
+
+        self.anomaly_titles: dict[str, StrongBodyLabel] = {}
+        for index, kind in enumerate(("normal", "abnormal")):
+            column = 1 + index * 2
+            title = StrongBodyLabel(_KIND_LABELS[kind], holder)
+            grid.addWidget(title, 0, column, 1, 2)
+            self.anomaly_titles[kind] = title
+            grid.addWidget(CaptionLabel("数量", holder), 1, column)
+            grid.addWidget(CaptionLabel("百分比", holder), 1, column + 1)
+
+        self.anomaly_spins: dict[tuple, QSpinBox] = {}
+        for row, sub in enumerate(("train", "val", "test")):
+            grid.addWidget(CaptionLabel(SPLIT_LABELS[sub], holder), 2 + row, 0)
+            for index, kind in enumerate(("normal", "abnormal")):
+                column = 1 + index * 2
+                editable = not (kind == "abnormal" and sub == "train")
+                count = QSpinBox(holder)
+                count.setRange(0, 999999)
+                # 侧栏只有 ~260px 可用：固定宽度，避免把卡片顶宽后被裁剪
+                count.setFixedWidth(52)
+                count.valueChanged.connect(
+                    lambda _v, k=kind, s=sub: self._on_anomaly_edited(k, s, "count")
+                )
+                grid.addWidget(count, 2 + row, column)
+                percent = QSpinBox(holder)
+                percent.setRange(0, 100)
+                percent.setFixedWidth(48)
+                percent.valueChanged.connect(
+                    lambda _v, k=kind, s=sub: self._on_anomaly_edited(
+                        k, s, "percent"
+                    )
+                )
+                grid.addWidget(percent, 2 + row, column + 1)
+                count.setEnabled(editable)
+                percent.setEnabled(editable)
+                self.anomaly_spins[(kind, sub, "count")] = count
+                self.anomaly_spins[(kind, sub, "percent")] = percent
+
+        self.anomaly_hint = CaptionLabel("", holder)
+        grid.addWidget(self.anomaly_hint, 5, 0, 1, 5)
+        return holder
+
+    def _refresh_anomaly_card(self) -> None:
+        """按任务显示：异常检测显示类别分配表，其余任务显示比例行。"""
+        is_anomaly = self._vm.is_anomaly()
+        for row in self.ratio_rows.values():
+            row.setVisible(not is_anomaly)
+        self.stratified_check.setVisible(not is_anomaly)
+        self.anomaly_card.setVisible(is_anomaly)
+        if not is_anomaly:
+            return
+        self._anomaly_totals = self._vm.anomaly_totals()
+        self._anomaly_plan = self._vm.anomaly_allocation()
+        for kind in ("normal", "abnormal"):
+            self.anomaly_titles[kind].setText(
+                f"{_KIND_LABELS[kind]} {int(self._anomaly_totals.get(kind, 0))}"
+            )
+        self.anomaly_hint.setText(
+            f"已标注 / 全部：{int(self._anomaly_totals.get('labeled', 0))} / "
+            f"{int(self._anomaly_totals.get('all', 0))}"
+        )
+        self._apply_anomaly_plan()
+
+    def _apply_anomaly_plan(self) -> None:
+        """把当前分配写回表格（期间屏蔽信号）。"""
+        self._syncing = True
+        try:
+            for kind in ("normal", "abnormal"):
+                total = int(self._anomaly_totals.get(kind, 0))
+                rows = self._anomaly_plan.get(kind) or {}
+                for sub in ("train", "val", "test"):
+                    value = int(rows.get(sub, 0))
+                    self.anomaly_spins[(kind, sub, "count")].setValue(value)
+                    self.anomaly_spins[(kind, sub, "percent")].setValue(
+                        int(round(value * 100 / total)) if total else 0
+                    )
+        finally:
+            self._syncing = False
+
+    def _rebalance(self, kind: str, changed: str, value: int) -> dict[str, int]:
+        """改一格后重排同类其余行，使行和恒等于该类图片数。"""
+        total = int(self._anomaly_totals.get(kind, 0))
+        if kind == "abnormal" and changed == "train":
+            value = 0
+        value = max(0, min(total, int(value)))
+        others = [sub for sub in ("train", "val", "test") if sub != changed]
+        if kind == "abnormal":
+            others = [sub for sub in others if sub != "train"]
+        current = self._anomaly_plan.get(kind) or {}
+        weights = {sub: max(0, int(current.get(sub, 0))) for sub in others}
+        if not any(weights.values()):
+            weights = {sub: 1 for sub in others}
+        sizes = DatasetService._proportional_sizes(total - value, weights)
+        rows = {sub: 0 for sub in ("train", "val", "test")}
+        rows[changed] = value
+        rows.update({sub: int(sizes.get(sub, 0)) for sub in others})
+        return rows
+
+    def _on_anomaly_edited(self, kind: str, sub: str, mode: str) -> None:
+        """改数量或百分比：同类其余行按比例吸收差额后写回拆分。"""
+        if self._syncing:
+            return
+        total = int(self._anomaly_totals.get(kind, 0))
+        if mode == "count":
+            value = int(self.anomaly_spins[(kind, sub, "count")].value())
+        else:
+            percent = int(self.anomaly_spins[(kind, sub, "percent")].value())
+            value = int(round(total * percent / 100))
+        self._anomaly_plan[kind] = self._rebalance(kind, sub, value)
+        self._apply_anomaly_plan()
+        self._vm.set_anomaly_allocation(self._anomaly_plan)
 
     def _build_main(self) -> QVBoxLayout:
         column = QVBoxLayout()
@@ -196,75 +335,7 @@ class SplitTab(QWidget):
         self.yaml_label.setWordWrap(True)
         output_layout.addWidget(self.yaml_label)
         column.addWidget(output_card)
-
-        column.addWidget(self._build_augment_card(), 1)
         return column
-
-    def _build_augment_card(self) -> CardWidget:
-        card = CardWidget(self)
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(16, 12, 16, 12)
-        layout.setSpacing(8)
-        layout.addWidget(StrongBodyLabel("数据增强", card))
-
-        self.aug_hint = CaptionLabel("", card)
-        layout.addWidget(self.aug_hint)
-
-        grid = QHBoxLayout()
-        grid.setSpacing(14)
-        self.aug_spins: dict[str, QDoubleSpinBox] = {}
-        specs = [
-            ("hflip", "水平翻转概率", 0.5, 0.0, 1.0, 0.05),
-            ("vflip", "垂直翻转概率", 0.0, 0.0, 1.0, 0.05),
-            ("rotate", "旋转角度上限", 15.0, 0.0, 180.0, 5.0),
-            ("scale", "缩放幅度", 0.1, 0.0, 1.0, 0.05),
-            ("brightness", "亮度幅度", 0.2, 0.0, 1.0, 0.05),
-            ("contrast", "对比度幅度", 0.2, 0.0, 1.0, 0.05),
-            ("noise", "高斯噪声概率", 0.0, 0.0, 1.0, 0.05),
-            ("blur", "高斯模糊概率", 0.0, 0.0, 1.0, 0.05),
-        ]
-        left = QVBoxLayout()
-        right = QVBoxLayout()
-        for index, (key, text, value, low, high, step) in enumerate(specs):
-            row = QHBoxLayout()
-            row.addWidget(CaptionLabel(text, card))
-            spin = QDoubleSpinBox(card)
-            spin.setRange(low, high)
-            spin.setSingleStep(step)
-            spin.setDecimals(2)
-            spin.setValue(value)
-            row.addWidget(spin, 1)
-            (left if index % 2 == 0 else right).addLayout(row)
-            self.aug_spins[key] = spin
-        grid.addLayout(left, 1)
-        grid.addLayout(right, 1)
-
-        copies_row = QHBoxLayout()
-        copies_row.addWidget(CaptionLabel("每张生成份数", card))
-        self.copies_spin = QSpinBox(card)
-        self.copies_spin.setRange(1, 20)
-        self.copies_spin.setValue(3)
-        copies_row.addWidget(self.copies_spin, 1)
-        grid.addLayout(copies_row, 1)
-        layout.addLayout(grid)
-
-        preview_row = QHBoxLayout()
-        preview_row.setSpacing(8)
-        self.preview_labels: list[QLabel] = []
-        for _ in range(4):
-            label = QLabel(card)
-            label.setFixedSize(96, 96)
-            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            label.setStyleSheet("background:#1B1B1B; border-radius:4px;")
-            preview_row.addWidget(label)
-            self.preview_labels.append(label)
-        preview_row.addStretch(1)
-        self.aug_preview_btn = PushButton("预览增强效果", card)
-        self.aug_apply_btn = PrimaryPushButton("生成增强样本", card)
-        preview_row.addWidget(self.aug_preview_btn)
-        preview_row.addWidget(self.aug_apply_btn)
-        layout.addLayout(preview_row)
-        return card
 
     # -----------------------------------------------------------
     # 绑定
@@ -274,8 +345,6 @@ class SplitTab(QWidget):
         self.preview_btn.clicked.connect(self._on_preview_clicked)
         self.apply_btn.clicked.connect(self._on_apply)
         self.name_edit.editingFinished.connect(self._on_name_changed)
-        self.aug_preview_btn.clicked.connect(self._on_aug_preview)
-        self.aug_apply_btn.clicked.connect(self._on_aug_apply)
 
         self._vm.datasetChanged.connect(lambda _d: self.refresh())
         self._vm.taskFinished.connect(lambda _t: self.refresh())
@@ -296,7 +365,12 @@ class SplitTab(QWidget):
             self.seed_spin.setValue(int(dataset.seed))
             self.stratified_check.setChecked(bool(dataset.stratified))
             self.output_label.setText(f"输出目录：{dataset.output_path or '—'}")
-            self.yaml_label.setText(f"数据集配置：{dataset.data_yaml or '—'}")
+            # 分类 / 异常检测以目录本体作为数据集，不存在 data.yaml
+            yaml_path = str(dataset.data_yaml or "")
+            has_yaml = bool(yaml_path) and not Path(yaml_path).is_dir()
+            self.yaml_label.setText(
+                f"数据集配置：{yaml_path}" if has_yaml else "数据集配置：—"
+            )
         else:
             self.output_label.setText("输出目录：—")
             self.yaml_label.setText("数据集配置：—")
@@ -306,6 +380,7 @@ class SplitTab(QWidget):
         self._refresh_splits()
         self._apply_lock_state()
         self._refresh_preview()
+        self._refresh_anomaly_card()
 
     # -----------------------------------------------------------
     # 拆分列表（一个项目可有多套）
@@ -465,61 +540,3 @@ class SplitTab(QWidget):
             f"{self.ratio_spins['test'].value()} 执行拆分…"
         )
         self._vm.apply_split()
-
-    # -----------------------------------------------------------
-    # 数据增强
-    # -----------------------------------------------------------
-    def _augment_config(self) -> AugmentConfig:
-        return AugmentConfig(
-            hflip=self.aug_spins["hflip"].value(),
-            vflip=self.aug_spins["vflip"].value(),
-            rotate=self.aug_spins["rotate"].value(),
-            scale=self.aug_spins["scale"].value(),
-            brightness=self.aug_spins["brightness"].value(),
-            contrast=self.aug_spins["contrast"].value(),
-            noise=self.aug_spins["noise"].value(),
-            blur=self.aug_spins["blur"].value(),
-            copies=self.copies_spin.value(),
-        )
-
-    def _on_aug_preview(self) -> None:
-        if not AugmentService.is_available():
-            self.aug_hint.setText("未安装 Albumentations")
-            self._vm.notify("未安装 Albumentations，无法预览增强", "error")
-            return
-        arrays = self._vm.augment_preview(self._augment_config(), count=4)
-        if not arrays:
-            self.aug_hint.setText("没有已标注的图片")
-            self._vm.notify("没有已标注的图片，无法预览增强", "warning")
-            return
-        for index, label in enumerate(self.preview_labels):
-            if index < len(arrays):
-                label.setPixmap(self._to_pixmap(arrays[index], 92))
-            else:
-                label.clear()
-        self.aug_hint.setText(f"已生成 {len(arrays)} 张预览")
-        self._vm.notify(f"已生成 {len(arrays)} 张增强预览")
-
-    def _on_aug_apply(self) -> None:
-        if not AugmentService.is_available():
-            self.aug_hint.setText("未安装 Albumentations")
-            self._vm.notify("未安装 Albumentations，无法执行增强", "error")
-            return
-        if self._vm.split_layout() == "classify":
-            self.aug_hint.setText("分类任务不支持离线增强")
-            self._vm.notify("分类任务不支持离线增强", "warning")
-            return
-        self._vm.augment_apply(self._augment_config())
-
-    @staticmethod
-    def _to_pixmap(array, size: int) -> QPixmap:
-        height, width, channels = array.shape
-        image = QImage(
-            array.data, width, height, channels * width,
-            QImage.Format.Format_RGB888,
-        )
-        return QPixmap.fromImage(image.copy()).scaled(
-            size, size,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )

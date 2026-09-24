@@ -13,16 +13,15 @@ from src.models.split import Split
 from src.services.annotation_service import AnnotationService
 from src.services.category_service import CategoryService
 from src.services.quality_service import QualityService
-from src.services.augment_service import AugmentService
 from src.services.dataset_service import DatasetService
 from src.services.project_service import ProjectService
 from src.utils.constants import (
     COVER_ENTRY_NAME,
-    DEFAULT_AUGMENT_NAME,
     DEFAULT_SPLIT_NAME,
     IMAGE_EXTS,
     LABEL_EXTS,
     SPLIT_LABELS,
+    SPLIT_SUBDIRS,
     UNLABELED_LABEL,
 )
 from src.utils.logger import get_logger
@@ -226,17 +225,20 @@ class DatasetViewModel(QObject):
                 overrides[self._relative_key(image, merged_roots)] = name
                 if name:
                     applied[name] = applied.get(name, 0) + 1
-            # 类别体系里没有的先建类，保证「已标注」判定与类别列表自洽
+            # 类别体系里没有的先建类，保证「已标注」判定与类别列表自洽；
+            # 颜色由 CategoryService 按名称语义 / 类别类型初始化（已有类不改）
             for name in applied:
                 if not any(str(cls.name) == name for cls in project.classes):
-                    CategoryService.add(project.classes, name)
+                    CategoryService.add(
+                        project.classes, name, kind=kinds.get(name, "")
+                    )
         # 异常检测的类别类型（良好 / 异常）：良好与异常下都可以有多个类别
         for name, kind in kinds.items():
             target = next(
                 (cls for cls in project.classes if str(cls.name) == name), None
             )
             if target is None:
-                target = CategoryService.add(project.classes, name)
+                target = CategoryService.add(project.classes, name, kind=kind)
             CategoryService.set_kind(project.classes, target.cls_id, kind)
 
         # 5) 合并顺序：新图片追加到图库末尾
@@ -477,6 +479,7 @@ class DatasetViewModel(QObject):
         project.training.split_name = split.name
         if split.data_yaml:
             project.training.data_yaml = split.data_yaml
+        self._sync_anomaly_root(split)
         project.touch()
         self._mirror_split(split)
         self._emit_splits()
@@ -556,6 +559,8 @@ class DatasetViewModel(QObject):
         ]
         if project.active_split_id == split.split_id:
             project.active_split_id = project.splits[0].split_id
+            # 当前拆分换人后同步兼容副本，避免界面残留已删除的拆分名
+            project.params["split_name"] = project.splits[0].name
         project.touch()
         self._mirror_split(project.active_split())
         self._emit_splits()
@@ -674,6 +679,8 @@ class DatasetViewModel(QObject):
         # 图库可能由多个文件夹累加而成，划分按界面上看到的图片清单进行
         library = self.images()
         label_index = self.label_index()
+        # 异常检测：按「良好 / 异常」分配，训练集只放良好图
+        kinds, counts = self._anomaly_inputs()
 
         # 预检查：验证集为空时后端会直接失败（val=None），这里提前拦住
         try:
@@ -684,13 +691,16 @@ class DatasetViewModel(QObject):
                 seed=self._dataset.seed,
                 stratified=self._dataset.stratified,
                 layout=layout,
+                kinds=kinds,
+                counts=counts,
             )
         except (OSError, ValueError):
             buckets = {}
         if buckets and (not buckets["train"] or not buckets["val"]):
             self.message.emit(
                 "warning",
-                "验证集为空，请调整拆分比例或增加图片",
+                "训练集或验证集为空，请调整分配数量或增加图片"
+                if kinds else "验证集为空，请调整拆分比例或增加图片",
             )
             return
         try:
@@ -698,6 +708,7 @@ class DatasetViewModel(QObject):
                 source, out_dir,
                 split=split, stratified=self._dataset.stratified, layout=layout,
                 images=library, label_index=label_index,
+                kinds=kinds, counts=counts,
             )
             if stats["total"] == 0:
                 self.message.emit("warning", "来源目录中未找到图片")
@@ -707,6 +718,11 @@ class DatasetViewModel(QObject):
                 # 分类任务：Ultralytics 直接以数据集目录作为 --data，按子目录扫描
                 classes = list(self._service.child_class_dirs_multi(self._source_roots()))
                 config_path: Path = out_dir
+            elif layout == "anomaly_folder":
+                # 异常检测没有 YAML：产物目录本身即数据集
+                # （normal / normal_test / abnormal，Anomalib Folder 约定）
+                classes = []
+                config_path = out_dir
             else:
                 classes = self._service.load_class_names(source)
                 if not classes:
@@ -721,6 +737,8 @@ class DatasetViewModel(QObject):
             if split is not None:
                 split.layout = layout
                 split.mark_generated(out_dir, config_path, stats, classes)
+                # 异常检测：训练数据目录指向本拆分产物，训练 / 评估直接用这一套
+                self._sync_anomaly_root(split)
             self._dataset.output_path = str(out_dir)
             self._dataset.data_yaml = str(config_path)
             self._dataset.class_names = classes
@@ -787,8 +805,12 @@ class DatasetViewModel(QObject):
             self._dataset = dataset
         if project is not None:
             # 旧项目没有拆分列表：这里补一套出来，并让界面按当前拆分显示
-            project.ensure_splits(self.split_layout())
-            self._mirror_split(project.active_split())
+            split = project.ensure_splits(self.split_layout())
+            # 兼容副本「当前拆分名」跟随模型：副本过期时，凡按下沉字段显示的
+            # 位置都会残留上一次的拆分名（如删除当前拆分后未同步）
+            if split is not None:
+                project.params["split_name"] = split.name
+            self._mirror_split(split)
             self.splitsChanged.emit(self.splits_ready())
         self.datasetChanged.emit(self._dataset)
 
@@ -882,75 +904,11 @@ class DatasetViewModel(QObject):
         self.datasetChanged.emit(None)
 
     # -----------------------------------------------------------
-    # 数据增强
+    # 后台任务状态
     # -----------------------------------------------------------
     def is_busy(self) -> bool:
         """是否有后台任务在运行。"""
         return self._worker is not None and self._worker.isRunning()
-
-    def augment_preview(self, config, count: int = 6) -> list:
-        """对第一张「已标注」图片生成增强预览（RGB 数组列表）。"""
-        if not AugmentService.is_available():
-            self.message.emit("error", "未安装 Albumentations，无法预览")
-            return []
-        images = self.images()
-        if not images:
-            self.message.emit("warning", "请先导入数据集")
-            return []
-
-        label_index = self.source_label_index()
-        for image in images:
-            label = label_index.get(image.stem)
-            if label is None:
-                continue
-            width, height = AnnotationService.image_size(image)
-            annotation = AnnotationService.load_yolo(label, width, height)
-            if not annotation.items:
-                continue
-            return AugmentService.preview(image, annotation.items, config, count)
-
-        self.message.emit("warning", "没有找到已标注的图片")
-        return []
-
-    def augment_apply(self, config) -> None:
-        """离线增强：为已标注图片生成增强副本并归档进项目。"""
-        if self.is_busy():
-            self.message.emit("warning", "已有任务在运行")
-            return
-        if not AugmentService.is_available():
-            self.message.emit("error", "未安装 Albumentations，无法执行增强")
-            return
-        images = self.images()
-        if not images:
-            self.message.emit("warning", "请先导入数据集")
-            return
-        project = self._project_vm.project if self._project_vm else None
-        if project is None:
-            self.message.emit("warning", "请先创建或打开项目")
-            return
-
-        label_index = self.source_label_index()
-        mprj = Path(project.params.get("path", ""))
-        out_dir = ProjectService.project_dir(mprj) / DEFAULT_AUGMENT_NAME
-
-        def job(progress, is_cancelled):
-            stats = AugmentService.augment_dataset(
-                images, label_index, out_dir, config,
-                progress=progress, is_cancelled=is_cancelled,
-            )
-            if not is_cancelled() and stats["written"]:
-                items = self._collect_archive_items(out_dir, prefix="augment")
-                self._project_vm.service.add_files(project, items, save=True)
-            return stats
-
-        def done(stats):
-            self._project_vm.notify_changed()
-            self.message.emit(
-                "success",
-                f"增强完成：新增 {stats['written']} 张，跳过 {stats['skipped']} 张",
-            )
-
-        self._start_worker(job, "数据增强", on_done=done)
 
     # -----------------------------------------------------------
     # 质检辅助
@@ -1300,6 +1258,7 @@ class DatasetViewModel(QObject):
 
         marker = {"train": "T", "val": "V", "test": "E"}
         layout = self.split_layout()
+        kinds, counts = self._anomaly_inputs()
         try:
             buckets = DatasetService.split_members(
                 images,
@@ -1312,6 +1271,8 @@ class DatasetViewModel(QObject):
                 seed=self._dataset.seed,
                 stratified=self._dataset.stratified,
                 layout=layout,
+                kinds=kinds,
+                counts=counts,
             )
         except (OSError, ValueError) as exc:
             logger.warning("计算子集归属失败: %s", exc)
@@ -1579,11 +1540,149 @@ class DatasetViewModel(QObject):
         return counts
 
     def split_name_label(self) -> str:
-        """当前使用的拆分名称（拆分映射下拉框显示用）。"""
+        """当前使用的拆分名称（拆分映射下拉框显示用）。
+
+        与 :meth:`split_name` 同源，都以模型中的当前拆分为准；
+        ``params["split_name"]`` 只是兼容旧项目的下沉副本，不作为显示依据
+        ——副本过期时图库会显示上一次的拆分名，与数据拆分页对不上。
+        """
+        return self.split_name()
+
+    # -----------------------------------------------------------
+    # 异常检测：按类别分配（良好 / 异常）
+    # -----------------------------------------------------------
+    def _class_kind(self, name: str) -> str:
+        """类别的类型（normal / abnormal，"" 为未指定）。"""
         project = self._project_vm.project if self._project_vm else None
-        return str(
-            (project.params.get("split_name") if project is not None else "") or ""
-        ).strip() or DEFAULT_SPLIT_NAME
+        if project is None:
+            return ""
+        for cls in project.classes:
+            if str(cls.name) == str(name):
+                return str(getattr(cls, "kind", "") or "")
+        return ""
+
+    def anomaly_kinds(self) -> dict[str, str]:
+        """每张图片的类别归属：normal / abnormal（未标注的图片不在其中）。
+
+        类别类型取自项目类别表（导入弹窗按文件夹指定）；类别类型未指定的
+        按「良好」处理——导入弹窗的默认值就是「良好」，无类别的图片不参与
+        分配（与 DLT 的「已标注 / 全部」一致）。
+        """
+        kinds: dict[str, str] = {}
+        for image in self.images():
+            name = self.image_class(image)
+            if not name:
+                continue
+            kind = self._class_kind(name)
+            kinds[str(image)] = kind if kind == "abnormal" else "normal"
+        return kinds
+
+    def anomaly_totals(self) -> dict[str, int]:
+        """分配的分母：各类别图片数与「已标注 / 全部」。"""
+        images = self.images()
+        kinds = self.anomaly_kinds()
+        normal = sum(1 for kind in kinds.values() if kind == "normal")
+        abnormal = sum(1 for kind in kinds.values() if kind == "abnormal")
+        return {
+            "normal": normal,
+            "abnormal": abnormal,
+            "labeled": normal + abnormal,
+            "all": len(images),
+        }
+
+    def anomaly_allocation(self) -> dict[str, dict[str, int]]:
+        """当前拆分按类别的分配数量（行和恒等于该类图片数）。
+
+        未配置过时给一份按当前比例的建议值；异常图的训练数量恒为 0
+        （异常检测只用正常样本训练，异常图进验证 / 测试）。
+        """
+        stored = getattr(self.active_split(), "anomaly_counts", None) or {}
+        totals = self.anomaly_totals()
+        dataset = self._dataset
+        ratio = (
+            dataset.split_train, dataset.split_val, dataset.split_test
+        ) if dataset is not None else (0.7, 0.2, 0.1)
+        plan: dict[str, dict[str, int]] = {}
+        for kind in ("normal", "abnormal"):
+            weights = {
+                sub: max(0, int((stored.get(kind) or {}).get(sub, 0)))
+                for sub in SPLIT_SUBDIRS
+            }
+            if not any(weights.values()):
+                weights = {
+                    sub: max(0, round(float(ratio[index]) * 1000))
+                    for index, sub in enumerate(SPLIT_SUBDIRS)
+                }
+            if kind == "abnormal":
+                weights["train"] = 0
+            sizes = DatasetService._proportional_sizes(
+                int(totals.get(kind, 0)), weights
+            )
+            plan[kind] = {sub: int(sizes.get(sub, 0)) for sub in SPLIT_SUBDIRS}
+        return plan
+
+    def set_anomaly_allocation(self, plan: dict) -> None:
+        """保存按类别的分配数量到当前拆分，并让比例字段跟随分配结果。"""
+        split = self.active_split()
+        project = self._project_vm.project if self._project_vm else None
+        if split is None or project is None:
+            return
+        stored: dict[str, dict[str, int]] = {}
+        for kind in ("normal", "abnormal"):
+            rows = (plan or {}).get(kind) or {}
+            stored[kind] = {
+                sub: max(0, int(rows.get(sub, 0))) for sub in SPLIT_SUBDIRS
+            }
+        stored["abnormal"]["train"] = 0        # 训练集只放良好图
+        split.anomaly_counts = stored
+
+        total = sum(sum(rows.values()) for rows in stored.values())
+        shares = {
+            sub: sum(rows[sub] for rows in stored.values()) / total if total else 0.0
+            for sub in SPLIT_SUBDIRS
+        }
+        split.train, split.val, split.test = (
+            shares["train"], shares["val"], shares["test"]
+        )
+        if self._dataset is not None:
+            self._dataset.split_train = shares["train"]
+            self._dataset.split_val = shares["val"]
+            self._dataset.split_test = shares["test"]
+        project.touch()
+        self._subsets = None
+        self._emit_splits()
+
+    def _sync_anomaly_root(self, split) -> None:
+        """异常检测：训练数据目录跟随当前拆分产物。
+
+        用户自选的外部目录（不属于本项目的任何拆分产物）保持不动；
+        空值或指向本项目其它拆分产物时，改用当前拆分的产物目录。
+        """
+        project = self._project_vm.project if self._project_vm else None
+        if project is None or split is None or not self.is_anomaly():
+            return
+        out_dir = str(getattr(split, "output_dir", "") or "").strip()
+        if not out_dir:
+            return
+        known = {
+            str(item.output_dir).strip()
+            for item in project.splits
+            if str(getattr(item, "output_dir", "") or "").strip()
+        }
+        current = str(getattr(project.training, "anomaly_root", "") or "").strip()
+        if current and current not in known:
+            return
+        project.training.anomaly_root = out_dir
+
+    def _anomaly_inputs(self) -> tuple[dict | None, dict | None]:
+        """异常检测的分配输入（其余任务返回 (None, None)，走比例分配）。"""
+        if not self.is_anomaly():
+            return None, None
+        kinds = self.anomaly_kinds()
+        if not kinds:
+            return None, None
+        plan = self.anomaly_allocation()
+        return kinds, {kind: dict(rows) for kind, rows in plan.items()}
 
     def split_locked(self) -> bool:
         """当前拆分是否已被训练使用（使用后不再改比例）。"""
@@ -2085,13 +2184,13 @@ class DatasetViewModel(QObject):
     def split_layout(self) -> str:
         """按项目类型返回数据集结构（声明在任务注册表）。
 
-        已实现四种：分类（目录结构）、检测（images / labels）、OCR（检测结构
-        + det / rec 产物）、语义分割（images + masks）；异常检测的
-        normal / abnormal 结构待后续阶段接入，未实现的一律回退为检测结构。
+        已实现五种：分类（目录结构）、检测（images / labels）、OCR（检测结构
+        + det / rec 产物）、语义分割（images + masks）、异常检测
+        （normal / normal_test / abnormal）；未实现的一律回退为检测结构。
         """
         project = self._project_vm.project if self._project_vm else None
         layout = dataset_layout(project.model_type) if project is not None else "detect"
-        if layout in ("classify", "ocr_det_rec", "mask"):
+        if layout in ("classify", "ocr_det_rec", "mask", "anomaly_folder"):
             return layout
         return "detect"
 
@@ -2101,6 +2200,7 @@ class DatasetViewModel(QObject):
         if not images or self._dataset is None:
             return {}
         layout = self.split_layout()
+        kinds, counts = self._anomaly_inputs()
         try:
             return DatasetService.preview_split(
                 self.resolved_source(),
@@ -2114,6 +2214,8 @@ class DatasetViewModel(QObject):
                 layout=layout,
                 images=images,
                 label_index={} if layout == "classify" else self.label_index(),
+                kinds=kinds,
+                counts=counts,
             )
         except (OSError, ValueError) as exc:
             logger.warning("划分预览失败: %s", exc)

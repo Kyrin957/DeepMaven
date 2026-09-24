@@ -987,6 +987,8 @@ class TrainTab(QWidget):
                 self._syncing = False
 
         if config.task_type == "anomaly":
+            # 数据目录跟随当前拆分（拆分切换 / 重新划分后同步显示）
+            self.anomaly_edit.setText(str(config.anomaly_root or ""))
             self.data_label.setText(config.anomaly_root or "未选择")
             self.pie.set_data([], "")
             self.legend.set_data([])

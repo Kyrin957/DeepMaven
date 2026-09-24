@@ -349,6 +349,10 @@ class ExportTab(QWidget):
         index = self.record_combo.findData(weights)
         self.record_combo.setCurrentIndex(index if index >= 0 else 0)
 
+    def refresh_splits(self) -> None:
+        """拆分列表变化后重取拆分概览（主窗口在 splitsChanged 时调用）。"""
+        self._refresh_overview()
+
     def _refresh_overview(self) -> None:
         """拆分与评估概览。"""
         split = self._vm.split_summary()

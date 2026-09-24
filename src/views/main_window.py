@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMenuBar,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -322,6 +323,18 @@ class MainWindow(FluentWindow):
         """数据集划分完成后，把 data.yaml 交给训练页。"""
         self.train_vm.update_config(data_yaml=yaml_path)
 
+    def _on_splits_changed(self, _rows) -> None:
+        """拆分变化：刷新用到拆分的页面。
+
+        图库 / 拆分 / 训练页各自订阅了数据侧信号，此处只补评估与导出两页
+        ——它们的拆分下拉与拆分概览不会因拆分增删而自发重取。
+        """
+        try:
+            self.evaluate_tab.refresh_splits()
+            self.export_tab.refresh_splits()
+        except Exception as exc:  # noqa: BLE001 - 单页刷新失败不应中断流程
+            logger.warning("刷新拆分相关页面失败: %s", exc)
+
     def _open_in_annotator(self, path: str) -> None:
         """从图库跳转到标注页，并定位到指定图片。"""
         index = self.annotate_vm.set_image_by_path(path)
@@ -405,9 +418,20 @@ class MainWindow(FluentWindow):
         self._add_page(PAGE_EXPORT, self.export_tab, FluentIcon.DOWNLOAD, "模型导出")
 
     def _add_page(self, key: str, page: QWidget, icon, title: str) -> None:
-        """注册一个导航页并记录 key（供按任务的页面门控使用）。"""
+        """注册一个导航页并记录 key（供按任务的页面门控使用）。
+
+        页面的**最小高度会沿布局层层累加到窗口**（标注 / 评估页内容即有
+        900~1000px）。一旦超过屏幕可用高度，放大时窗口会被撑得比屏幕还
+        高、顶部标题栏被顶出可视区。这里把页面的尺寸策略设为 Ignored，
+        使其不再向窗口传导最小尺寸：窗口只服从 setMinimumSize(1080, 680)，
+        页面放不下时由各页自身的滚动区承担
+        （侧栏见 views/data_widgets.py::side_column）。
+        """
         self._pages[key] = page
         self._page_titles[key] = title
+        page.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored
+        )
         self._nav_items[key] = self.addSubInterface(
             page, icon, title, position=NavigationItemPosition.TOP,
         )
@@ -624,6 +648,8 @@ class MainWindow(FluentWindow):
         self.project_vm.projectChanged.connect(self._on_project_loaded)
         # 数据集划分完成后，把 data.yaml 交给训练页
         self.dataset_vm.datasetReady.connect(self._on_dataset_ready)
+        # 拆分列表变化（新建 / 删除 / 改名 / 切换）后，用到拆分的页面重取数据
+        self.dataset_vm.splitsChanged.connect(self._on_splits_changed)
         # 图库双击图片 → 切到标注页并定位到该图片
         self.gallery_tab.requestAnnotate.connect(self._open_in_annotator)
         # 新建项目时若带数据集目录，直接导入图库

@@ -8,10 +8,12 @@ from __future__ import annotations
 
 from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtWidgets import (
+    QFrame,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
@@ -495,14 +497,29 @@ class SectionLabel(CaptionLabel):
         self.setFont(font)
 
 
-def side_column(*widgets, width: int = 268) -> QWidget:
-    """把若干面板竖排为一个固定宽度的侧栏。"""
-    container = QWidget()
-    container.setFixedWidth(width)
-    layout = QVBoxLayout(container)
+def side_column(*widgets, width: int = 268) -> QScrollArea:
+    """把若干面板竖排为一个固定宽度的侧栏。
+
+    卡片的**最小高度会沿布局向上累积**：竖排 5 张卡片即有 ~1000px 的
+    最小高度，会一路顶到主窗口，使窗口的最小高度超过屏幕可用高度，
+    进而导致放大后窗口比屏幕还高、顶部标题栏被顶出可视区。
+    因此侧栏内容放进滚动区，高度不足时自身滚动，最小高度不外传。
+    """
+    content = QWidget()
+    layout = QVBoxLayout(content)
     layout.setContentsMargins(0, 0, 0, 0)
     layout.setSpacing(10)
     for widget in widgets:
         layout.addWidget(widget)
     layout.addStretch(1)
-    return container
+
+    scroll = QScrollArea()
+    scroll.setFixedWidth(width)
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QFrame.Shape.NoFrame)
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+    scroll.viewport().setAutoFillBackground(False)
+    scroll.setWidget(content)
+    return scroll

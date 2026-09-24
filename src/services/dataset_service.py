@@ -10,6 +10,8 @@ from pathlib import Path
 
 from src.models.dataset import Dataset
 from src.utils.constants import (
+    ANOMALY_ABNORMAL_DIR,
+    ANOMALY_NORMAL_DIR,
     IMAGE_EXTS,
     LABEL_EXTS,
     SPLIT_SUBDIRS,
@@ -470,11 +472,19 @@ class DatasetService:
         seed: int = 0,
         stratified: bool = True,
         layout: str = "detect",
+        kinds: dict | None = None,
+        counts: dict | None = None,
     ) -> dict[str, list[Path]]:
         """把图片分配到 train / val / test。
 
         stratified=True 时按分组键分层抽样，避免小类别整体落进同一子集；
         样本数少于 3 的组整体归入训练集，避免验证集出现单样本噪声。
+
+        Args:
+            kinds: 异常检测的「图片 → 类别」表（``str(图片)`` → normal /
+                abnormal）；给出时改按类别分配（见 `_allocate_by_kind`），
+                训练集只放良好图。
+            counts: 按类别指定的各子集数量（`Split.anomaly_counts`）。
         """
         import random
 
@@ -483,6 +493,11 @@ class DatasetService:
         items = [Path(p) for p in images]
         if not items:
             return buckets
+
+        if kinds:
+            return DatasetService._allocate_by_kind(
+                items, kinds, counts or {}, split, seed
+            )
 
         if not stratified:
             rng.shuffle(items)
@@ -521,6 +536,70 @@ class DatasetService:
         return buckets
 
     @staticmethod
+    def _proportional_sizes(total: int, weights: dict) -> dict[str, int]:
+        """按权重把 ``total`` 拆成整数份（最大余数法，结果确定且合计等于 total）。"""
+        cleaned = {key: max(0, int(value)) for key, value in weights.items()}
+        span = sum(cleaned.values())
+        if total <= 0 or span <= 0:
+            return {key: 0 for key in cleaned}
+        exact = {key: total * value / span for key, value in cleaned.items()}
+        sizes = {key: int(value) for key, value in exact.items()}
+        # 余数按「小数部分从大到小、同值按键名」补，保证与图片顺序无关
+        order = sorted(exact, key=lambda key: (-(exact[key] - sizes[key]), key))
+        for index in range(total - sum(sizes.values())):
+            sizes[order[index % len(order)]] += 1
+        return sizes
+
+    @staticmethod
+    def _allocate_by_kind(
+        images: list[Path],
+        kinds: dict,
+        counts: dict,
+        split: tuple[float, float, float],
+        seed: int,
+    ) -> dict[str, list[Path]]:
+        """异常检测的分配：良好的训练图 + 异常的验证 / 测试图。
+
+        约定（与异常检测「只用正常样本训练」一致）：
+            * 训练集**只放良好图**，异常图一律进验证 / 测试；
+            * 未标注（拿不到类别）的图片不参与分配；
+            * ``counts`` 按权重使用：与实际图片数不一致时按比例归一化，
+              图片增删后既不丢图，也不会把异常图挤进训练集。
+        """
+        import random
+
+        rng = random.Random(seed)
+        buckets: dict[str, list[Path]] = {sub: [] for sub in SPLIT_SUBDIRS}
+        pools: dict[str, list[Path]] = {"normal": [], "abnormal": []}
+        for image in images:
+            kind = str(kinds.get(str(image), ""))
+            if kind in pools:
+                pools[kind].append(image)
+
+        for kind, members in pools.items():
+            if not members:
+                continue
+            rng.shuffle(members)
+            weights = {
+                sub: max(0, int((counts.get(kind) or {}).get(sub, 0)))
+                for sub in SPLIT_SUBDIRS
+            }
+            if not any(weights.values()):
+                # 未配置：按当前比例分配（异常图的比例去掉训练集后归一化）
+                weights = {
+                    sub: max(0, round(float(split[index]) * 1000))
+                    for index, sub in enumerate(SPLIT_SUBDIRS)
+                }
+            if kind == "abnormal":
+                weights["train"] = 0
+            sizes = DatasetService._proportional_sizes(len(members), weights)
+            cursor = 0
+            for sub in SPLIT_SUBDIRS:
+                buckets[sub].extend(members[cursor:cursor + sizes[sub]])
+                cursor += sizes[sub]
+        return buckets
+
+    @staticmethod
     def split_dataset(
         source_dir: str | Path,
         target_dir: str | Path,
@@ -530,6 +609,8 @@ class DatasetService:
         layout: str = "detect",
         images: list | None = None,
         label_index: dict | None = None,
+        kinds: dict | None = None,
+        counts: dict | None = None,
     ) -> dict:
         """把图片（及同名标签）复制为可训练的 YOLO 数据集结构。
 
@@ -565,6 +646,46 @@ class DatasetService:
         }
         if not images:
             logger.warning("无图片可划分: %s", source)
+            return stats
+
+        if layout == "anomaly_folder":
+            # 异常检测：产物即 Anomalib Folder 结构——
+            #   normal/       训练良好图（只用正常样本拟合）
+            #   normal_test/  验证 + 测试的良好图（评估用）
+            #   abnormal/     验证 + 测试的异常图（评估用）
+            buckets = DatasetService.split_members(
+                images, {}, split=split, seed=seed,
+                stratified=stratified, layout=layout,
+                kinds=kinds, counts=counts,
+            )
+            eval_members = buckets["val"] + buckets["test"]
+            layout_dirs = {
+                ANOMALY_NORMAL_DIR: list(buckets["train"]),
+                f"{ANOMALY_NORMAL_DIR}_test": [
+                    img for img in eval_members
+                    if str((kinds or {}).get(str(img), "")) != "abnormal"
+                ],
+                ANOMALY_ABNORMAL_DIR: [
+                    img for img in eval_members
+                    if str((kinds or {}).get(str(img), "")) == "abnormal"
+                ],
+            }
+            for name, members in layout_dirs.items():
+                folder = target / name
+                folder.mkdir(parents=True, exist_ok=True)
+                for img in members:
+                    DatasetService._count_place(stats, img, folder / img.name)
+            # 统计仍按 train / val / test 记（与拆分页的分配一致），
+            # 便于拆分列表、占比图与导出页沿用同一套口径
+            for sub in SPLIT_SUBDIRS:
+                stats[sub] = len(buckets[sub])
+            stats["files"] = sum(len(items) for items in layout_dirs.values())
+            logger.info(
+                "异常检测数据集划分完成 normal=%s normal_test=%s abnormal=%s",
+                len(layout_dirs[ANOMALY_NORMAL_DIR]),
+                len(layout_dirs[f"{ANOMALY_NORMAL_DIR}_test"]),
+                len(layout_dirs[ANOMALY_ABNORMAL_DIR]),
+            )
             return stats
 
         if layout == "classify":
@@ -626,6 +747,7 @@ class DatasetService:
         buckets = DatasetService.split_members(
             images, label_index, split=split, seed=seed,
             stratified=stratified, layout=layout,
+            kinds=kinds, counts=counts,
         )
 
         for sub in SPLIT_SUBDIRS:
@@ -890,6 +1012,8 @@ class DatasetService:
         layout: str = "detect",
         images: list | None = None,
         label_index: dict | None = None,
+        kinds: dict | None = None,
+        counts: dict | None = None,
     ) -> dict:
         """**不落盘**地计算划分结果，供界面预览（拆分页的饼图与类别分布）。
 
@@ -923,6 +1047,7 @@ class DatasetService:
         buckets = DatasetService.split_members(
             images, label_index, split=split, seed=seed,
             stratified=stratified, layout=layout,
+            kinds=kinds, counts=counts,
         )
 
         per_class: dict[str, dict] = {}

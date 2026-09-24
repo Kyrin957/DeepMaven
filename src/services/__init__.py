@@ -13,7 +13,6 @@ from .category_service import CategoryService
 from .quality_service import QualityService
 from .annotation_service import AnnotationService
 from .autolabel_service import AutoLabelService
-from .augment_service import AugmentConfig, AugmentService
 from .train_service import TrainService
 from .inference_service import InferenceService
 from .report_service import ReportService
@@ -28,8 +27,6 @@ __all__ = [
     "QualityService",
     "AnnotationService",
     "AutoLabelService",
-    "AugmentService",
-    "AugmentConfig",
     "TrainService",
     "InferenceService",
     "ReportService",

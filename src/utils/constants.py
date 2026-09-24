@@ -116,8 +116,6 @@ SPLIT_SUBDIRS = ["train", "val", "test"]
 
 # 划分产物（Ultralytics 数据集目录）的默认目录名
 DEFAULT_SPLIT_NAME = "dataset"
-# 数据增强产物目录名
-DEFAULT_AUGMENT_NAME = "augment"
 # 未标注图片在类别统计中的显示名
 UNLABELED_LABEL = "未标注"
 

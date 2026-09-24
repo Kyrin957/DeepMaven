@@ -58,7 +58,7 @@ LAYOUT_DETECT = "detect"
 LAYOUT_CLASSIFY = "classify"
 LAYOUT_MASK = "mask"                    # 语义分割：像素掩码 PNG（第 4 期）
 LAYOUT_OCR = "ocr_det_rec"              # OCR：检测框 + 转写（第 3 期）
-LAYOUT_ANOMALY = "anomaly_folder"       # 异常：normal / abnormal（第 4 期）
+LAYOUT_ANOMALY = "anomaly_folder"       # 异常：normal / normal_test / abnormal
 
 # ---------------------------------------------------------------
 # 评估结果视图（评估页右栏结果卡片标识）
@@ -166,8 +166,9 @@ _TASKS: tuple[TaskSpec, ...] = (
         annotation=ANNOTATION_NONE,
         model_suffix="",
         backends=(BACKEND_ANOMALIB,),
-        # 第 4 期改为 LAYOUT_ANOMALY：拆分页目前仍按检测结构落盘
-        dataset_layout=LAYOUT_DETECT,
+        # 拆分产物即 Anomalib Folder 结构：normal（训练良好图）/
+        # normal_test（评估良好图）/ abnormal（评估异常图），训练直接用拆分目录
+        dataset_layout=LAYOUT_ANOMALY,
         metrics=ANOMALY_METRICS,
         eval_views=(VIEW_ANOMALY,),
         export_formats=(),                 # 第 2 期：backbone + 记忆库「模型包」

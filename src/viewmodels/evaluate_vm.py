@@ -12,7 +12,12 @@ from src.services.evaluation_service import EvaluationService
 from src.services.inference_service import InferenceService
 from src.services.report_service import ReportService
 from src.services.segmentation_service import SegmentationService
-from src.utils.constants import DATA_DIR, SPLIT_LABELS
+from src.utils.constants import (
+    ANOMALY_ABNORMAL_DIR,
+    ANOMALY_NORMAL_DIR,
+    DATA_DIR,
+    SPLIT_LABELS,
+)
 from src.utils.image_ops import overlay_heatmap
 from src.utils.logger import get_logger
 from src.utils.tasks import eval_views as _eval_views
@@ -884,6 +889,23 @@ class EvaluateViewModel(QObject):
             rng.sample(list(pairs), int(limit)), key=lambda item: str(item[0])
         )
 
+    @staticmethod
+    def anomaly_eval_sources(root: Path) -> list[Path]:
+        """异常检测评估的数据源。
+
+        拆分产物是 Anomalib Folder 结构（含 ``normal_test/``），其中
+        ``normal/`` 只用于训练拟合，因此评估取 ``normal_test/`` 与
+        ``abnormal/``，避免把训练图算进指标；用户自选的平铺目录
+        （只有 normal/ + abnormal/）没有 ``normal_test/``，原样使用。
+        """
+        normal_test = root / f"{ANOMALY_NORMAL_DIR}_test"
+        if not normal_test.is_dir():
+            return [root]
+        return [
+            item for item in (normal_test, root / ANOMALY_ABNORMAL_DIR)
+            if item.is_dir()
+        ]
+
     def _run_anomaly_evaluation(self, ckpt: str) -> None:
         """异常检测评估：以 normal / abnormal 目录名作为真实标签。"""
         if not AnomalibService.is_available():
@@ -898,10 +920,19 @@ class EvaluateViewModel(QObject):
             self.message.emit("warning", "请选择含 normal/ 与 abnormal/ 的目录")
             return
         model_name = self._config.anomaly_model or "Padim"
+        sources = self.anomaly_eval_sources(root)
 
         def job(progress, _is_cancelled):
-            progress(20, "异常检测推理中")
-            results = AnomalibService.predict(ckpt, model_name, root)
+            results: list = []
+            for index, source in enumerate(sources):
+                progress(
+                    20 + int(60 * index / len(sources)),
+                    f"异常检测推理中（{index + 1}/{len(sources)}）",
+                )
+                results.extend(
+                    AnomalibService.predict(ckpt, model_name, source) or []
+                )
+            progress(85, "统计中")
             rows: list[dict] = []
             for item in results or []:
                 path = Path(str(item.get("path", "")))

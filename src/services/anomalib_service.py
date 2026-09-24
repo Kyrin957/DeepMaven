@@ -4,8 +4,12 @@
 仅需正常样本即可训练，推理输出异常分数与判定结果。
 
 数据目录约定（`Folder` 数据模块）：
-    <root>/normal/     正常样本（必需）
-    <root>/abnormal/   异常样本（可选，用于评估）
+    <root>/normal/        正常样本（必需，只用它拟合记忆库）
+    <root>/abnormal/      异常样本（评估用）
+    <root>/normal_test/   正常样本的验证 / 测试集（评估用，可选）
+
+拆分页的异常检测产物就是这套结构（`LAYOUT_ANOMALY`），
+因此拆分的产物目录可以直接作为 `anomaly_root` 交给训练与评估。
 """
 
 from __future__ import annotations

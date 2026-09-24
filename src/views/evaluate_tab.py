@@ -683,6 +683,20 @@ class EvaluateTab(QWidget):
         finally:
             self._syncing = False
 
+    def refresh_splits(self) -> None:
+        """拆分列表变化后重取「数据拆分」下拉（主窗口在 splitsChanged 时调用）。
+
+        下拉项取自项目里的拆分，选中项按 ``config.eval_split_id`` 还原，
+        因此刷新不会丢失已选拆分；若该拆分已被删除则回落到第一项。
+        重建期间置 ``_syncing``：否则填充首项时的 ``currentIndexChanged``
+        会写回配置并再次触发 ``_on_config``，导致列表被插入重复项。
+        """
+        self._syncing = True
+        try:
+            self._reload_sources(self._vm.config)
+        finally:
+            self._syncing = False
+
     def _reload_sources(self, config) -> None:
         """「数据拆分」下拉：项目里已生成的拆分（子集由多选框决定）。"""
         sources = self._vm.eval_splits() or self._vm.eval_sources()

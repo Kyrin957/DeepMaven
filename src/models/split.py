@@ -45,6 +45,12 @@ class Split:
     classes: list[str] = field(default_factory=list)
     locked: bool = False                 # 已被训练使用（比例不再改动）
 
+    # 异常检测：按类别指定各子集的数量（其余任务为空，仍按 train/val/test 比例）
+    # {"normal": {"train": 175, "val": 38, "test": 37},
+    #  "abnormal": {"train": 0, "val": 100, "test": 40}}
+    # 「训练集只放良好图」由算法保证（abnormal 的 train 恒为 0），异常图进验证 / 测试。
+    anomaly_counts: dict = field(default_factory=dict)
+
     # -----------------------------------------------------------
     # 展示与换算
     # -----------------------------------------------------------
@@ -90,6 +96,7 @@ class Split:
             "counts": self.counts,
             "classes": self.classes,
             "locked": self.locked,
+            "anomaly_counts": self.anomaly_counts,
         }
 
     @classmethod
@@ -109,4 +116,5 @@ class Split:
             counts=dict(data.get("counts", {}) or {}),
             classes=list(data.get("classes", []) or []),
             locked=data.get("locked", False),
+            anomaly_counts=dict(data.get("anomaly_counts", {}) or {}),
         )
