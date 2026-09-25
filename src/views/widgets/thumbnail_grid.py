@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
 
 from src.utils.constants import SPLIT_COLORS
 from src.utils.image_ops import adjust_pixmap, normalize_display
+from src.views.ui import tokens as T
 
 # 条目数据角色
 _PATH_ROLE = Qt.ItemDataRole.UserRole
@@ -417,7 +418,7 @@ class ThumbnailGrid(QListWidget):
         self.setMovement(QListView.Movement.Static)
         self.setSelectionMode(QListView.SelectionMode.ExtendedSelection)
         self.setUniformItemSizes(True)
-        self.setSpacing(3)
+        self.setSpacing(T.SPACE_XS)
         self.setMouseTracking(True)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.set_thumb_size(THUMB_MEDIUM)

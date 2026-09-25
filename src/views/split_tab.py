@@ -18,7 +18,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QListWidget,
     QListWidgetItem,
-    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -38,6 +37,8 @@ from src.utils.constants import SPLIT_COLORS, SPLIT_LABELS, UNLABELED_LABEL
 from src.viewmodels.category_vm import CategoryViewModel
 from src.viewmodels.dataset_vm import DatasetViewModel
 from src.views.data_widgets import side_column
+from src.views.ui import SafeSpinBox
+from src.views.ui import tokens as T
 from src.views.widgets import BarChart, LegendList, PieChart
 
 _COLOR_UNLABELED = "#8A8A8A"
@@ -70,8 +71,8 @@ class SplitTab(QWidget):
     # -----------------------------------------------------------
     def _build_ui(self) -> None:
         root = QHBoxLayout(self)
-        root.setContentsMargins(16, 12, 16, 12)
-        root.setSpacing(12)
+        root.setContentsMargins(T.SPACE_XL, T.SPACE_LG, T.SPACE_XL, T.SPACE_LG)
+        root.setSpacing(T.SPACE_LG)
 
         root.addWidget(self._build_side())
         root.addLayout(self._build_main(), 1)
@@ -80,8 +81,8 @@ class SplitTab(QWidget):
         # 拆分列表：一个项目可以有多套拆分（横向比较不同划分）
         self.list_card = CardWidget(self)
         list_layout = QVBoxLayout(self.list_card)
-        list_layout.setContentsMargins(14, 12, 14, 12)
-        list_layout.setSpacing(6)
+        list_layout.setContentsMargins(T.CARD_PAD_H, T.CARD_PAD_V, T.CARD_PAD_H, T.CARD_PAD_V)
+        list_layout.setSpacing(T.SPACE_SM)
         list_layout.addWidget(StrongBodyLabel("拆分列表", self.list_card))
         self.split_list = QListWidget(self.list_card)
         self.split_list.setMinimumHeight(120)
@@ -89,7 +90,7 @@ class SplitTab(QWidget):
         list_layout.addWidget(self.split_list)
 
         tools = QHBoxLayout()
-        tools.setSpacing(6)
+        tools.setSpacing(T.SPACE_SM)
         self.add_split_btn = PushButton("新建", self.list_card)
         self.copy_split_btn = PushButton("复制", self.list_card)
         self.del_split_btn = PushButton("删除", self.list_card)
@@ -102,8 +103,8 @@ class SplitTab(QWidget):
 
         self.setting_card = CardWidget(self)
         layout = QVBoxLayout(self.setting_card)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(6)
+        layout.setContentsMargins(T.CARD_PAD_H, T.CARD_PAD_V, T.CARD_PAD_H, T.CARD_PAD_V)
+        layout.setSpacing(T.SPACE_SM)
         layout.addWidget(StrongBodyLabel("拆分设置", self.setting_card))
 
         name_row = QHBoxLayout()
@@ -113,29 +114,39 @@ class SplitTab(QWidget):
         name_row.addWidget(self.name_edit, 1)
         layout.addLayout(name_row)
 
-        self.ratio_spins: dict[str, QSpinBox] = {}
+        self.ratio_spins: dict[str, SafeSpinBox] = {}
         self.ratio_rows: dict[str, QWidget] = {}
         for key in ("train", "val", "test"):
             row_widget = QWidget(self.setting_card)
             row = QHBoxLayout(row_widget)
             row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(T.SPACE_MD)
             row.addWidget(CaptionLabel(SPLIT_LABELS[key], row_widget))
-            spin = QSpinBox(row_widget)
+            spin = SafeSpinBox(row_widget)
             spin.setRange(0, 100)
             spin.setSuffix(" %")
             spin.setValue({"train": 70, "val": 20, "test": 10}[key])
+            spin.setFixedWidth(
+                T.field_width(spin, T.STEPPER_CHARS_NARROW)
+            )
             spin.valueChanged.connect(lambda _v: self._on_ratio_changed())
-            row.addWidget(spin, 1)
+            row.addWidget(spin)
+            row.addStretch(1)
             layout.addWidget(row_widget)
             self.ratio_spins[key] = spin
             self.ratio_rows[key] = row_widget
 
         seed_row = QHBoxLayout()
+        seed_row.setSpacing(T.SPACE_MD)
         seed_row.addWidget(CaptionLabel("随机种子", self.setting_card))
-        self.seed_spin = QSpinBox(self.setting_card)
+        self.seed_spin = SafeSpinBox(self.setting_card)
         self.seed_spin.setRange(0, 99999)
+        self.seed_spin.setFixedWidth(
+            T.field_width(self.seed_spin, T.STEPPER_CHARS)
+        )
         self.seed_spin.valueChanged.connect(lambda _v: self._on_seed_changed())
-        seed_row.addWidget(self.seed_spin, 1)
+        seed_row.addWidget(self.seed_spin)
+        seed_row.addStretch(1)
         layout.addLayout(seed_row)
 
         self.stratified_check = QCheckBox("按类别分层抽样（推荐）", self.setting_card)
@@ -150,7 +161,7 @@ class SplitTab(QWidget):
         layout.addWidget(self.anomaly_card)
 
         button_row = QHBoxLayout()
-        button_row.setSpacing(6)
+        button_row.setSpacing(T.SPACE_SM)
         self.preview_btn = PushButton("刷新预览", self.setting_card)
         self.apply_btn = PrimaryPushButton("执行拆分", self.setting_card)
         button_row.addWidget(self.preview_btn)
@@ -159,8 +170,8 @@ class SplitTab(QWidget):
 
         self.overview_card = CardWidget(self)
         overview_layout = QVBoxLayout(self.overview_card)
-        overview_layout.setContentsMargins(14, 12, 14, 12)
-        overview_layout.setSpacing(6)
+        overview_layout.setContentsMargins(T.CARD_PAD_H, T.CARD_PAD_V, T.CARD_PAD_H, T.CARD_PAD_V)
+        overview_layout.setSpacing(T.SPACE_SM)
         overview_layout.addWidget(StrongBodyLabel("拆分概览", self.overview_card))
         self.pie = PieChart(self.overview_card)
         overview_layout.addWidget(self.pie)
@@ -195,23 +206,24 @@ class SplitTab(QWidget):
             grid.addWidget(CaptionLabel("数量", holder), 1, column)
             grid.addWidget(CaptionLabel("百分比", holder), 1, column + 1)
 
-        self.anomaly_spins: dict[tuple, QSpinBox] = {}
+        self.anomaly_spins: dict[tuple, SafeSpinBox] = {}
         for row, sub in enumerate(("train", "val", "test")):
             grid.addWidget(CaptionLabel(SPLIT_LABELS[sub], holder), 2 + row, 0)
             for index, kind in enumerate(("normal", "abnormal")):
                 column = 1 + index * 2
                 editable = not (kind == "abnormal" and sub == "train")
-                count = QSpinBox(holder)
+                count = SafeSpinBox(holder)
                 count.setRange(0, 999999)
-                # 侧栏只有 ~260px 可用：固定宽度，避免把卡片顶宽后被裁剪
-                count.setFixedWidth(52)
+                # 侧栏只有 ~260px 可用：用专为紧凑栅格准备的定宽令牌，
+                # 避免把卡片顶宽后被裁剪
+                count.setFixedWidth(T.STEPPER_W_TIGHT)
                 count.valueChanged.connect(
                     lambda _v, k=kind, s=sub: self._on_anomaly_edited(k, s, "count")
                 )
                 grid.addWidget(count, 2 + row, column)
-                percent = QSpinBox(holder)
+                percent = SafeSpinBox(holder)
                 percent.setRange(0, 100)
-                percent.setFixedWidth(48)
+                percent.setFixedWidth(T.STEPPER_W_TIGHT_PCT)
                 percent.valueChanged.connect(
                     lambda _v, k=kind, s=sub: self._on_anomaly_edited(
                         k, s, "percent"
@@ -299,12 +311,12 @@ class SplitTab(QWidget):
 
     def _build_main(self) -> QVBoxLayout:
         column = QVBoxLayout()
-        column.setSpacing(10)
+        column.setSpacing(T.SPACE_ML)
 
         card = CardWidget(self)
         layout = QHBoxLayout(card)
-        layout.setContentsMargins(16, 10, 16, 10)
-        layout.setSpacing(10)
+        layout.setContentsMargins(T.SPACE_XL, T.SPACE_ML, T.SPACE_XL, T.SPACE_ML)
+        layout.setSpacing(T.SPACE_ML)
         self.title = StrongBodyLabel("数据拆分", card)
         layout.addWidget(self.title)
         layout.addStretch(1)
@@ -314,8 +326,8 @@ class SplitTab(QWidget):
 
         class_card = CardWidget(self)
         class_layout = QVBoxLayout(class_card)
-        class_layout.setContentsMargins(16, 12, 16, 12)
-        class_layout.setSpacing(6)
+        class_layout.setContentsMargins(T.SPACE_XL, T.SPACE_LG, T.SPACE_XL, T.SPACE_LG)
+        class_layout.setSpacing(T.SPACE_SM)
         class_layout.addWidget(StrongBodyLabel("类别分布预览", class_card))
         self.class_hint = CaptionLabel("", class_card)
         class_layout.addWidget(self.class_hint)
@@ -325,8 +337,8 @@ class SplitTab(QWidget):
 
         output_card = CardWidget(self)
         output_layout = QVBoxLayout(output_card)
-        output_layout.setContentsMargins(16, 12, 16, 12)
-        output_layout.setSpacing(6)
+        output_layout.setContentsMargins(T.SPACE_XL, T.SPACE_LG, T.SPACE_XL, T.SPACE_LG)
+        output_layout.setSpacing(T.SPACE_SM)
         output_layout.addWidget(StrongBodyLabel("拆分产物", output_card))
         self.output_label = BodyLabel("—", output_card)
         self.output_label.setWordWrap(True)

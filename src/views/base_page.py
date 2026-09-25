@@ -14,6 +14,8 @@ from qfluentwidgets import (
     StrongBodyLabel,
 )
 
+from src.views.ui import tokens as T
+
 
 class BasePage(QWidget):
     """导航页基类：可滚动内容区。"""
@@ -32,8 +34,10 @@ class BasePage(QWidget):
         self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.scroll_body = QWidget()
         self.content_layout = QVBoxLayout(self.scroll_body)
-        self.content_layout.setContentsMargins(24, 16, 24, 24)
-        self.content_layout.setSpacing(16)
+        self.content_layout.setContentsMargins(
+            T.PAGE_PAD_H, T.SPACE_XL, T.PAGE_PAD_H, T.SPACE_XXL
+        )
+        self.content_layout.setSpacing(T.SPACE_XL)
         self.content_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.scroll_area.setWidget(self.scroll_body)
         root.addWidget(self.scroll_area)
@@ -45,8 +49,10 @@ class BasePage(QWidget):
         """向内容区添加一个卡片，返回 (card, card_layout)。"""
         card = CardWidget(self.scroll_body)
         card.vlayout = QVBoxLayout(card)
-        card.vlayout.setContentsMargins(20, 16, 20, 16)
-        card.vlayout.setSpacing(12)
+        card.vlayout.setContentsMargins(
+            T.SPACE_2XL, T.SPACE_XL, T.SPACE_2XL, T.SPACE_XL
+        )
+        card.vlayout.setSpacing(T.SPACE_LG)
         if title:
             card.vlayout.addWidget(StrongBodyLabel(title))
         self.content_layout.addWidget(card)

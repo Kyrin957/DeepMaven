@@ -21,11 +21,12 @@ from qfluentwidgets import (
     LineEdit,
     MessageBoxBase,
     PushButton,
-    SpinBox,
     SubtitleLabel,
 )
 
 from src.services.ood_service import DEFAULT_PERCENTILE, OodService, OodStats
+from src.views.ui import SafeSpinBox
+from src.views.ui import tokens as T
 
 _IMAGE_FILTER = "图片 (*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp)"
 
@@ -68,9 +69,9 @@ class OodDialog(MessageBoxBase):
         body = QWidget(self)
         layout = QVBoxLayout(body)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        layout.setSpacing(T.SPACE_MD)
         form = QFormLayout()
-        form.setSpacing(8)
+        form.setSpacing(T.SPACE_MD)
 
         self.weights_edit = LineEdit(body)
         self.weights_edit.setPlaceholderText("分类模型权重 (.pt)")
@@ -103,11 +104,14 @@ class OodDialog(MessageBoxBase):
         row.addWidget(dir_btn)
         form.addRow("待测", row)
 
-        self.percentile_spin = SpinBox(body)
+        self.percentile_spin = SafeSpinBox(body)
         self.percentile_spin.setRange(50, 100)
         self.percentile_spin.setSuffix(" 分位")
         self.percentile_spin.setValue(int(DEFAULT_PERCENTILE))
         self.percentile_spin.setToolTip("阈值取「已知样本距离」的分位数，越大越宽松")
+        self.percentile_spin.setFixedWidth(
+            T.field_width(self.percentile_spin, T.STEPPER_CHARS_NARROW)
+        )
         form.addRow("阈值", self.percentile_spin)
         layout.addLayout(form)
 

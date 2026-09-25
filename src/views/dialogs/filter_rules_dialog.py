@@ -33,6 +33,8 @@ from src.models.filter_rules import (
     operators_for,
 )
 
+from src.views.ui import tokens as T
+
 
 class _ConditionRow(QWidget):
     """一条筛选条件：字段 / 关系 / 值 / 删除。"""
@@ -47,16 +49,16 @@ class _ConditionRow(QWidget):
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
+        layout.setSpacing(T.SPACE_SM)
 
         self.field_box = ComboBox(self)
         for key, label, _kind in FILTER_FIELDS:
             self.field_box.addItem(label, userData=key)
-        self.field_box.setFixedWidth(112)
+        self.field_box.setFixedWidth(T.CTRL_W_MD)
         layout.addWidget(self.field_box)
 
         self.op_box = ComboBox(self)
-        self.op_box.setFixedWidth(88)
+        self.op_box.setFixedWidth(T.CTRL_W_SM)
         layout.addWidget(self.op_box)
 
         self.value_edit = LineEdit(self)
@@ -66,7 +68,7 @@ class _ConditionRow(QWidget):
 
         # 候选值选择器：选中的候选填入输入框，仍可手动输入其它值
         self.value_picker = ComboBox(self)
-        self.value_picker.setFixedWidth(104)
+        self.value_picker.setFixedWidth(T.CTRL_W_MD)
         self.value_picker.setVisible(False)
         self.value_picker.currentIndexChanged.connect(self._on_pick)
         layout.addWidget(self.value_picker)
@@ -74,7 +76,7 @@ class _ConditionRow(QWidget):
         self.remove_btn = TransparentToolButton(self)
         self.remove_btn.setIcon(FluentIcon.DELETE)
         self.remove_btn.setToolTip("删除该条件")
-        self.remove_btn.setFixedSize(28, 28)
+        self.remove_btn.setFixedSize(T.ICON_BTN_MD, T.ICON_BTN_MD)
         self.remove_btn.clicked.connect(lambda: self.removed.emit(self))
         layout.addWidget(self.remove_btn)
 
@@ -187,16 +189,16 @@ class FilterRulesDialog(MessageBoxBase):
         holder = QWidget(self)
         layout = QVBoxLayout(holder)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
+        layout.setSpacing(T.SPACE_SM)
 
         logic_row = QHBoxLayout()
-        logic_row.setSpacing(8)
+        logic_row.setSpacing(T.SPACE_MD)
         logic_row.addWidget(CaptionLabel("条件关系", holder))
         self.logic_box = ComboBox(holder)
         self.logic_box.addItem("满足全部条件（且）", userData="and")
         self.logic_box.addItem("满足任一条件（或）", userData="or")
         self.logic_box.setCurrentIndex(1 if str(tree.get("logic")) == "or" else 0)
-        self.logic_box.setFixedWidth(180)
+        self.logic_box.setFixedWidth(T.CTRL_W_XL)
         self.logic_box.currentIndexChanged.connect(lambda _i: self._on_changed())
         logic_row.addWidget(self.logic_box)
         logic_row.addStretch(1)
@@ -210,7 +212,7 @@ class FilterRulesDialog(MessageBoxBase):
         self.rows_holder = QWidget(holder)
         self.rows_layout = QVBoxLayout(self.rows_holder)
         self.rows_layout.setContentsMargins(0, 0, 0, 0)
-        self.rows_layout.setSpacing(6)
+        self.rows_layout.setSpacing(T.SPACE_SM)
         self.rows_layout.addStretch(1)
 
         scroll = ScrollArea(holder)

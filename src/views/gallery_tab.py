@@ -46,12 +46,13 @@ from src.views.dialogs import (
 )
 from src.views.dialogs.tag_edit_dialog import DEFAULT_TAG_COLOR
 from src.views.gallery_widgets import DisplayBar, FilterBar, SplitMapCard, TagCard
+from src.views.ui import tokens as T
 from src.views.widgets import THUMB_STEPS, ThumbnailGrid
 
 # 尺寸档位与网格、尺寸滑杆共用同一套（见 views/widgets/thumbnail_grid.py）
 _THUMB_STEPS = THUMB_STEPS
 _IMAGE_FILTER = "图片 (*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp)"
-_SIDE_WIDTH = 292
+_SIDE_WIDTH = T.SIDE_W_WIDE
 
 
 class GalleryTab(QWidget):
@@ -79,8 +80,8 @@ class GalleryTab(QWidget):
     # -----------------------------------------------------------
     def _build_ui(self) -> None:
         root = QHBoxLayout(self)
-        root.setContentsMargins(16, 12, 16, 12)
-        root.setSpacing(12)
+        root.setContentsMargins(T.SPACE_XL, T.SPACE_LG, T.SPACE_XL, T.SPACE_LG)
+        root.setSpacing(T.SPACE_LG)
 
         self.import_card = ImportCard(self)
         self.stats_card = StatsCard(self)
@@ -104,7 +105,7 @@ class GalleryTab(QWidget):
         root.addWidget(scroll)
 
         main = QVBoxLayout()
-        main.setSpacing(10)
+        main.setSpacing(T.SPACE_ML)
 
         # 浏览筛选放在图像窗口上方（原顶部的标题标识已移除）
         self.filter_bar = FilterBar(self)

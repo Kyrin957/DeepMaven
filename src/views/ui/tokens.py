@@ -31,8 +31,10 @@ SPACE_XXS = 2
 SPACE_XS = 4
 SPACE_SM = 6
 SPACE_MD = 8
+SPACE_ML = 10
 SPACE_LG = 12
 SPACE_XL = 16
+SPACE_2XL = 20
 SPACE_XXL = 24
 
 # ---------------------------------------------------------------------------
@@ -69,6 +71,29 @@ STEPPER_CHROME_W = 42
 
 # 标签列最小宽度（表单左侧文字）
 LABEL_MIN_W = 72
+
+# 下拉框 / 文本框 / 按钮组等控件的常用宽度（避免各处写死 88/112/160）
+CTRL_W_SM = 88
+CTRL_W_MD = 112
+CTRL_W_LG = 160
+CTRL_W_XL = 180
+
+# 图标按钮边长
+ICON_BTN_SM = 24
+ICON_BTN_MD = 28
+
+# 窄侧栏里成组排布的紧凑数值框（如「良好 / 异常 × 训练 / 验证 / 测试」的数量与百分比）
+STEPPER_W_TIGHT = 52
+STEPPER_W_TIGHT_PCT = 48
+
+# 侧栏面板最小宽度（图库筛选栏等）
+PANEL_MIN_W = 170
+# 评估 / 导出页右栏面板固定宽度
+PANEL_W = 300
+# 项目管理页左侧操作栏宽度
+PANEL_W_WIDE = 320
+# 结果分页按钮宽度
+PAGER_BTN_W = 38
 
 # ---------------------------------------------------------------------------
 # 行高 / 控件高
@@ -115,12 +140,16 @@ def field_width(reference: QWidget, chars: int = STEPPER_CHARS) -> int:
 
 
 __all__ = [
-    "SPACE_XXS", "SPACE_XS", "SPACE_SM", "SPACE_MD", "SPACE_LG",
-    "SPACE_XL", "SPACE_XXL",
+    "SPACE_XXS", "SPACE_XS", "SPACE_SM", "SPACE_MD", "SPACE_ML", "SPACE_LG",
+    "SPACE_XL", "SPACE_2XL", "SPACE_XXL",
     "CARD_PAD_H", "CARD_PAD_V", "PAGE_PAD_H", "PAGE_PAD_V",
     "SIDE_W_NARROW", "SIDE_W", "SIDE_W_WIDE",
     "STEPPER_CHARS_NARROW", "STEPPER_CHARS", "STEPPER_CHARS_WIDE",
     "STEPPER_MIN_W", "STEPPER_MAX_W", "LABEL_MIN_W", "ROW_H",
+    "CTRL_W_SM", "CTRL_W_MD", "CTRL_W_LG", "CTRL_W_XL",
+    "ICON_BTN_SM", "ICON_BTN_MD",
+    "STEPPER_W_TIGHT", "STEPPER_W_TIGHT_PCT", "PANEL_MIN_W", "PANEL_W",
+    "PANEL_W_WIDE", "PAGER_BTN_W",
     "RADIUS_SM", "RADIUS_MD", "RADIUS_LG",
     "CANVAS_BG", "GROUP_BORDER", "GROUP_BG",
     "field_width",

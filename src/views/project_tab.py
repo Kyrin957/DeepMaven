@@ -45,6 +45,7 @@ from src.utils.constants import (
 )
 from src.viewmodels.project_vm import ProjectViewModel
 from src.views.dialogs import DeleteProjectDialog, NewProjectDialog
+from src.views.ui import tokens as T
 
 _COVER_W, _COVER_H = 184, 116
 _COLUMNS = 4
@@ -74,8 +75,8 @@ class ProjectCard(QFrame):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 8)
-        layout.setSpacing(5)
+        layout.setContentsMargins(T.SPACE_ML, T.SPACE_ML, T.SPACE_ML, T.SPACE_MD)
+        layout.setSpacing(T.SPACE_SM)
 
         self.cover = QLabel(self)
         self.cover.setFixedSize(_COVER_W, _COVER_H)
@@ -165,22 +166,22 @@ class ProjectTab(QWidget):
     # -----------------------------------------------------------
     def _build_ui(self) -> None:
         root = QHBoxLayout(self)
-        root.setContentsMargins(16, 12, 16, 12)
-        root.setSpacing(12)
+        root.setContentsMargins(T.SPACE_XL, T.SPACE_LG, T.SPACE_XL, T.SPACE_LG)
+        root.setSpacing(T.SPACE_LG)
         root.addWidget(self._build_side())
         root.addLayout(self._build_recent_area(), 1)
 
     def _build_side(self) -> QWidget:
         container = QWidget(self)
-        container.setFixedWidth(320)
+        container.setFixedWidth(T.PANEL_W_WIDE)
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
+        layout.setSpacing(T.SPACE_ML)
 
         action_card = CardWidget(container)
         action_layout = QVBoxLayout(action_card)
-        action_layout.setContentsMargins(16, 14, 16, 14)
-        action_layout.setSpacing(8)
+        action_layout.setContentsMargins(T.SPACE_XL, T.CARD_PAD_H, T.SPACE_XL, T.CARD_PAD_H)
+        action_layout.setSpacing(T.SPACE_MD)
         self.new_btn = PrimaryPushButton(action_card)
         self.new_btn.setText("新建项目")
         self.new_btn.setIcon(FluentIcon.ADD)
@@ -200,8 +201,8 @@ class ProjectTab(QWidget):
 
         info_card = CardWidget(container)
         info_layout = QVBoxLayout(info_card)
-        info_layout.setContentsMargins(16, 14, 16, 14)
-        info_layout.setSpacing(6)
+        info_layout.setContentsMargins(T.SPACE_XL, T.CARD_PAD_H, T.SPACE_XL, T.CARD_PAD_H)
+        info_layout.setSpacing(T.SPACE_SM)
         self.info_title = StrongBodyLabel("项目信息", info_card)
         info_layout.addWidget(self.info_title)
 
@@ -241,14 +242,14 @@ class ProjectTab(QWidget):
         # 可恢复项目（崩溃 / 异常退出后残留的自动备份）
         self.recover_card = CardWidget(container)
         recover_layout = QVBoxLayout(self.recover_card)
-        recover_layout.setContentsMargins(16, 14, 16, 14)
-        recover_layout.setSpacing(6)
+        recover_layout.setContentsMargins(T.SPACE_XL, T.CARD_PAD_H, T.SPACE_XL, T.CARD_PAD_H)
+        recover_layout.setSpacing(T.SPACE_SM)
         recover_layout.addWidget(StrongBodyLabel("可恢复项目", self.recover_card))
         self.recover_hint = CaptionLabel("", self.recover_card)
         self.recover_hint.setWordWrap(True)
         recover_layout.addWidget(self.recover_hint)
         self.recover_buttons = QVBoxLayout()
-        self.recover_buttons.setSpacing(4)
+        self.recover_buttons.setSpacing(T.SPACE_XS)
         recover_layout.addLayout(self.recover_buttons)
         layout.addWidget(self.recover_card)
         self.recover_card.setVisible(False)
@@ -256,8 +257,8 @@ class ProjectTab(QWidget):
         # 图像位置：基础路径 + 缺失重定位
         self.location_card = CardWidget(container)
         location_layout = QVBoxLayout(self.location_card)
-        location_layout.setContentsMargins(16, 14, 16, 14)
-        location_layout.setSpacing(6)
+        location_layout.setContentsMargins(T.SPACE_XL, T.CARD_PAD_H, T.SPACE_XL, T.CARD_PAD_H)
+        location_layout.setSpacing(T.SPACE_SM)
         location_layout.addWidget(StrongBodyLabel("图像位置", self.location_card))
         path_row = QHBoxLayout()
         self.base_edit = LineEdit(self.location_card)
@@ -283,12 +284,12 @@ class ProjectTab(QWidget):
 
     def _build_recent_area(self) -> QVBoxLayout:
         column = QVBoxLayout()
-        column.setSpacing(10)
+        column.setSpacing(T.SPACE_ML)
 
         header = CardWidget(self)
         header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(16, 10, 16, 10)
-        header_layout.setSpacing(10)
+        header_layout.setContentsMargins(T.SPACE_XL, T.SPACE_ML, T.SPACE_XL, T.SPACE_ML)
+        header_layout.setSpacing(T.SPACE_ML)
         header_layout.addWidget(StrongBodyLabel("最近的项目", header))
         header_layout.addStretch(1)
         self.hint = CaptionLabel("", header)
@@ -300,8 +301,10 @@ class ProjectTab(QWidget):
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.body = QWidget()
         self.grid = QGridLayout(self.body)
-        self.grid.setContentsMargins(4, 4, 4, 4)
-        self.grid.setSpacing(10)
+        self.grid.setContentsMargins(
+            T.SPACE_XS, T.SPACE_XS, T.SPACE_XS, T.SPACE_XS
+        )
+        self.grid.setSpacing(T.SPACE_ML)
         self.grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         self.scroll.setWidget(self.body)
         column.addWidget(self.scroll, 1)
@@ -595,7 +598,7 @@ class ProjectTab(QWidget):
             row = QWidget(self.recover_card)
             layout = QHBoxLayout(row)
             layout.setContentsMargins(0, 0, 0, 0)
-            layout.setSpacing(6)
+            layout.setSpacing(T.SPACE_SM)
             label = CaptionLabel(
                 f"{info.get('name') or ''} · {info.get('time', '')}", row
             )

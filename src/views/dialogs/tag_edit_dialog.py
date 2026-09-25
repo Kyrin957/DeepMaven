@@ -19,6 +19,7 @@ from qfluentwidgets import (
 )
 
 from src.views.dialogs.class_edit_dialog import PRESET_COLORS, ColorPicker
+from src.views.ui import tokens as T
 
 DEFAULT_TAG_COLOR = "#9DB5B2"
 
@@ -75,7 +76,7 @@ class TagEditDialog(MessageBoxBase):
         holder = QWidget(self)
         layout = QVBoxLayout(holder)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(5)
+        layout.setSpacing(T.SPACE_SM)
 
         layout.addWidget(CaptionLabel("文本", holder))
         self.text_edit = LineEdit(holder)
@@ -85,7 +86,7 @@ class TagEditDialog(MessageBoxBase):
 
         layout.addWidget(CaptionLabel("颜色", holder))
         row = QHBoxLayout()
-        row.setSpacing(6)
+        row.setSpacing(T.SPACE_SM)
         self.color_edit = LineEdit(holder)
         self.color_edit.setText(QColor(color).name().upper())
         self.color_edit.editingFinished.connect(self._on_color_text)
@@ -99,7 +100,7 @@ class TagEditDialog(MessageBoxBase):
         layout.addLayout(row)
 
         presets = QHBoxLayout()
-        presets.setSpacing(4)
+        presets.setSpacing(T.SPACE_XS)
         for value in PRESET_COLORS:
             presets.addWidget(self._preset_button(value, holder))
         presets.addStretch(1)
@@ -121,7 +122,7 @@ class TagEditDialog(MessageBoxBase):
 
     def _preset_button(self, value: str, parent) -> PushButton:
         button = PushButton(parent)
-        button.setFixedSize(22, 22)
+        button.setFixedSize(T.ICON_BTN_SM, T.ICON_BTN_SM)
         button.setToolTip(value)
         button.setStyleSheet(
             f"PushButton {{ background: {value}; border: 1px solid #5A5A5A;"

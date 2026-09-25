@@ -29,6 +29,7 @@ from src.services.annotation_service import AnnotationService
 from src.viewmodels.category_vm import CategoryViewModel
 from src.viewmodels.dataset_vm import DatasetViewModel
 from src.views.data_widgets import ClassCard, FilterCard, side_column
+from src.views.ui import tokens as T
 from src.views.gallery_widgets import DisplayBar
 from src.views.widgets import (
     THUMB_LARGE,
@@ -66,8 +67,8 @@ class ReviewTab(QWidget):
     # -----------------------------------------------------------
     def _build_ui(self) -> None:
         root = QHBoxLayout(self)
-        root.setContentsMargins(16, 12, 16, 12)
-        root.setSpacing(12)
+        root.setContentsMargins(T.SPACE_XL, T.SPACE_LG, T.SPACE_XL, T.SPACE_LG)
+        root.setSpacing(T.SPACE_LG)
 
         root.addWidget(self._build_side())
         root.addLayout(self._build_main(), 1)
@@ -75,8 +76,8 @@ class ReviewTab(QWidget):
     def _build_side(self) -> QWidget:
         self.detail_card = CardWidget(self)
         layout = QVBoxLayout(self.detail_card)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(5)
+        layout.setContentsMargins(T.CARD_PAD_H, T.CARD_PAD_V, T.CARD_PAD_H, T.CARD_PAD_V)
+        layout.setSpacing(T.SPACE_SM)
         layout.addWidget(StrongBodyLabel("已选择图像", self.detail_card))
         self.detail_name = BodyLabel("—", self.detail_card)
         self.detail_name.setWordWrap(True)
@@ -96,8 +97,8 @@ class ReviewTab(QWidget):
 
         self.quality_card = CardWidget(self)
         quality_layout = QVBoxLayout(self.quality_card)
-        quality_layout.setContentsMargins(14, 12, 14, 12)
-        quality_layout.setSpacing(6)
+        quality_layout.setContentsMargins(T.CARD_PAD_H, T.CARD_PAD_V, T.CARD_PAD_H, T.CARD_PAD_V)
+        quality_layout.setSpacing(T.SPACE_SM)
         quality_layout.addWidget(StrongBodyLabel("质检", self.quality_card))
         self.quality_btn = PrimaryPushButton("一键质检", self.quality_card)
         quality_layout.addWidget(self.quality_btn)
@@ -114,12 +115,12 @@ class ReviewTab(QWidget):
 
     def _build_main(self) -> QVBoxLayout:
         column = QVBoxLayout()
-        column.setSpacing(10)
+        column.setSpacing(T.SPACE_ML)
 
         card = CardWidget(self)
         layout = QHBoxLayout(card)
-        layout.setContentsMargins(16, 10, 16, 10)
-        layout.setSpacing(10)
+        layout.setContentsMargins(T.SPACE_XL, T.SPACE_ML, T.SPACE_XL, T.SPACE_ML)
+        layout.setSpacing(T.SPACE_ML)
         self.title = StrongBodyLabel("标注检查", card)
         layout.addWidget(self.title)
         layout.addStretch(1)

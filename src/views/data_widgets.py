@@ -32,10 +32,13 @@ from qfluentwidgets import (
 )
 
 from src.views.dialogs.class_edit_dialog import PRESET_COLORS, ClassEditDialog
+from src.views.ui import tokens as T
 from src.views.widgets import THUMB_LARGE, THUMB_STEPS
 
 _COLOR_FALLBACK = "#66CCFF"
 _UNLABELED_ROW_LABEL = "无标签"
+# 类别色块边长（装饰性尺寸，组件内部常量）
+_CHIP_SIZE = 12
 
 
 class StatsCard(CardWidget):
@@ -44,8 +47,8 @@ class StatsCard(CardWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(5)
+        layout.setContentsMargins(T.CARD_PAD_H, T.CARD_PAD_V, T.CARD_PAD_H, T.CARD_PAD_V)
+        layout.setSpacing(T.SPACE_SM)
         layout.addWidget(StrongBodyLabel("数据集概览", self))
 
         self._values: dict[str, BodyLabel] = {}
@@ -90,8 +93,10 @@ class ImportCard(CardWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(6)
+        layout.setContentsMargins(
+            T.CARD_PAD_H, T.CARD_PAD_V, T.CARD_PAD_H, T.CARD_PAD_V
+        )
+        layout.setSpacing(T.SPACE_SM)
         layout.addWidget(StrongBodyLabel("数据导入", self))
 
         self.folder_btn = PrimaryPushButton(self)
@@ -130,11 +135,11 @@ class ClassRow(QWidget):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(6, 2, 4, 2)
-        layout.setSpacing(6)
+        layout.setContentsMargins(T.SPACE_SM, T.SPACE_XXS, T.SPACE_XS, T.SPACE_XXS)
+        layout.setSpacing(T.SPACE_SM)
 
         chip = QLabel(self)
-        chip.setFixedSize(12, 12)
+        chip.setFixedSize(_CHIP_SIZE, _CHIP_SIZE)
         if color:
             chip.setStyleSheet(f"background: {color}; border-radius: 2px;")
         else:
@@ -160,7 +165,7 @@ class ClassRow(QWidget):
         button = TransparentToolButton(self)
         button.setIcon(icon)
         button.setToolTip(tip)
-        button.setFixedSize(24, 24)
+        button.setFixedSize(T.ICON_BTN_SM, T.ICON_BTN_SM)
         button.clicked.connect(lambda: signal.emit(self.category))
         return button
 
@@ -191,13 +196,13 @@ class ClassCard(CardWidget):
         self._items: dict[str, QListWidgetItem] = {}
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(6)
+        layout.setContentsMargins(T.CARD_PAD_H, T.CARD_PAD_V, T.CARD_PAD_H, T.CARD_PAD_V)
+        layout.setSpacing(T.SPACE_SM)
         layout.addWidget(StrongBodyLabel("标签类别", self))
 
         # 列表上方：新增 + 顺序排列
         tools = QHBoxLayout()
-        tools.setSpacing(4)
+        tools.setSpacing(T.SPACE_XS)
         self.add_btn = self._tool(FluentIcon.ADD, "新增类别", self._on_add)
         self.up_btn = self._tool(
             FluentIcon.UP, "上移选中类别", lambda: self._on_move(-1)
@@ -228,7 +233,7 @@ class ClassCard(CardWidget):
         button = TransparentToolButton(self)
         button.setIcon(icon)
         button.setToolTip(tip)
-        button.setFixedSize(28, 28)
+        button.setFixedSize(T.ICON_BTN_MD, T.ICON_BTN_MD)
         button.clicked.connect(slot)
         return button
 
@@ -277,7 +282,7 @@ class ClassCard(CardWidget):
         item = QListWidgetItem()
         item.setData(Qt.ItemDataRole.UserRole, int(cls_id))
         item.setData(Qt.ItemDataRole.UserRole + 1, name)
-        item.setSizeHint(QSize(0, 30))
+        item.setSizeHint(QSize(0, T.ROW_H))
         item.setToolTip(
             f"id={cls_id}  颜色 {color}" if editable
             else "不给图像指定任何类别"
@@ -406,8 +411,8 @@ class FilterCard(CardWidget):
         self._thumb_steps: tuple[int, ...] = THUMB_STEPS
         self._syncing_thumb = False
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(6)
+        layout.setContentsMargins(T.CARD_PAD_H, T.CARD_PAD_V, T.CARD_PAD_H, T.CARD_PAD_V)
+        layout.setSpacing(T.SPACE_SM)
         layout.addWidget(StrongBodyLabel("浏览筛选", self))
 
         self.segment = SegmentedWidget(self)
@@ -497,7 +502,7 @@ class SectionLabel(CaptionLabel):
         self.setFont(font)
 
 
-def side_column(*widgets, width: int = 268) -> QScrollArea:
+def side_column(*widgets, width: int = T.SIDE_W) -> QScrollArea:
     """把若干面板竖排为一个固定宽度的侧栏。
 
     卡片的**最小高度会沿布局向上累积**：竖排 5 张卡片即有 ~1000px 的
@@ -508,7 +513,7 @@ def side_column(*widgets, width: int = 268) -> QScrollArea:
     content = QWidget()
     layout = QVBoxLayout(content)
     layout.setContentsMargins(0, 0, 0, 0)
-    layout.setSpacing(10)
+    layout.setSpacing(T.SPACE_ML)
     for widget in widgets:
         layout.addWidget(widget)
     layout.addStretch(1)

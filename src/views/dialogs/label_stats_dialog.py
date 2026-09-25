@@ -26,6 +26,8 @@ from qfluentwidgets import (
 
 from src.models.filter_rules import UNLABELED_NAME
 
+from src.views.ui import tokens as T
+
 _TABLE_HEIGHT = 132
 _HEADERS = ("名称", "数量", "占比")
 
@@ -68,15 +70,15 @@ class LabelStatsDialog(MessageBoxBase):
         holder = QWidget(self)
         layout = QVBoxLayout(holder)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
+        layout.setSpacing(T.SPACE_SM)
 
         scope_row = QHBoxLayout()
-        scope_row.setSpacing(8)
+        scope_row.setSpacing(T.SPACE_MD)
         scope_row.addWidget(CaptionLabel("统计范围", holder))
         self.scope_box = ComboBox(holder)
         self.scope_box.addItem("全部图像", userData="all")
         self.scope_box.addItem("当前选中图像", userData="selection")
-        self.scope_box.setFixedWidth(160)
+        self.scope_box.setFixedWidth(T.CTRL_W_LG)
         self.scope_box.currentIndexChanged.connect(lambda _i: self.reload())
         scope_row.addWidget(self.scope_box)
         scope_row.addStretch(1)

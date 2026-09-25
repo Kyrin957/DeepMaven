@@ -15,7 +15,6 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
-    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -26,11 +25,12 @@ from qfluentwidgets import (
     MessageBoxBase,
     PushButton,
     Slider,
-    SpinBox,
     SubtitleLabel,
 )
 
 from src.utils.config import ConfigManager
+from src.views.ui import SafeSpinBox
+from src.views.ui import tokens as T
 
 
 class PreferencesDialog(MessageBoxBase):
@@ -56,9 +56,9 @@ class PreferencesDialog(MessageBoxBase):
         body = QWidget(self)
         outer = QVBoxLayout(body)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(8)
+        outer.setSpacing(T.SPACE_MD)
         form = QFormLayout()
-        form.setSpacing(8)
+        form.setSpacing(T.SPACE_MD)
 
         # 默认项目目录
         row = QHBoxLayout()
@@ -70,18 +70,25 @@ class PreferencesDialog(MessageBoxBase):
         row.addWidget(browse)
         form.addRow("默认项目目录", row)
 
-        self.recent_spin = SpinBox(body)
+        # 数值输入一律定宽（`setFixedWidth` 使其不随 QFormLayout 拉伸满行）
+        self.recent_spin = SafeSpinBox(body)
         self.recent_spin.setRange(0, 50)
         self.recent_spin.setValue(self._config.max_recent)
+        self.recent_spin.setFixedWidth(
+            T.field_width(self.recent_spin, T.STEPPER_CHARS_NARROW)
+        )
         form.addRow("最近项目数量", self.recent_spin)
 
         self.open_last_check = QCheckBox("启动时打开最近项目", body)
         self.open_last_check.setChecked(self._config.open_last_project)
         form.addRow("", self.open_last_check)
 
-        self.threads_spin = SpinBox(body)
+        self.threads_spin = SafeSpinBox(body)
         self.threads_spin.setRange(1, 64)
         self.threads_spin.setValue(self._config.cpu_threads)
+        self.threads_spin.setFixedWidth(
+            T.field_width(self.threads_spin, T.STEPPER_CHARS_NARROW)
+        )
         form.addRow("训练 CPU 线程数", self.threads_spin)
 
         self.wheel_check = QCheckBox("滚轮反向缩放", body)
@@ -113,26 +120,35 @@ class PreferencesDialog(MessageBoxBase):
         self.pixel_check.setChecked(self._config.show_pixel_value)
         form.addRow("", self.pixel_check)
 
-        self.autosave_spin = QSpinBox(body)
+        self.autosave_spin = SafeSpinBox(body)
         self.autosave_spin.setRange(0, 600)
         self.autosave_spin.setSuffix(" 秒")
         self.autosave_spin.setValue(self._config.autosave_seconds)
         self.autosave_spin.setToolTip("0 表示关闭自动保存")
+        self.autosave_spin.setFixedWidth(
+            T.field_width(self.autosave_spin, T.STEPPER_CHARS_NARROW)
+        )
         form.addRow("自动保存间隔", self.autosave_spin)
 
         # 日志：单文件上限与保留份数（重启后生效）
-        self.log_count_spin = QSpinBox(body)
+        self.log_count_spin = SafeSpinBox(body)
         self.log_count_spin.setRange(1, 50)
         self.log_count_spin.setSuffix(" 份")
         self.log_count_spin.setValue(self._config.log_backup_count)
         self.log_count_spin.setToolTip("滚动日志保留份数（重启后生效）")
+        self.log_count_spin.setFixedWidth(
+            T.field_width(self.log_count_spin, T.STEPPER_CHARS_NARROW)
+        )
         form.addRow("日志保留", self.log_count_spin)
 
-        self.log_size_spin = QSpinBox(body)
+        self.log_size_spin = SafeSpinBox(body)
         self.log_size_spin.setRange(1, 100)
         self.log_size_spin.setSuffix(" MB")
         self.log_size_spin.setValue(self._config.log_max_mb)
         self.log_size_spin.setToolTip("单个日志文件上限（重启后生效）")
+        self.log_size_spin.setFixedWidth(
+            T.field_width(self.log_size_spin, T.STEPPER_CHARS_NARROW)
+        )
         form.addRow("单文件上限", self.log_size_spin)
         outer.addLayout(form)
 
@@ -150,7 +166,7 @@ class PreferencesDialog(MessageBoxBase):
         holder = QWidget(body)
         column = QVBoxLayout(holder)
         column.setContentsMargins(0, 0, 0, 0)
-        column.setSpacing(2)
+        column.setSpacing(T.SPACE_XXS)
         top = QHBoxLayout()
         text = CaptionLabel(f"{value}{suffix}", holder)
         top.addWidget(text)

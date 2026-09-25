@@ -38,6 +38,10 @@ from qfluentwidgets import (
 )
 
 from src.utils.constants import SPLIT_COLORS
+from src.views.ui import tokens as T
+
+# 标记 / 类别色块边长（装饰性尺寸，组件内部常量）
+_SWATCH_SIZE = 14
 from src.views.widgets import THUMB_MEDIUM, THUMB_STEPS
 
 _COLOR_EMPTY = "#1B1B1B"
@@ -67,9 +71,11 @@ class _FilterPanel(FlyoutViewBase):
         self._boxes: dict[str, CheckBox] = {}
         self._order: list[str] = []
         self.vBoxLayout = QVBoxLayout(self)
-        self.vBoxLayout.setContentsMargins(14, 10, 14, 12)
-        self.vBoxLayout.setSpacing(2)
-        self.setMinimumWidth(170)
+        self.vBoxLayout.setContentsMargins(
+            T.CARD_PAD_H, T.SPACE_ML, T.CARD_PAD_H, T.CARD_PAD_V
+        )
+        self.vBoxLayout.setSpacing(T.SPACE_XXS)
+        self.setMinimumWidth(T.PANEL_MIN_W)
 
     def set_items(self, items: list, selected=()) -> None:
         """items: [(key, text), ...]；selected 为已勾选的键（空 = 全部）。"""
@@ -162,8 +168,8 @@ class FilterBar(CardWidget):
         self._panel = None                # 当前展开的筛选面板（同时只留一个）
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 8, 12, 8)
-        layout.setSpacing(8)
+        layout.setContentsMargins(T.SPACE_LG, T.SPACE_MD, T.SPACE_LG, T.SPACE_MD)
+        layout.setSpacing(T.SPACE_MD)
 
         self.label_btn = self._menu_button("标签", FluentIcon.TAG, "label")
         layout.addWidget(self.label_btn)
@@ -182,7 +188,7 @@ class FilterBar(CardWidget):
         self.rules_clear_btn = TransparentToolButton(self)
         self.rules_clear_btn.setIcon(FluentIcon.DELETE)
         self.rules_clear_btn.setToolTip("清除自定义筛选规则")
-        self.rules_clear_btn.setFixedSize(24, 24)
+        self.rules_clear_btn.setFixedSize(T.ICON_BTN_SM, T.ICON_BTN_SM)
         self.rules_clear_btn.setVisible(False)
         self.rules_clear_btn.clicked.connect(lambda: self.rulesCleared.emit())
         layout.addWidget(self.rules_clear_btn)
@@ -194,7 +200,7 @@ class FilterBar(CardWidget):
 
         self.search = SearchLineEdit(self)
         self.search.setPlaceholderText("输入筛选文本")
-        self.search.setFixedWidth(180)
+        self.search.setFixedWidth(T.CTRL_W_XL)
         self.search.textChanged.connect(lambda _t: self.textChanged.emit(self.text()))
         self.search.searchSignal.connect(lambda _t: self.textChanged.emit(self.text()))
         layout.addWidget(self.search)
@@ -208,7 +214,7 @@ class FilterBar(CardWidget):
             self.size_slider = Slider(Qt.Orientation.Horizontal, self)
             self.size_slider.setRange(0, max(0, len(self._thumb_steps) - 1))
             self.size_slider.setValue(self._thumb_index(THUMB_MEDIUM))
-            self.size_slider.setFixedWidth(90)
+            self.size_slider.setFixedWidth(T.CTRL_W_SM)
             self.size_slider.setToolTip("缩略图尺寸（Ctrl + 滚轮）")
             self.size_slider.valueChanged.connect(self._on_slider_value)
             layout.addWidget(self.size_slider)
@@ -436,11 +442,11 @@ class SplitRow(QWidget):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 3, 8, 3)
-        layout.setSpacing(8)
+        layout.setContentsMargins(T.SPACE_MD, T.SPACE_XS, T.SPACE_MD, T.SPACE_XS)
+        layout.setSpacing(T.SPACE_MD)
 
         swatch = QLabel(self)
-        swatch.setFixedSize(14, 14)
+        swatch.setFixedSize(_SWATCH_SIZE, _SWATCH_SIZE)
         swatch.setStyleSheet(
             f"background: {color}; border: 1px solid #5A5A5A; border-radius: 2px;"
         )
@@ -473,8 +479,8 @@ class SplitMapCard(CardWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(6)
+        layout.setContentsMargins(T.CARD_PAD_H, T.CARD_PAD_V, T.CARD_PAD_H, T.CARD_PAD_V)
+        layout.setSpacing(T.SPACE_SM)
         layout.addWidget(StrongBodyLabel("数据集拆分映射", self))
 
         self.name_box = ComboBox(self)
@@ -484,10 +490,10 @@ class SplitMapCard(CardWidget):
         lock = QWidget(self)
         lock_layout = QHBoxLayout(lock)
         lock_layout.setContentsMargins(0, 0, 0, 0)
-        lock_layout.setSpacing(6)
+        lock_layout.setSpacing(T.SPACE_SM)
         lock_icon = TransparentToolButton(lock)
         lock_icon.setIcon(FluentIcon.CONSTRACT)
-        lock_icon.setFixedSize(22, 22)
+        lock_icon.setFixedSize(T.ICON_BTN_SM, T.ICON_BTN_SM)
         lock_icon.setEnabled(False)
         lock_layout.addWidget(lock_icon)
         self.lock_label = CaptionLabel("已用于训练，无法更改", lock)
@@ -542,17 +548,17 @@ class TagCard(CardWidget):
         self._colors: dict[str, str] = {}
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(6)
+        layout.setContentsMargins(T.CARD_PAD_H, T.CARD_PAD_V, T.CARD_PAD_H, T.CARD_PAD_V)
+        layout.setSpacing(T.SPACE_SM)
 
         header = QHBoxLayout()
-        header.setSpacing(6)
+        header.setSpacing(T.SPACE_SM)
         header.addWidget(StrongBodyLabel("图像标记", self))
         header.addStretch(1)
         self.add_btn = TransparentToolButton(self)
         self.add_btn.setIcon(FluentIcon.ADD)
         self.add_btn.setToolTip("新增图像标记")
-        self.add_btn.setFixedSize(28, 28)
+        self.add_btn.setFixedSize(T.ICON_BTN_MD, T.ICON_BTN_MD)
         self.add_btn.clicked.connect(self.addRequested)
         header.addWidget(self.add_btn)
         layout.addLayout(header)
@@ -564,7 +570,7 @@ class TagCard(CardWidget):
         holder = QWidget(self)
         self.grid = QGridLayout(holder)
         self.grid.setContentsMargins(0, 0, 0, 0)
-        self.grid.setSpacing(4)
+        self.grid.setSpacing(T.SPACE_XS)
         layout.addWidget(holder)
 
     def set_tags(self, names: list, colors: dict, counts: dict) -> None:
@@ -619,8 +625,8 @@ class DisplayBar(CardWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 8, 12, 8)
-        layout.setSpacing(8)
+        layout.setContentsMargins(T.SPACE_LG, T.SPACE_MD, T.SPACE_LG, T.SPACE_MD)
+        layout.setSpacing(T.SPACE_MD)
 
         layout.addWidget(StrongBodyLabel("显示", self))
 
@@ -628,7 +634,7 @@ class DisplayBar(CardWidget):
         self.brightness = Slider(Qt.Orientation.Horizontal, self)
         self.brightness.setRange(-100, 100)
         self.brightness.setValue(0)
-        self.brightness.setFixedWidth(110)
+        self.brightness.setFixedWidth(T.CTRL_W_MD)
         self.brightness.setToolTip("显示亮度（仅影响显示）")
         layout.addWidget(self.brightness)
 
@@ -636,7 +642,7 @@ class DisplayBar(CardWidget):
         self.contrast = Slider(Qt.Orientation.Horizontal, self)
         self.contrast.setRange(-100, 100)
         self.contrast.setValue(0)
-        self.contrast.setFixedWidth(110)
+        self.contrast.setFixedWidth(T.CTRL_W_MD)
         self.contrast.setToolTip("显示对比度（仅影响显示）")
         layout.addWidget(self.contrast)
 
@@ -647,7 +653,7 @@ class DisplayBar(CardWidget):
         self.name_width = Slider(Qt.Orientation.Horizontal, self)
         self.name_width.setRange(25, 100)
         self.name_width.setValue(60)
-        self.name_width.setFixedWidth(80)
+        self.name_width.setFixedWidth(T.CTRL_W_SM)
         self.name_width.setToolTip("类别名框宽度（占缩略图比例）")
         layout.addWidget(self.name_width)
 

@@ -92,8 +92,8 @@ class AnnotateTab(QWidget):
     # -----------------------------------------------------------
     def _build_ui(self) -> None:
         root = QHBoxLayout(self)
-        root.setContentsMargins(16, 12, 16, 12)
-        root.setSpacing(12)
+        root.setContentsMargins(T.SPACE_XL, T.SPACE_LG, T.SPACE_XL, T.SPACE_LG)
+        root.setSpacing(T.SPACE_LG)
 
         root.addWidget(self._build_left_column())
         root.addLayout(self._build_center(), 1)
@@ -103,8 +103,8 @@ class AnnotateTab(QWidget):
     def _build_left_column(self) -> QWidget:
         current_card = CardWidget(self)
         layout = QVBoxLayout(current_card)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(6)
+        layout.setContentsMargins(T.CARD_PAD_H, T.CARD_PAD_V, T.CARD_PAD_H, T.CARD_PAD_V)
+        layout.setSpacing(T.SPACE_SM)
         layout.addWidget(StrongBodyLabel("当前图像", current_card))
 
         self.preview = QLabel(current_card)
@@ -122,7 +122,7 @@ class AnnotateTab(QWidget):
         layout.addWidget(self.image_meta)
 
         nav_row = QHBoxLayout()
-        nav_row.setSpacing(6)
+        nav_row.setSpacing(T.SPACE_SM)
         self.prev_btn = PushButton("上一张", current_card)
         self.next_btn = PushButton("下一张", current_card)
         nav_row.addWidget(self.prev_btn)
@@ -130,7 +130,7 @@ class AnnotateTab(QWidget):
         layout.addLayout(nav_row)
 
         jump_row = QHBoxLayout()
-        jump_row.setSpacing(6)
+        jump_row.setSpacing(T.SPACE_SM)
         self.jump_spin = SafeSpinBox(current_card)
         self.jump_spin.setRange(1, 1)
         self.jump_spin.setFixedWidth(
@@ -143,8 +143,8 @@ class AnnotateTab(QWidget):
 
         list_card = CardWidget(self)
         list_layout = QVBoxLayout(list_card)
-        list_layout.setContentsMargins(14, 12, 14, 12)
-        list_layout.setSpacing(6)
+        list_layout.setContentsMargins(T.CARD_PAD_H, T.CARD_PAD_V, T.CARD_PAD_H, T.CARD_PAD_V)
+        list_layout.setSpacing(T.SPACE_SM)
         list_layout.addWidget(StrongBodyLabel("图像列表", list_card))
         self.grid = ThumbnailGrid(list_card)
         self.grid.set_thumb_size(THUMB_SMALL)
@@ -156,7 +156,7 @@ class AnnotateTab(QWidget):
     # --------------------------------------------------- 中间
     def _build_center(self) -> QVBoxLayout:
         column = QVBoxLayout()
-        column.setSpacing(10)
+        column.setSpacing(T.SPACE_ML)
         column.addWidget(self._build_toolbar())
         column.addWidget(self._build_preannotate_bar())
         column.addWidget(self._build_canvas_card(), 1)
@@ -283,7 +283,7 @@ class AnnotateTab(QWidget):
 
         self.progress_bar = ProgressBar(card)
         self.progress_bar.setRange(0, 100)
-        self.progress_bar.setFixedWidth(150)
+        self.progress_bar.setFixedWidth(T.CTRL_W_LG)
         self.task_label = CaptionLabel("", card)
         flow.addWidget(ToolGroup(self.progress_bar, self.task_label, parent=card))
         return card
@@ -291,11 +291,11 @@ class AnnotateTab(QWidget):
     def _build_canvas_card(self) -> CardWidget:
         card = CardWidget(self)
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(8)
+        layout.setContentsMargins(T.SPACE_LG, T.SPACE_ML, T.SPACE_LG, T.SPACE_ML)
+        layout.setSpacing(T.SPACE_MD)
 
         strip = QHBoxLayout()
-        strip.setSpacing(10)
+        strip.setSpacing(T.SPACE_ML)
         self.strip_position = StrongBodyLabel("—", card)
         strip.addWidget(self.strip_position)
         strip.addWidget(CaptionLabel("·", card))
@@ -321,8 +321,8 @@ class AnnotateTab(QWidget):
     def _build_right_column(self) -> QWidget:
         navigator_card = CardWidget(self)
         layout = QVBoxLayout(navigator_card)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(6)
+        layout.setContentsMargins(T.CARD_PAD_H, T.CARD_PAD_V, T.CARD_PAD_H, T.CARD_PAD_V)
+        layout.setSpacing(T.SPACE_SM)
         layout.addWidget(StrongBodyLabel("导航器", navigator_card))
         self.navigator = Navigator(navigator_card)
         layout.addWidget(self.navigator)
@@ -331,8 +331,8 @@ class AnnotateTab(QWidget):
 
         display_card = CardWidget(self)
         display_layout = QVBoxLayout(display_card)
-        display_layout.setContentsMargins(14, 12, 14, 12)
-        display_layout.setSpacing(6)
+        display_layout.setContentsMargins(T.CARD_PAD_H, T.CARD_PAD_V, T.CARD_PAD_H, T.CARD_PAD_V)
+        display_layout.setSpacing(T.SPACE_SM)
         display_layout.addWidget(StrongBodyLabel("显示", display_card))
 
         display_layout.addWidget(CaptionLabel("亮度", display_card))
@@ -350,8 +350,8 @@ class AnnotateTab(QWidget):
 
         item_card = CardWidget(self)
         item_layout = QVBoxLayout(item_card)
-        item_layout.setContentsMargins(14, 12, 14, 12)
-        item_layout.setSpacing(6)
+        item_layout.setContentsMargins(T.CARD_PAD_H, T.CARD_PAD_V, T.CARD_PAD_H, T.CARD_PAD_V)
+        item_layout.setSpacing(T.SPACE_SM)
         item_layout.addWidget(StrongBodyLabel("标注对象", item_card))
         self.item_list = QListWidget(item_card)
         self.item_list.setMinimumHeight(110)
@@ -371,11 +371,11 @@ class AnnotateTab(QWidget):
         # 数值编辑（参照 DLT 的「编辑选中标注」表）
         self.edit_card = CardWidget(self)
         edit_layout = QVBoxLayout(self.edit_card)
-        edit_layout.setContentsMargins(14, 12, 14, 12)
-        edit_layout.setSpacing(6)
+        edit_layout.setContentsMargins(T.CARD_PAD_H, T.CARD_PAD_V, T.CARD_PAD_H, T.CARD_PAD_V)
+        edit_layout.setSpacing(T.SPACE_SM)
         edit_layout.addWidget(StrongBodyLabel("编辑选中", self.edit_card))
         form = QFormLayout()
-        form.setSpacing(6)
+        form.setSpacing(T.SPACE_SM)
         self.item_class_combo = ComboBox(self.edit_card)
         self.item_class_combo.currentIndexChanged.connect(
             lambda _i: self._on_item_class_changed()
@@ -418,8 +418,8 @@ class AnnotateTab(QWidget):
 
         note_card = CardWidget(self)
         note_layout = QVBoxLayout(note_card)
-        note_layout.setContentsMargins(14, 12, 14, 12)
-        note_layout.setSpacing(6)
+        note_layout.setContentsMargins(T.CARD_PAD_H, T.CARD_PAD_V, T.CARD_PAD_H, T.CARD_PAD_V)
+        note_layout.setSpacing(T.SPACE_SM)
         note_layout.addWidget(StrongBodyLabel("备注", note_card))
         self.note_edit = QPlainTextEdit(note_card)
         self.note_edit.setPlaceholderText("为该图像填写备注…")

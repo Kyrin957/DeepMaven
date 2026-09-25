@@ -35,6 +35,7 @@ from qfluentwidgets import (
 
 from src.utils.constants import PROJECT_FILE_FILTER, PROJECT_TYPES, project_type
 from src.utils.tasks import backend_candidates
+from src.views.ui import tokens as T
 
 _COLUMNS = 3
 _UNSUPPORTED_COLOR = "#6A6A6A"
@@ -57,8 +58,8 @@ class MethodCard(QFrame):
         )
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 10, 14, 10)
-        layout.setSpacing(2)
+        layout.setContentsMargins(T.SPACE_LG, T.SPACE_MD, T.SPACE_LG, T.SPACE_MD)
+        layout.setSpacing(T.SPACE_XXS)
         title = StrongBodyLabel(item["label"], self)
         caption = CaptionLabel(item["short"], self)
         caption.setWordWrap(True)
@@ -134,11 +135,11 @@ class NewProjectDialog(MessageBoxBase):
         container = QWidget(self)
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
+        layout.setSpacing(T.SPACE_SM)
         layout.addWidget(CaptionLabel("从现有数据集创建", container))
 
         row = QHBoxLayout()
-        row.setSpacing(10)
+        row.setSpacing(T.SPACE_LG)
         self.dataset_btn = PushButton("选择数据集目录", container)
         self.dataset_btn.setIcon(FluentIcon.FOLDER)
         self.dataset_btn.clicked.connect(self._on_pick_dataset)
@@ -174,16 +175,16 @@ class NewProjectDialog(MessageBoxBase):
         container = QWidget(self)
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
+        layout.setSpacing(T.SPACE_SM)
         layout.addWidget(CaptionLabel("深度学习方法：", container))
 
         row = QHBoxLayout()
-        row.setSpacing(12)
+        row.setSpacing(T.SPACE_LG)
 
         grid_holder = QWidget(container)
         grid = QGridLayout(grid_holder)
         grid.setContentsMargins(0, 0, 0, 0)
-        grid.setSpacing(8)
+        grid.setSpacing(T.SPACE_MD)
         for index, item in enumerate(PROJECT_TYPES):
             card = MethodCard(item, grid_holder)
             card.clicked.connect(self._on_card_clicked)
@@ -193,14 +194,18 @@ class NewProjectDialog(MessageBoxBase):
 
         panel = QFrame(container)
         panel.setObjectName("MethodPanel")
-        panel.setFixedWidth(300)
+        panel.setFixedWidth(T.PANEL_W)
+        # 中性描边 / 底纹取设计令牌，明暗主题下都成立
         panel.setStyleSheet(
-            "#MethodPanel { border: 1px solid #333333; border-radius: 6px;"
-            " background: rgba(255, 255, 255, 0.03); }"
+            f"#MethodPanel {{ border: 1px solid {T.GROUP_BORDER};"
+            f" border-radius: {T.RADIUS_MD}px;"
+            f" background: {T.GROUP_BG}; }}"
         )
         panel_layout = QVBoxLayout(panel)
-        panel_layout.setContentsMargins(16, 14, 16, 14)
-        panel_layout.setSpacing(8)
+        panel_layout.setContentsMargins(
+            T.SPACE_XL, T.CARD_PAD_H, T.SPACE_XL, T.CARD_PAD_H
+        )
+        panel_layout.setSpacing(T.SPACE_MD)
         self.detail_title = StrongBodyLabel("对象检测", panel)
         self.detail_text = BodyLabel("", panel)
         self.detail_text.setWordWrap(True)
@@ -253,10 +258,10 @@ class NewProjectDialog(MessageBoxBase):
         container = QWidget(self)
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        layout.setSpacing(T.SPACE_MD)
 
         row = QHBoxLayout()
-        row.setSpacing(10)
+        row.setSpacing(T.SPACE_ML)
         row.addWidget(CaptionLabel("项目名称", container))
         self.name_edit = LineEdit(container)
         self.name_edit.setText("新项目")

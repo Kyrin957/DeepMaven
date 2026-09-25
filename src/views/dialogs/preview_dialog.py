@@ -10,6 +10,8 @@ from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
 from qfluentwidgets import CaptionLabel, MessageBoxBase, SubtitleLabel
 
+from src.views.ui import tokens as T
+
 
 class ImagePreviewDialog(MessageBoxBase):
     """图片预览弹窗。
@@ -34,12 +36,14 @@ class ImagePreviewDialog(MessageBoxBase):
         holder = QWidget(self)
         layout = QVBoxLayout(holder)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
+        layout.setSpacing(T.SPACE_SM)
 
         self.view = QLabel(holder)
         self.view.setMinimumSize(width, height)
         self.view.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.view.setStyleSheet("background:#1B1B1B; border-radius:4px;")
+        self.view.setStyleSheet(
+            f"background:{T.CANVAS_BG}; border-radius:{T.RADIUS_SM}px;"
+        )
         layout.addWidget(self.view)
 
         self.hint = CaptionLabel(hint or "", holder)

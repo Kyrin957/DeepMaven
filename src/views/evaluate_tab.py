@@ -42,7 +42,6 @@ from qfluentwidgets import (
     ScrollArea,
     SegmentedWidget,
     Slider,
-    SpinBox,
     StrongBodyLabel,
     TableWidget,
 )
@@ -58,6 +57,8 @@ from src.utils.constants import PLOT_COLORS
 from src.utils.tasks import VIEW_ANOMALY, VIEW_DETECT, VIEW_SEGMENT
 from src.viewmodels.evaluate_vm import EvaluateViewModel
 from src.views.data_widgets import side_column
+from src.views.ui import SafeSpinBox
+from src.views.ui import tokens as T
 from src.views.widgets import (
     BarChart,
     ConfusionMatrixView,
@@ -105,16 +106,16 @@ class EvaluateTab(QWidget):
     # -----------------------------------------------------------
     def _build_ui(self) -> None:
         root = QHBoxLayout(self)
-        root.setContentsMargins(16, 12, 16, 12)
-        root.setSpacing(12)
+        root.setContentsMargins(T.SPACE_XL, T.SPACE_LG, T.SPACE_XL, T.SPACE_LG)
+        root.setSpacing(T.SPACE_LG)
         root.addWidget(self._build_side(), 0)
         root.addLayout(self._build_main(), 1)
 
     def _card(self, title: str) -> tuple[CardWidget, QVBoxLayout]:
         card = CardWidget(self)
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(20, 16, 20, 16)
-        layout.setSpacing(10)
+        layout.setContentsMargins(T.SPACE_2XL, T.SPACE_XL, T.SPACE_2XL, T.SPACE_XL)
+        layout.setSpacing(T.SPACE_ML)
         if title:
             layout.addWidget(StrongBodyLabel(title, card))
         return card, layout
@@ -138,14 +139,14 @@ class EvaluateTab(QWidget):
         layout.addWidget(self.history_combo)
 
         form = QFormLayout()
-        form.setSpacing(8)
+        form.setSpacing(T.SPACE_MD)
         self.source_combo = ComboBox(config_card)
         self.source_combo.currentIndexChanged.connect(self._on_eval_source_picked)
         form.addRow("数据拆分", self.source_combo)
 
         # 评估图像集可多选（训练 / 验证 / 测试），对齐 DLT 的评估设置
         subsets_row = QHBoxLayout()
-        subsets_row.setSpacing(10)
+        subsets_row.setSpacing(T.SPACE_ML)
         self.subset_checks: dict[str, CheckBox] = {}
         for key, text in (("train", "训练"), ("val", "验证"), ("test", "测试")):
             box = CheckBox(text, config_card)
@@ -160,10 +161,13 @@ class EvaluateTab(QWidget):
         self.random_check.setToolTip("达到图片上限时随机抽取（相同种子结果可复现）")
         self.random_check.toggled.connect(self._on_random_changed)
         random_row.addWidget(self.random_check)
-        self.seed_spin = SpinBox(config_card)
+        self.seed_spin = SafeSpinBox(config_card)
         self.seed_spin.setRange(0, 999999)
         self.seed_spin.setToolTip("随机种子（相同种子结果可复现）")
         self.seed_spin.valueChanged.connect(self._on_seed_changed)
+        self.seed_spin.setFixedWidth(
+            T.field_width(self.seed_spin, T.STEPPER_CHARS)
+        )
         random_row.addWidget(self.seed_spin)
         random_row.addStretch(1)
         form.addRow("抽样", random_row)
@@ -181,10 +185,13 @@ class EvaluateTab(QWidget):
         self.device_combo.addItems(["auto", "cpu", "cuda:0"])
         form.addRow("设备", self.device_combo)
 
-        self.limit_spin = SpinBox(config_card)
+        self.limit_spin = SafeSpinBox(config_card)
         self.limit_spin.setRange(1, 5000)
         self.limit_spin.setValue(200)
         self.limit_spin.setSuffix(" 张")
+        self.limit_spin.setFixedWidth(
+            T.field_width(self.limit_spin, T.STEPPER_CHARS_NARROW)
+        )
         form.addRow("图片上限", self.limit_spin)
 
         self.anomaly_combo = ComboBox(config_card)
@@ -271,14 +278,18 @@ class EvaluateTab(QWidget):
 
         min_size_row = QHBoxLayout()
         min_size_row.addWidget(CaptionLabel("最小缺陷尺寸", self.anomaly_card))
-        self.min_size_spin = SpinBox(self.anomaly_card)
+        self.min_size_spin = SafeSpinBox(self.anomaly_card)
         self.min_size_spin.setRange(0, 100000)
+        self.min_size_spin.setFixedWidth(
+            T.field_width(self.min_size_spin, T.STEPPER_CHARS)
+        )
         self.min_size_spin.setSuffix(" px")
         self.min_size_spin.setToolTip(
             "小于该尺寸的高分区域视为噪声（需要异常热力图；无热力图时按分数判定）"
         )
         self.min_size_spin.valueChanged.connect(self._on_min_size)
-        min_size_row.addWidget(self.min_size_spin, 1)
+        min_size_row.addWidget(self.min_size_spin)
+        min_size_row.addStretch(1)
         anomaly_layout.addLayout(min_size_row)
 
         self.anomaly_hint = CaptionLabel("", self.anomaly_card)
@@ -330,11 +341,11 @@ class EvaluateTab(QWidget):
     # --------------------------------------------------- 中央
     def _build_main(self) -> QVBoxLayout:
         column = QVBoxLayout()
-        column.setSpacing(10)
+        column.setSpacing(T.SPACE_ML)
 
         header = CardWidget(self)
         header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(16, 10, 16, 10)
+        header_layout.setContentsMargins(T.SPACE_XL, T.SPACE_ML, T.SPACE_XL, T.SPACE_ML)
         self.tab_seg = SegmentedWidget(header)
         self.tab_seg.addItem("eval", "评估", onClick=lambda: self._switch(0))
         self.tab_seg.addItem("demo", "推理", onClick=lambda: self._switch(1))
@@ -358,14 +369,14 @@ class EvaluateTab(QWidget):
         pane = QWidget(self)
         layout = QHBoxLayout(pane)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
+        layout.setSpacing(T.SPACE_ML)
         layout.addLayout(self._build_center_column(), 1)
         layout.addWidget(self._build_detail_column(), 0)
         return pane
 
     def _build_center_column(self) -> QVBoxLayout:
         column = QVBoxLayout()
-        column.setSpacing(10)
+        column.setSpacing(T.SPACE_ML)
         column.addWidget(self._build_metric_card())
         column.addWidget(self._build_matrix_card())
         column.addWidget(self._build_images_card(), 1)
@@ -379,13 +390,13 @@ class EvaluateTab(QWidget):
             ("平均推断时间", "avg_ms"), ("已用时间", "elapsed"),
         ]
         grid = QGridLayout()
-        grid.setSpacing(10)
+        grid.setSpacing(T.SPACE_ML)
         self._tiles: dict[str, BodyLabel] = {}
         for index, (title, key) in enumerate(tiles):
             box = QWidget(card)
             inner = QVBoxLayout(box)
             inner.setContentsMargins(0, 0, 0, 0)
-            inner.setSpacing(2)
+            inner.setSpacing(T.SPACE_XXS)
             inner.addWidget(CaptionLabel(title, box))
             value = BodyLabel("—", box)
             inner.addWidget(value)
@@ -397,13 +408,13 @@ class EvaluateTab(QWidget):
         self.fp_row = QWidget(card)
         fp_layout = QHBoxLayout(self.fp_row)
         fp_layout.setContentsMargins(0, 0, 0, 0)
-        fp_layout.setSpacing(10)
+        fp_layout.setSpacing(T.SPACE_ML)
         self._fp_tiles: dict[str, BodyLabel] = {}
         for key, label in FP_REASONS + (("total", "合计"),):
             box = QWidget(self.fp_row)
             inner = QVBoxLayout(box)
             inner.setContentsMargins(0, 0, 0, 0)
-            inner.setSpacing(2)
+            inner.setSpacing(T.SPACE_XXS)
             inner.addWidget(CaptionLabel(f"误检 · {label}", box))
             value = BodyLabel("—", box)
             inner.addWidget(value)
@@ -459,7 +470,7 @@ class EvaluateTab(QWidget):
         self.page_buttons: dict[str, PushButton] = {}
         for key, text in (("first", "|◀"), ("prev", "◀"), ("next", "▶"), ("last", "▶|")):
             button = PushButton(text, card)
-            button.setFixedWidth(38)
+            button.setFixedWidth(T.PAGER_BTN_W)
             button.clicked.connect(lambda _c=False, name=key: self._on_page(name))
             tools.addWidget(button)
             self.page_buttons[key] = button
@@ -480,7 +491,7 @@ class EvaluateTab(QWidget):
         layout.addWidget(self.detail_name)
 
         form = QFormLayout()
-        form.setSpacing(8)
+        form.setSpacing(T.SPACE_MD)
         self.true_combo = ComboBox(detail_card)
         self.true_combo.currentIndexChanged.connect(self._on_true_label_changed)
         form.addRow("真实类别", self.true_combo)
@@ -537,10 +548,10 @@ class EvaluateTab(QWidget):
         holder = QWidget(self)
         column = QVBoxLayout(holder)
         column.setContentsMargins(0, 0, 0, 0)
-        column.setSpacing(10)
+        column.setSpacing(T.SPACE_ML)
         column.addWidget(detail_card)
         column.addWidget(metrics_card, 1)
-        holder.setFixedWidth(300)
+        holder.setFixedWidth(T.PANEL_W)
         return holder
 
     # --------------------------------------------------- 推理分页（原检测能力）
@@ -550,8 +561,8 @@ class EvaluateTab(QWidget):
         area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         body = QWidget()
         layout = QVBoxLayout(body)
-        layout.setContentsMargins(2, 2, 2, 2)
-        layout.setSpacing(10)
+        layout.setContentsMargins(T.SPACE_XXS, T.SPACE_XXS, T.SPACE_XXS, T.SPACE_XXS)
+        layout.setSpacing(T.SPACE_ML)
         layout.addWidget(self._build_input_card())
         layout.addWidget(self._build_result_card())
         layout.addStretch(1)
@@ -597,7 +608,7 @@ class EvaluateTab(QWidget):
         row.addStretch(1)
         self.detect_progress = ProgressBar(card)
         self.detect_progress.setRange(0, 100)
-        self.detect_progress.setFixedWidth(150)
+        self.detect_progress.setFixedWidth(T.CTRL_W_LG)
         row.addWidget(self.detect_progress)
         layout.addLayout(row)
         return card

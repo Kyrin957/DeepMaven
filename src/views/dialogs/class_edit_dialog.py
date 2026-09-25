@@ -21,6 +21,8 @@ from qfluentwidgets import (
     SubtitleLabel,
 )
 
+from src.views.ui import tokens as T
+
 # 常用配色（一键选色；真正想要的颜色可在色板上自选）
 PRESET_COLORS = (
     "#005FB8", "#0F7B0F", "#C42B1C", "#8764B8",
@@ -216,10 +218,10 @@ class ClassEditDialog(MessageBoxBase):
         holder = QWidget(self)
         row = QHBoxLayout(holder)
         row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(18)
+        row.setSpacing(T.SPACE_XL)
 
         form = QVBoxLayout()
-        form.setSpacing(5)
+        form.setSpacing(T.SPACE_SM)
 
         form.addWidget(CaptionLabel("名称", holder))
         self.name_edit = LineEdit(holder)
@@ -234,7 +236,7 @@ class ClassEditDialog(MessageBoxBase):
         form.addWidget(self.color_edit)
 
         presets = QHBoxLayout()
-        presets.setSpacing(4)
+        presets.setSpacing(T.SPACE_XS)
         for value in PRESET_COLORS:
             presets.addWidget(self._preset_button(value, holder))
         presets.addStretch(1)
@@ -257,7 +259,7 @@ class ClassEditDialog(MessageBoxBase):
 
     def _preset_button(self, value: str, parent) -> PushButton:
         button = PushButton(parent)
-        button.setFixedSize(22, 22)
+        button.setFixedSize(T.ICON_BTN_SM, T.ICON_BTN_SM)
         button.setToolTip(value)
         button.setStyleSheet(
             f"PushButton {{ background: {value}; border: 1px solid #5A5A5A;"

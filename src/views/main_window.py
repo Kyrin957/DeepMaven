@@ -43,6 +43,8 @@ from src.utils.constants import (
     NAV_MIN_WIDTH,
     NAV_WIDTH_MARGIN,
     PROJECT_FILE_FILTER,
+    WINDOW_MIN_HEIGHT,
+    WINDOW_MIN_WIDTH,
 )
 from src.utils.config import ConfigManager
 from src.utils.history import stack
@@ -84,6 +86,7 @@ from src.views import (
 from src.views.dialogs.preferences_dialog import PreferencesDialog
 from src.views.dialogs.shortcut_dialog import ShortcutDialog
 from src.views.shortcuts import ShortcutManager
+from src.views.ui import tokens as T
 
 logger = get_logger("main_window")
 
@@ -95,7 +98,8 @@ class MainWindow(FluentWindow):
         super().__init__(parent)
         self.setWindowTitle(f"{APP_NAME} — 深度学习缺陷检测系统")
         self.resize(1280, 800)
-        self.setMinimumSize(1080, 680)
+        # 最小尺寸取自常量，避免与 constants.py 里的定义各写一份
+        self.setMinimumSize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
         # 应用品牌色
         setThemeColor(BRAND_COLOR)
 
@@ -295,10 +299,10 @@ class MainWindow(FluentWindow):
     def _create_status_bar(self) -> QFrame:
         bar = QFrame(self)
         bar.setObjectName("statusBar")
-        bar.setFixedHeight(30)
+        bar.setFixedHeight(T.ROW_H)
         layout = QHBoxLayout(bar)
-        layout.setContentsMargins(12, 0, 16, 0)
-        layout.setSpacing(8)
+        layout.setContentsMargins(T.SPACE_LG, 0, T.SPACE_XL, 0)
+        layout.setSpacing(T.SPACE_MD)
 
         self.status_label = QLabel("", bar)
         self.status_label.setObjectName("statusText")

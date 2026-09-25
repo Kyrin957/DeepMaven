@@ -19,6 +19,8 @@ from qfluentwidgets import (
     SubtitleLabel,
 )
 
+from src.views.ui import tokens as T
+
 # 列出的模型数量上限（超过则折叠为「另有 N 个」）
 _MAX_MODELS = 6
 
@@ -52,7 +54,7 @@ class DeleteProjectDialog(MessageBoxBase):
         body = QWidget(self)
         layout = QVBoxLayout(body)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
+        layout.setSpacing(T.SPACE_SM)
 
         layout.addWidget(BodyLabel("以下内容将被永久删除：", body))
         for item in self._paths(info):

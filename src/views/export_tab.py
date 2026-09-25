@@ -20,7 +20,6 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
-    QSpinBox,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
@@ -42,6 +41,8 @@ from qfluentwidgets import (
 from src.utils.constants import EXPORT_FORMATS, SPLIT_COLORS
 from src.viewmodels.export_vm import ExportViewModel
 from src.views.data_widgets import side_column
+from src.views.ui import SafeSpinBox
+from src.views.ui import tokens as T
 from src.views.widgets import LegendList, PieChart
 
 _REPORT_FORMATS = [
@@ -73,8 +74,8 @@ class ExportTab(QWidget):
     # -----------------------------------------------------------
     def _build_ui(self) -> None:
         root = QHBoxLayout(self)
-        root.setContentsMargins(16, 12, 16, 12)
-        root.setSpacing(12)
+        root.setContentsMargins(T.SPACE_XL, T.SPACE_LG, T.SPACE_XL, T.SPACE_LG)
+        root.setSpacing(T.SPACE_LG)
         root.addWidget(self._build_side(), 0)
         root.addLayout(self._build_center(), 1)
         root.addWidget(self._build_actions(), 0)
@@ -82,8 +83,8 @@ class ExportTab(QWidget):
     def _card(self, title: str) -> tuple[CardWidget, QVBoxLayout]:
         card = CardWidget(self)
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(20, 16, 20, 16)
-        layout.setSpacing(10)
+        layout.setContentsMargins(T.SPACE_2XL, T.SPACE_XL, T.SPACE_2XL, T.SPACE_XL)
+        layout.setSpacing(T.SPACE_ML)
         if title:
             layout.addWidget(StrongBodyLabel(title, card))
         return card, layout
@@ -94,7 +95,7 @@ class ExportTab(QWidget):
         box = QWidget(parent)
         inner = QVBoxLayout(box)
         inner.setContentsMargins(0, 0, 0, 0)
-        inner.setSpacing(2)
+        inner.setSpacing(T.SPACE_XXS)
         inner.addWidget(CaptionLabel(title, box))
         value = BodyLabel("—", box)
         value.setWordWrap(True)
@@ -120,7 +121,7 @@ class ExportTab(QWidget):
         layout.addLayout(weights_row)
 
         form = QFormLayout()
-        form.setSpacing(8)
+        form.setSpacing(T.SPACE_MD)
         self.format_combo = ComboBox(card)
         for fmt in EXPORT_FORMATS:
             self.format_combo.addItem(fmt["label"], userData=fmt["key"])
@@ -138,15 +139,23 @@ class ExportTab(QWidget):
         form.addRow("导出目录", out_row)
 
         size_row = QHBoxLayout()
-        self.imgsz_spin = QSpinBox(card)
+        size_row.setSpacing(T.SPACE_MD)
+        self.imgsz_spin = SafeSpinBox(card)
         self.imgsz_spin.setRange(64, 4096)
         self.imgsz_spin.setSingleStep(32)
+        self.imgsz_spin.setFixedWidth(
+            T.field_width(self.imgsz_spin, T.STEPPER_CHARS_WIDE)
+        )
         self.imgsz_spin.valueChanged.connect(self._on_params_changed)
-        size_row.addWidget(self.imgsz_spin, 1)
-        self.opset_spin = QSpinBox(card)
+        size_row.addWidget(self.imgsz_spin)
+        self.opset_spin = SafeSpinBox(card)
         self.opset_spin.setRange(9, 20)
+        self.opset_spin.setFixedWidth(
+            T.field_width(self.opset_spin, T.STEPPER_CHARS_NARROW)
+        )
         self.opset_spin.valueChanged.connect(self._on_params_changed)
-        size_row.addWidget(self.opset_spin, 1)
+        size_row.addWidget(self.opset_spin)
+        size_row.addStretch(1)
         form.addRow("尺寸 / Opset", size_row)
         layout.addLayout(form)
 
@@ -166,7 +175,7 @@ class ExportTab(QWidget):
     # --------------------------------------------------- 中央
     def _build_center(self) -> QVBoxLayout:
         column = QVBoxLayout()
-        column.setSpacing(10)
+        column.setSpacing(T.SPACE_ML)
         column.addWidget(self._build_model_card(), 0)
         column.addWidget(self._build_split_card(), 1)
         column.addWidget(self._build_eval_card(), 1)
@@ -181,7 +190,7 @@ class ExportTab(QWidget):
         layout.addWidget(self.model_path)
 
         grid = QGridLayout()
-        grid.setSpacing(10)
+        grid.setSpacing(T.SPACE_ML)
         self.model_tiles = {
             "variant": self._tile(card, grid, 0, 0, "模型变体"),
             "source": self._tile(card, grid, 0, 1, "来源"),
@@ -212,7 +221,7 @@ class ExportTab(QWidget):
         card, layout = self._card("评估结果")
         row = QHBoxLayout()
         grid = QGridLayout()
-        grid.setSpacing(10)
+        grid.setSpacing(T.SPACE_ML)
         self.eval_tiles = {
             "wrong": self._tile(card, grid, 0, 0, "错误预测"),
             "correct": self._tile(card, grid, 0, 1, "正确预测"),
@@ -281,11 +290,11 @@ class ExportTab(QWidget):
         holder = QWidget(self)
         column = QVBoxLayout(holder)
         column.setContentsMargins(0, 0, 0, 0)
-        column.setSpacing(10)
+        column.setSpacing(T.SPACE_ML)
         column.addWidget(export_card, 0)
         column.addWidget(report_card, 0)
         column.addWidget(history_card, 1)
-        holder.setFixedWidth(300)
+        holder.setFixedWidth(T.PANEL_W)
         return holder
 
     # -----------------------------------------------------------

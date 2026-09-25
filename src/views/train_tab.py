@@ -142,16 +142,16 @@ class TrainTab(QWidget):
     # -----------------------------------------------------------
     def _build_ui(self) -> None:
         root = QHBoxLayout(self)
-        root.setContentsMargins(16, 12, 16, 12)
-        root.setSpacing(12)
+        root.setContentsMargins(T.SPACE_XL, T.SPACE_LG, T.SPACE_XL, T.SPACE_LG)
+        root.setSpacing(T.SPACE_LG)
         root.addWidget(self._build_side(), 0)
         root.addLayout(self._build_main(), 1)
 
     def _card(self, title: str) -> tuple[CardWidget, QVBoxLayout]:
         card = CardWidget(self)
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(20, 16, 20, 16)
-        layout.setSpacing(10)
+        layout.setContentsMargins(T.SPACE_2XL, T.SPACE_XL, T.SPACE_2XL, T.SPACE_XL)
+        layout.setSpacing(T.SPACE_ML)
         if title:
             layout.addWidget(StrongBodyLabel(title, card))
         return card, layout
@@ -215,12 +215,12 @@ class TrainTab(QWidget):
     # --------------------------------------------------- 中央
     def _build_main(self) -> QVBoxLayout:
         column = QVBoxLayout()
-        column.setSpacing(10)
+        column.setSpacing(T.SPACE_ML)
 
         header = CardWidget(self)
         header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(16, 10, 16, 10)
-        header_layout.setSpacing(12)
+        header_layout.setContentsMargins(T.SPACE_XL, T.SPACE_ML, T.SPACE_XL, T.SPACE_ML)
+        header_layout.setSpacing(T.SPACE_LG)
         self.tab_seg = SegmentedWidget(header)
         self.tab_seg.addItem("settings", "设置", onClick=lambda: self._switch(0))
         self.tab_seg.addItem("results", "结果", onClick=lambda: self._switch(1))
@@ -255,8 +255,8 @@ class TrainTab(QWidget):
         area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         body = QWidget()
         layout = QVBoxLayout(body)
-        layout.setContentsMargins(2, 2, 2, 2)
-        layout.setSpacing(10)
+        layout.setContentsMargins(T.SPACE_XXS, T.SPACE_XXS, T.SPACE_XXS, T.SPACE_XXS)
+        layout.setSpacing(T.SPACE_ML)
         layout.addWidget(self._build_setup_card())
         layout.addWidget(self._build_split_card())
         layout.addWidget(self._build_model_card())
@@ -395,7 +395,7 @@ class TrainTab(QWidget):
         layout.addWidget(self.data_label)
 
         chart_row = QHBoxLayout()
-        chart_row.setSpacing(12)
+        chart_row.setSpacing(T.SPACE_LG)
         self.pie = PieChart(card)
         self.pie.setFixedHeight(160)
         chart_row.addWidget(self.pie, 1)
@@ -548,7 +548,7 @@ class TrainTab(QWidget):
         self.weight_holder = QWidget(card)
         self.weight_grid = QGridLayout(self.weight_holder)
         self.weight_grid.setContentsMargins(0, 0, 0, 0)
-        self.weight_grid.setSpacing(4)
+        self.weight_grid.setSpacing(T.SPACE_XS)
         layout.addWidget(self.weight_holder)
 
         buttons = QHBoxLayout()
@@ -625,7 +625,7 @@ class TrainTab(QWidget):
         self.aug_holder = QWidget(card)
         grid = QGridLayout(self.aug_holder)
         grid.setContentsMargins(0, 0, 0, 0)
-        grid.setSpacing(8)
+        grid.setSpacing(T.SPACE_MD)
         for index, (key, label, minimum, maximum, default, step) in enumerate(
             _AUG_PARAMS
         ):
@@ -656,8 +656,8 @@ class TrainTab(QWidget):
         area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         body = QWidget()
         layout = QVBoxLayout(body)
-        layout.setContentsMargins(2, 2, 2, 2)
-        layout.setSpacing(10)
+        layout.setContentsMargins(T.SPACE_XXS, T.SPACE_XXS, T.SPACE_XXS, T.SPACE_XXS)
+        layout.setSpacing(T.SPACE_ML)
         layout.addWidget(self._build_progress_card())
         layout.addWidget(self._build_curve_card())
         layout.addWidget(self._build_compare_card())
@@ -678,12 +678,12 @@ class TrainTab(QWidget):
             ("已用时", "elapsed"), ("预计剩余", "eta"), ("最佳指标", "best"),
         ]
         grid = QGridLayout()
-        grid.setSpacing(10)
+        grid.setSpacing(T.SPACE_ML)
         for index, (title, key) in enumerate(tiles):
             box = QWidget(card)
             column = QVBoxLayout(box)
             column.setContentsMargins(0, 0, 0, 0)
-            column.setSpacing(2)
+            column.setSpacing(T.SPACE_XXS)
             column.addWidget(CaptionLabel(title, box))
             value = BodyLabel("—", box)
             column.addWidget(value)
@@ -727,8 +727,8 @@ class TrainTab(QWidget):
         area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         body = QWidget()
         layout = QVBoxLayout(body)
-        layout.setContentsMargins(2, 2, 2, 2)
-        layout.setSpacing(10)
+        layout.setContentsMargins(T.SPACE_XXS, T.SPACE_XXS, T.SPACE_XXS, T.SPACE_XXS)
+        layout.setSpacing(T.SPACE_ML)
         layout.addWidget(self._build_model_table_card())
         layout.addWidget(self._build_compare_curve_card())
         layout.addWidget(self._build_compare_metric_card())

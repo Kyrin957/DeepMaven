@@ -37,12 +37,13 @@ from qfluentwidgets import (
     LineEdit,
     MessageBoxBase,
     PushButton,
-    SpinBox,
     SubtitleLabel,
     TreeWidget,
 )
 
 from src.services.dataset_service import DatasetService
+from src.views.ui import SafeSpinBox
+from src.views.ui import tokens as T
 from src.utils.constants import IMAGE_EXTS
 
 _IMAGE_FILTER = "图片 (*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp)"
@@ -78,7 +79,7 @@ class _KindSelector(QWidget):
         super().__init__(parent)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
+        layout.setSpacing(T.SPACE_SM)
 
         self._group = QButtonGroup(self)
         self._group.setExclusive(True)
@@ -203,12 +204,12 @@ class ImportImagesDialog(MessageBoxBase):
         holder = QWidget(self)
         layout = QVBoxLayout(holder)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        layout.setSpacing(T.SPACE_MD)
 
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        form.setHorizontalSpacing(12)
-        form.setVerticalSpacing(8)
+        form.setHorizontalSpacing(T.SPACE_LG)
+        form.setVerticalSpacing(T.SPACE_MD)
 
         # 图像来源
         self.path_edit = LineEdit(holder)
@@ -219,7 +220,7 @@ class ImportImagesDialog(MessageBoxBase):
         source_row = QWidget(holder)
         source_layout = QHBoxLayout(source_row)
         source_layout.setContentsMargins(0, 0, 0, 0)
-        source_layout.setSpacing(8)
+        source_layout.setSpacing(T.SPACE_MD)
         source_layout.addWidget(self.path_edit, 1)
         source_layout.addWidget(self.browse_btn)
         form.addRow(CaptionLabel("图像来源", holder), source_row)
@@ -244,23 +245,27 @@ class ImportImagesDialog(MessageBoxBase):
     def _build_levels(self, parent) -> QGridLayout:
         """顶部「文件夹层级 → 类别名」设置。"""
         grid = QGridLayout()
-        grid.setHorizontalSpacing(12)
-        grid.setVerticalSpacing(8)
+        grid.setHorizontalSpacing(T.SPACE_LG)
+        grid.setVerticalSpacing(T.SPACE_MD)
 
         self.left_check = CheckBox("左侧文件夹级别", parent)
-        self.left_spin = SpinBox(parent)
+        self.left_spin = SafeSpinBox(parent)
         self.left_spin.setRange(1, _MAX_LEVEL)
         self.left_spin.setValue(1)
-        self.left_spin.setFixedWidth(108)
+        self.left_spin.setFixedWidth(
+            T.field_width(self.left_spin, T.STEPPER_CHARS_NARROW)
+        )
         self.left_spin.setEnabled(False)
         self.left_check.toggled.connect(self._on_levels_changed)
         self.left_spin.valueChanged.connect(lambda _v: self._refresh_labels())
 
         self.right_check = CheckBox("右侧文件夹级别", parent)
-        self.right_spin = SpinBox(parent)
+        self.right_spin = SafeSpinBox(parent)
         self.right_spin.setRange(1, _MAX_LEVEL)
         self.right_spin.setValue(1)
-        self.right_spin.setFixedWidth(108)
+        self.right_spin.setFixedWidth(
+            T.field_width(self.right_spin, T.STEPPER_CHARS_NARROW)
+        )
         self.right_check.setChecked(True)
         self.right_check.toggled.connect(self._on_levels_changed)
         self.right_spin.valueChanged.connect(lambda _v: self._refresh_labels())
@@ -271,7 +276,7 @@ class ImportImagesDialog(MessageBoxBase):
         self.sep_edit = LineEdit(parent)
         self.sep_edit.setText(_DEFAULT_SEPARATOR)
         self.sep_edit.setMaxLength(3)
-        self.sep_edit.setFixedWidth(72)
+        self.sep_edit.setFixedWidth(T.CTRL_W_SM)
         self.sep_edit.textChanged.connect(lambda _t: self._refresh_labels())
 
         grid.addWidget(self.left_check, 0, 0)
@@ -282,7 +287,7 @@ class ImportImagesDialog(MessageBoxBase):
 
         separator_row = QHBoxLayout()
         separator_row.setContentsMargins(0, 0, 0, 0)
-        separator_row.setSpacing(8)
+        separator_row.setSpacing(T.SPACE_MD)
         separator_row.addWidget(CaptionLabel("类别名称定界符", parent))
         separator_row.addWidget(self.sep_edit)
         separator_row.addStretch(1)
