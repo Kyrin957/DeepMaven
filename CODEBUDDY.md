@@ -10,8 +10,10 @@ MVVM 架构：`models/`（数据）→ `services/`（业务/训练）→ `viewmo
 
 ## 界面硬约束（不可违反）
 
-1. **禁止单行塞满控件**——工具条 / 操作栏必须用 `FlowLayout` + `ToolGroup`
-   分组，宽度不足时整组换行，绝不允许控件互相重叠。
+1. **禁止单行塞满控件**——工具条 / 操作栏 / 筛选栏 / 翻页行必须用
+   `FlowContainer` + `ToolGroup` 分组，宽度不足时整组换行。
+   **既不允许控件互相重叠，也不允许文字被截断**（控件宽不得小于
+   `sizeHint().width()`；放不下就折行，极窄时才降级为只显示图标）。
 2. **数值输入框必须定宽**——用 `tokens.field_width()`，禁止 `QFormLayout`
    把参数框拉伸填满整行。
 3. **参数输入框滚轮不改值**——一律 `SafeSpinBox` / `SafeDoubleSpinBox`；

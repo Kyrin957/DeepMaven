@@ -16,21 +16,37 @@ enabled: true
 
 ## 1. 布局：容器化 + 可换行，禁止"单行塞满"
 
-- **禁止**把 3 个以上控件直接塞进一个 `QHBoxLayout` 作为工具条。`QHBoxLayout`
-  空间不足时**不会换行**，只会压缩到互相覆盖（历史故障：标注页
-  「浏览｜矩形｜多边形｜存标」文字与指示条重叠）。
-- 工具条 / 操作栏一律用 `FlowLayout` + `ToolGroup`：
+- **禁止**把 3 个以上控件直接塞进一个 `QHBoxLayout` 作为工具条 / 操作栏 /
+  筛选栏 / 翻页行。`QHBoxLayout` 空间不足时**不会换行**，只会把子项压到最小：
+  - 紧的会**互相覆盖**（标注页工具条文字与指示条重叠）；
+  - 宽的会把**文字截断**（图库筛选栏「标签: 全部」被压成「签: 全」、
+    评估页「Grad-CAM」被压到 35px）。
+
+  **这两种现象都不允许出现**——商业软件里任何一处文字被截断都是缺陷。
+- 上述行一律用 `FlowContainer` + `ToolGroup`：
 
   ```python
-  from src.views.ui import FlowLayout, ToolGroup
+  from src.views.ui import FlowContainer, ToolGroup
 
-  flow = FlowLayout(card, spacing=T.SPACE_MD)
-  flow.setContentsMargins(T.SPACE_XL, T.SPACE_MD, T.SPACE_XL, T.SPACE_MD)
-  flow.addWidget(ToolGroup(label, combo, parent=card))
-  flow.addWidget(ToolGroup(btn_a, btn_b, parent=card))
+  container = FlowContainer(
+      card, spacing=T.SPACE_MD,
+      margins=(T.SPACE_XL, T.SPACE_MD, T.SPACE_XL, T.SPACE_MD),
+  )
+  card_layout.addWidget(container)
+  container.add(ToolGroup(label, combo, parent=card))   # 一组：整体折行
+  container.add(ToolGroup(btn_a, btn_b, parent=card))
+  container.add(single_button)                          # 单个：独立折行
   ```
 
-- 每个 `ToolGroup` 是一个"逻辑分组"，整体折行、不会被拆散。
+- 每个 `ToolGroup` 是一个"逻辑分组"，整体折行、不被拆散；
+  需要独立折行的单个控件，直接 `container.add(控件)`。
+- **控件不得被压到小于其 `sizeHint().width()`**（否则文字必被截断）。
+  放不下就折行。确需给宽度时用**下限** `setMinimumWidth`，
+  **不要**用 `setFixedWidth` 去"将就"一个过窄的值
+  （历史故障：把「|◀」固定成 38px 后文字被截）。
+- 若在最窄可用宽度下**整行都放不下**（极窄侧栏 / 极高缩放），
+  才降级为**只显示图标**（`setIcon` + 空文本 + `setToolTip`），
+  而不是让文字被截断。
 - **整组显隐**用 `group.setVisible(...)`，不要逐个隐藏组内控件
   （`FlowLayout` 会自动跳过隐藏分组，不留空位）。
 
@@ -146,6 +162,11 @@ $env:QT_QPA_PLATFORM="offscreen"
    - `win.minimumSize()` 不超出屏幕可用区域
    - 页面内可变行数容器（`FlowContainer`）的 `minimumHeight() == 0`
      —— 一旦不为 0，说明有人注入了显式最小尺寸，故障即将复发。
+5. **横向压缩断言（必做）**：遍历各页内可渲染文字的控件
+   （按钮 / 下拉 / 勾选 / **未开启换行**的标签），断言
+   `控件宽 + 1 >= 控件.sizeHint().width()`。
+   不满足即说明该行在被压缩、文字即将被截断。
+   文本输入框与数字框允许更窄（内容内部滚动），排除在外。
 
 ## 9. 参考实现
 

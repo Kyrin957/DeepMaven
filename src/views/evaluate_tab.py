@@ -57,7 +57,7 @@ from src.utils.constants import PLOT_COLORS
 from src.utils.tasks import VIEW_ANOMALY, VIEW_DETECT, VIEW_SEGMENT
 from src.viewmodels.evaluate_vm import EvaluateViewModel
 from src.views.data_widgets import side_column
-from src.views.ui import SafeSpinBox
+from src.views.ui import FlowContainer, SafeSpinBox, ToolGroup
 from src.views.ui import tokens as T
 from src.views.widgets import (
     BarChart,
@@ -365,22 +365,34 @@ class EvaluateTab(QWidget):
     def _switch(self, index: int) -> None:
         self.stack.setCurrentIndex(index)
 
+    def _scroll_column(self, inner: QWidget, fixed_width: int | None = None) -> ScrollArea:
+        """把一列内容放进滚动区：窗口变矮时滚动，而不是被挤压 / 裁剪（§4.4）。"""
+        area = ScrollArea(self)
+        area.setWidgetResizable(True)
+        area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        if fixed_width is not None:
+            area.setFixedWidth(fixed_width)
+        area.setWidget(inner)
+        return area
+
     def _build_eval_pane(self) -> QWidget:
         pane = QWidget(self)
         layout = QHBoxLayout(pane)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(T.SPACE_ML)
-        layout.addLayout(self._build_center_column(), 1)
+        layout.addWidget(self._build_center_column(), 1)
         layout.addWidget(self._build_detail_column(), 0)
         return pane
 
-    def _build_center_column(self) -> QVBoxLayout:
-        column = QVBoxLayout()
+    def _build_center_column(self) -> QWidget:
+        body = QWidget()
+        column = QVBoxLayout(body)
+        column.setContentsMargins(0, 0, 0, 0)
         column.setSpacing(T.SPACE_ML)
         column.addWidget(self._build_metric_card())
         column.addWidget(self._build_matrix_card())
         column.addWidget(self._build_images_card(), 1)
-        return column
+        return self._scroll_column(body)
 
     def _build_metric_card(self) -> CardWidget:
         card, layout = self._card("综合指标")
@@ -436,17 +448,21 @@ class EvaluateTab(QWidget):
 
     def _build_images_card(self) -> CardWidget:
         card, layout = self._card("图像")
-        tools = QHBoxLayout()
+        # 容器化 + 可换行：筛选下拉与翻页控件较多，宽度不足时折行，
+        # 避免把「全部类别」这类文字压成两三个字（商业软件不应出现）
+        container = FlowContainer(card, spacing=T.SPACE_MD)
+        layout.addWidget(container)
+
         self.filter_combo = ComboBox(card)
         for key, text in _FILTERS:
             self.filter_combo.addItem(text, userData=key)
         self.filter_combo.currentIndexChanged.connect(self._on_filter_changed)
-        tools.addWidget(self.filter_combo)
+        container.add(self.filter_combo)
 
         self.class_combo = ComboBox(card)
         self.class_combo.addItem("全部类别", userData=None)
         self.class_combo.currentIndexChanged.connect(self._on_filter_changed)
-        tools.addWidget(self.class_combo)
+        container.add(self.class_combo)
 
         self.sort_combo = ComboBox(card)
         for key, text in _SORTS:
@@ -455,26 +471,27 @@ class EvaluateTab(QWidget):
             "结果排序：误检高置信 / 正确低置信往往说明标注有误"
         )
         self.sort_combo.currentIndexChanged.connect(self._on_sort_changed)
-        tools.addWidget(self.sort_combo)
+        container.add(self.sort_combo)
 
         self.view_combo = ComboBox(card)
         for key, text in _VIEWS:
             self.view_combo.addItem(text, userData=key)
         self.view_combo.setToolTip("展示粒度：整图 / 实例（每个预测框与真实框单独成块）")
         self.view_combo.currentIndexChanged.connect(self._on_view_changed)
-        tools.addWidget(self.view_combo)
-        tools.addStretch(1)
+        container.add(self.view_combo)
 
+        # 翻页：页码与四个按钮作为一组，整组折行不拆散
         self.page_label = CaptionLabel("", card)
-        tools.addWidget(self.page_label)
         self.page_buttons: dict[str, PushButton] = {}
+        pager: list = [self.page_label]
         for key, text in (("first", "|◀"), ("prev", "◀"), ("next", "▶"), ("last", "▶|")):
             button = PushButton(text, card)
-            button.setFixedWidth(T.PAGER_BTN_W)
+            # 下限而非固定宽度：图标字符「|◀」比数字按钮宽，固定宽度会截断
+            button.setMinimumWidth(T.PAGER_BTN_W)
             button.clicked.connect(lambda _c=False, name=key: self._on_page(name))
-            tools.addWidget(button)
+            pager.append(button)
             self.page_buttons[key] = button
-        layout.addLayout(tools)
+        container.add(ToolGroup(*pager, parent=card))
 
         self.grid = ThumbnailGrid(card)
         self.grid.set_thumb_size(124)
@@ -513,7 +530,9 @@ class EvaluateTab(QWidget):
         self.preview.setStyleSheet("background:#1B1B1B; border-radius:4px;")
         layout.addWidget(self.preview)
 
-        toggle = QHBoxLayout()
+        # 右栏只有 300px 宽：六个视图按钮逐个参与折行，
+        # 否则会被压到 35px 把「GT 叠加 / Grad-CAM」截断
+        toggle = FlowContainer(detail_card, spacing=T.SPACE_SM)
         self.preview_buttons: dict[str, PushButton] = {}
         for key, text in (
             ("raw", "原图"), ("pred", "预测图"),
@@ -522,10 +541,9 @@ class EvaluateTab(QWidget):
         ):
             button = PushButton(text, detail_card)
             button.clicked.connect(lambda _c=False, name=key: self._set_preview(name))
-            toggle.addWidget(button)
+            toggle.add(button)
             self.preview_buttons[key] = button
-        toggle.addStretch(1)
-        layout.addLayout(toggle)
+        layout.addWidget(toggle)
         # Grad-CAM 需要分类模型，默认禁用（选中分类结果后按需启用）
         if "gradcam" in self.preview_buttons:
             self.preview_buttons["gradcam"].setEnabled(False)
@@ -545,14 +563,13 @@ class EvaluateTab(QWidget):
         self.class_table.setMinimumHeight(180)
         metrics_layout.addWidget(self.class_table)
 
-        holder = QWidget(self)
+        holder = QWidget()
         column = QVBoxLayout(holder)
         column.setContentsMargins(0, 0, 0, 0)
         column.setSpacing(T.SPACE_ML)
         column.addWidget(detail_card)
         column.addWidget(metrics_card, 1)
-        holder.setFixedWidth(T.PANEL_W)
-        return holder
+        return self._scroll_column(holder, fixed_width=T.PANEL_W)
 
     # --------------------------------------------------- 推理分页（原检测能力）
     def _build_demo_pane(self) -> QWidget:

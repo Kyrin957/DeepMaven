@@ -38,6 +38,7 @@ from qfluentwidgets import (
 )
 
 from src.utils.constants import SPLIT_COLORS
+from src.views.ui import FlowContainer, ToolGroup
 from src.views.ui import tokens as T
 
 # 标记 / 类别色块边长（装饰性尺寸，组件内部常量）
@@ -167,23 +168,30 @@ class FilterBar(CardWidget):
         self._tag_names: list[str] = []
         self._panel = None                # 当前展开的筛选面板（同时只留一个）
 
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(T.SPACE_LG, T.SPACE_MD, T.SPACE_LG, T.SPACE_MD)
-        layout.setSpacing(T.SPACE_MD)
+        # 容器化 + 可换行：宽度不足时整组折到下一行，而不是把按钮压窄、
+        # 把「标签: 全部」这类文字截断成「签: 全」（商业软件不应出现该现象）。
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        container = FlowContainer(
+            self, spacing=T.SPACE_MD,
+            margins=(T.SPACE_LG, T.SPACE_MD, T.SPACE_LG, T.SPACE_MD),
+        )
+        outer.addWidget(container)
+        flow = container.flow()
 
         self.label_btn = self._menu_button("标签", FluentIcon.TAG, "label")
-        layout.addWidget(self.label_btn)
         self.split_btn = self._menu_button("数据集拆分", FluentIcon.LIBRARY, "split")
-        layout.addWidget(self.split_btn)
         self.mark_btn = self._menu_button("标记", FluentIcon.FLAG, "mark")
-        layout.addWidget(self.mark_btn)
+        flow.addWidget(ToolGroup(
+            self.label_btn, self.split_btn, self.mark_btn, parent=self,
+        ))
 
         # 自定义筛选规则 + 标签统计（参照 DLT 的筛选规则 / 统计入口）
         self.rules_btn = PushButton("规则", self)
         self.rules_btn.setCheckable(True)
         self.rules_btn.setToolTip("按条件组合筛选（名称 / 尺寸 / 标注 / 标记…）")
         self.rules_btn.clicked.connect(lambda: self.rulesRequested.emit())
-        layout.addWidget(self.rules_btn)
 
         self.rules_clear_btn = TransparentToolButton(self)
         self.rules_clear_btn.setIcon(FluentIcon.DELETE)
@@ -191,20 +199,20 @@ class FilterBar(CardWidget):
         self.rules_clear_btn.setFixedSize(T.ICON_BTN_SM, T.ICON_BTN_SM)
         self.rules_clear_btn.setVisible(False)
         self.rules_clear_btn.clicked.connect(lambda: self.rulesCleared.emit())
-        layout.addWidget(self.rules_clear_btn)
 
         self.stats_btn = PushButton("统计", self)
         self.stats_btn.setToolTip("按标签类别 / 数据集拆分 / 图像标记统计数量与占比")
         self.stats_btn.clicked.connect(lambda: self.statsRequested.emit())
-        layout.addWidget(self.stats_btn)
+        flow.addWidget(ToolGroup(
+            self.rules_btn, self.rules_clear_btn, self.stats_btn, parent=self,
+        ))
 
         self.search = SearchLineEdit(self)
         self.search.setPlaceholderText("输入筛选文本")
         self.search.setFixedWidth(T.CTRL_W_XL)
         self.search.textChanged.connect(lambda _t: self.textChanged.emit(self.text()))
         self.search.searchSignal.connect(lambda _t: self.textChanged.emit(self.text()))
-        layout.addWidget(self.search)
-        layout.addStretch(1)
+        flow.addWidget(ToolGroup(self.search, parent=self))
 
         # 尺寸档位与网格共用同一套（页面用 set_thumb_steps 再收窄）
         self._thumb_steps: tuple[int, ...] = THUMB_STEPS
@@ -217,10 +225,12 @@ class FilterBar(CardWidget):
             self.size_slider.setFixedWidth(T.CTRL_W_SM)
             self.size_slider.setToolTip("缩略图尺寸（Ctrl + 滚轮）")
             self.size_slider.valueChanged.connect(self._on_slider_value)
-            layout.addWidget(self.size_slider)
 
         self.summary = CaptionLabel("", self)
-        layout.addWidget(self.summary)
+        flow.addWidget(ToolGroup(
+            *[w for w in (self.size_slider, self.summary) if w is not None],
+            parent=self,
+        ))
 
         self._refresh_buttons()
 
@@ -624,46 +634,54 @@ class DisplayBar(CardWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(T.SPACE_LG, T.SPACE_MD, T.SPACE_LG, T.SPACE_MD)
-        layout.setSpacing(T.SPACE_MD)
+        # 同样容器化 + 可换行：窄窗口 / 高缩放下整组折行，不压窄控件
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        container = FlowContainer(
+            self, spacing=T.SPACE_MD,
+            margins=(T.SPACE_LG, T.SPACE_MD, T.SPACE_LG, T.SPACE_MD),
+        )
+        outer.addWidget(container)
+        flow = container.flow()
 
-        layout.addWidget(StrongBodyLabel("显示", self))
+        flow.addWidget(ToolGroup(StrongBodyLabel("显示", self), parent=self))
 
-        layout.addWidget(CaptionLabel("亮度", self))
         self.brightness = Slider(Qt.Orientation.Horizontal, self)
         self.brightness.setRange(-100, 100)
         self.brightness.setValue(0)
         self.brightness.setFixedWidth(T.CTRL_W_MD)
         self.brightness.setToolTip("显示亮度（仅影响显示）")
-        layout.addWidget(self.brightness)
+        flow.addWidget(ToolGroup(
+            CaptionLabel("亮度", self), self.brightness, parent=self,
+        ))
 
-        layout.addWidget(CaptionLabel("对比度", self))
         self.contrast = Slider(Qt.Orientation.Horizontal, self)
         self.contrast.setRange(-100, 100)
         self.contrast.setValue(0)
         self.contrast.setFixedWidth(T.CTRL_W_MD)
         self.contrast.setToolTip("显示对比度（仅影响显示）")
-        layout.addWidget(self.contrast)
+        flow.addWidget(ToolGroup(
+            CaptionLabel("对比度", self), self.contrast, parent=self,
+        ))
 
         self.name_check = CheckBox("类别名", self)
         self.name_check.setToolTip("在缩略图上叠加类别名")
-        layout.addWidget(self.name_check)
-
         self.name_width = Slider(Qt.Orientation.Horizontal, self)
         self.name_width.setRange(25, 100)
         self.name_width.setValue(60)
         self.name_width.setFixedWidth(T.CTRL_W_SM)
         self.name_width.setToolTip("类别名框宽度（占缩略图比例）")
-        layout.addWidget(self.name_width)
+        flow.addWidget(ToolGroup(
+            self.name_check, self.name_width, parent=self,
+        ))
 
         self.reset_btn = PushButton("复位", self)
         self.reset_btn.setToolTip("恢复默认显示")
-        layout.addWidget(self.reset_btn)
-        layout.addStretch(1)
+        flow.addWidget(ToolGroup(self.reset_btn, parent=self))
 
         self.hint = CaptionLabel("仅影响显示，不改动图片", self)
-        layout.addWidget(self.hint)
+        flow.addWidget(ToolGroup(self.hint, parent=self))
 
         self._syncing = False
         self.brightness.valueChanged.connect(self._on_change)

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import QEvent, Qt, QUrl
 from PySide6.QtGui import QAction, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
@@ -777,13 +777,46 @@ class MainWindow(FluentWindow):
         self.titleBar.move(0, 0)
         self.titleBar.resize(self.width(), self.titleBar.height())
 
+    def _fit_to_screen(self) -> None:
+        """校正最小尺寸，并在必要时把窗口收回屏幕可用区域内。
+
+        「最大化 → 还原」之后，Qt 会恢复此前的窗口几何；如果那个尺寸超过
+        当前屏幕可用区域，标题栏就会再次被顶出可视区。因此窗口状态变化时
+        也要校正，并把越界的窗口收回来（仅收不放大，不干扰用户的缩放意图）。
+        """
+        self._apply_screen_bounded_minimum()
+        if self.isMaximized() or self.isFullScreen():
+            return
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        width = min(self.width(), available.width())
+        height = min(self.height(), available.height())
+        x = max(available.x(), min(self.x(), available.right() - width + 1))
+        y = max(available.y(), min(self.y(), available.bottom() - height + 1))
+        if (width, height) != (self.width(), self.height()) or (x, y) != (self.x(), self.y()):
+            logger.info(
+                "窗口越出屏幕可用区域，已收回：%dx%d(%d,%d) -> %dx%d(%d,%d)",
+                self.width(), self.height(), self.x(), self.y(),
+                width, height, x, y,
+            )
+            self.resize(width, height)
+            self.move(x, y)
+
     def showEvent(self, e) -> None:  # noqa: N802 - Qt 命名
         """显示时再按实际所在屏幕校正一次最小尺寸。
 
         构造时取到的可能不是最终屏幕（多屏 / 缩放差异），显示时校正更可靠。
         """
         super().showEvent(e)
-        self._apply_screen_bounded_minimum()
+        self._fit_to_screen()
+
+    def changeEvent(self, e) -> None:  # noqa: N802 - Qt 命名
+        """窗口状态变化（最大化 / 还原）后重新校正，避免还原到越界尺寸。"""
+        super().changeEvent(e)
+        if e.type() == QEvent.Type.WindowStateChange:
+            self._fit_to_screen()
 
     def closeEvent(self, e) -> None:  # noqa: N802 - Qt 命名
         logger.info("应用退出")
