@@ -1,4 +1,4 @@
-"""可换行流式布局（FlowLayout）。
+"""可换行流式布局（FlowLayout）与其宿主控件（FlowContainer）。
 
 解决"一排控件塞不下就重叠"的根本问题
 ------------------------------------
@@ -10,20 +10,22 @@ Qt 就只能让它们互相覆盖——这正是标注页工具栏出现
 ``FlowLayout`` 让子项**从左到右排列，放不下时自动折到下一行**，
 因此界面在任意窗口宽度 / 缩放比例下都不会重叠，只会变高。
 
-用法
-----
-把每个"逻辑分组"包成一个 ``QWidget`` 再加进来，分组整体折行、不会被拆散::
+⚠ 关键约束：不要用 ``setMinimumHeight`` 给宿主表达"折行后的高度"
+-----------------------------------------------------------------
+折行高度与**宽度相关**，而 ``QLayout::minimumSize`` 与宽度无关（只能给出一行高）。
+若在布局回调里给宿主 ``setMinimumHeight()``，就相当于向父布局注入了一个
+**显式最小尺寸**——Qt 的 ``qSmartMinSize()`` 会**无视 ``QSizePolicy.Ignored``
+强行采用显式最小值**，于是"页面最小高度沿布局层层累加、窗口被撑得比屏幕还高、
+顶部标题栏被顶出可视区"的故障（见开发文档 §4.4）会重新出现。
 
-    flow = FlowLayout(spacing=8)
-    flow.addWidget(tool_group)      # 工具切换组
-    flow.addWidget(class_group)     # 类别选择组
-    flow.addWidget(action_group)    # 保存/导出组
+正确做法见 ``FlowContainer``：只重写 ``sizeHint`` / ``minimumSizeHint``
+（**提示值**，随宽度重算、受尺寸策略正常约束），绝不写显式最小值。
 """
 
 from __future__ import annotations
 
 from PySide6.QtCore import QMargins, QPoint, QRect, QSize, Qt
-from PySide6.QtWidgets import QLayout, QSizePolicy
+from PySide6.QtWidgets import QLayout, QSizePolicy, QWidget
 
 
 class FlowLayout(QLayout):
@@ -69,33 +71,12 @@ class FlowLayout(QLayout):
     def setGeometry(self, rect: QRect) -> None:  # noqa: N802 - Qt 命名
         super().setGeometry(rect)
         self._do_layout(rect, test_only=False)
-        self._sync_host_min_height(rect.width())
 
     def sizeHint(self) -> QSize:  # noqa: N802 - Qt 命名
         return self.minimumSize()
 
-    # -----------------------------------------------------------
-    # 宿主控件最小高度（关键：避免折行后被压扁裁剪）
-    # -----------------------------------------------------------
-    def _sync_host_min_height(self, width: int) -> None:
-        """按当前宽度把"折行所需高度"写回宿主控件的最小高度。
-
-        为什么必须这么做：``QLayout::minimumSize`` 是**与宽度无关**的，
-        只能给出"一行的高度"。父布局（如 QVBoxLayout）在做空间分配时以
-        最小高度为压缩下限，一旦竖直方向空间紧张（例如同页还有需要
-        360px 的画布），就会把折行后的卡片压回一行高，内容被裁掉。
-
-        这里在每次几何变化后回写最小高度；宽度不变时值也不变，
-        因此不会产生布局震荡。
-        """
-        host = self.parentWidget()
-        if host is None or width <= 0:
-            return
-        needed = self.heightForWidth(width)
-        if needed > 0 and host.minimumHeight() != needed:
-            host.setMinimumHeight(needed)
-
     def minimumSize(self) -> QSize:  # noqa: N802 - Qt 命名
+        """与宽度无关的最小尺寸：单个子项的最大最小尺寸（即"一行"的尺寸）。"""
         size = QSize()
         for item in self._items:
             if item.isEmpty():
@@ -140,4 +121,60 @@ class FlowLayout(QLayout):
         return y + line_height - rect.y() + margins.bottom()
 
 
-__all__ = ["FlowLayout"]
+class FlowContainer(QWidget):
+    """``FlowLayout`` 的宿主控件：高度随折行自适应，且**不写显式最小尺寸**。
+
+    用法::
+
+        container = FlowContainer(card, spacing=T.SPACE_MD,
+                                  margins=(T.SPACE_XL, T.SPACE_MD, T.SPACE_XL, T.SPACE_MD))
+        container.add(ToolGroup(...))
+        card_layout.addWidget(container)
+
+    高度如何生效：重写 ``minimumSizeHint`` / ``sizeHint`` 返回**折行所需高度**，
+    并给尺寸策略打开 ``HeightForWidth``。父布局按提示值分配空间，
+    因此内容不会被压扁裁剪；同时因为**没有显式最小尺寸**，页面注册时的
+    ``QSizePolicy.Ignored`` 依然有效，最小高度不会传导到窗口（§4.4）。
+    """
+
+    def __init__(self, parent=None, spacing: int = 8, margins=None):
+        super().__init__(parent)
+        self._flow = FlowLayout(self, spacing=spacing)
+        if margins is not None:
+            self._flow.setContentsMargins(*margins)
+        policy = self.sizePolicy()
+        policy.setHeightForWidth(True)
+        self.setSizePolicy(policy)
+
+    # -----------------------------------------------------------
+    def flow(self) -> FlowLayout:
+        return self._flow
+
+    def add(self, widget) -> None:
+        """加入一个子项（通常是一个 ``ToolGroup``）。"""
+        self._flow.addWidget(widget)
+
+    def wrapped_height(self, width: int | None = None) -> int:
+        """给定宽度下折行所需的高度（宽度缺省用当前宽度）。"""
+        if width is None:
+            width = self.width()
+        if width <= 0:
+            # 尚未定位：先给"一行"的高度，等真正拿到宽度再重算
+            return self._flow.minimumSize().height()
+        return self._flow.heightForWidth(width)
+
+    # -----------------------------------------------------------
+    # 宽高提示（提示值，随宽度变化；不写显式最小值）
+    # -----------------------------------------------------------
+    def sizeHint(self) -> QSize:  # noqa: N802 - Qt 命名
+        base = self._flow.minimumSize()
+        return QSize(base.width(), self.wrapped_height())
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802 - Qt 命名
+        return QSize(0, self.wrapped_height())
+
+    def heightForWidth(self, width: int) -> int:  # noqa: N802 - Qt 命名
+        return self._flow.heightForWidth(width)
+
+
+__all__ = ["FlowLayout", "FlowContainer"]

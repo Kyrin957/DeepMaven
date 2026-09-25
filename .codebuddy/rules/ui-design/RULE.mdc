@@ -80,12 +80,35 @@ enabled: true
 - 侧栏一律用 `data_widgets.side_column(*cards, width=tokens.SIDE_W)`，
   内容超高时由侧栏自身滚动。
 
-## 5. 高分屏 / 缩放适配
+## 5. 高度与缩放：只给"提示值"，绝不写显式最小/固定高度
 
-- 不要用固定像素去"对齐文字"。宽度用 `field_width()`，高度留给布局计算。
-- 自绘控件请同时读 `devicePixelRatio`（参考 `widgets/charts.py`）。
-- **禁止**给承载可变行数内容的容器设置 `setFixedHeight`（会裁掉折行内容）。
-  `FlowLayout` 会按当前宽度自动回写宿主最小高度，不要覆盖它。
+高度上有两条硬约束，违反任一条都会让**窗口被撑得比屏幕还高、顶部标题栏
+（最小化 / 关闭按钮）被顶出可视区**——这是本项目反复复发的故障，
+详见 `开发文档.md` §4.4 / §4.8。
+
+1. **页面不得向窗口传导最小尺寸**：注册页面时的 `QSizePolicy.Ignored`
+   必须保留（`main_window.py::_add_page`），**不要移除**。
+
+2. **禁止用 `setMinimumHeight` / `setMinimumSize` / `setFixedHeight`
+   表达"内容希望的高度"**。Qt 的 `qSmartMinSize()` 会**无视 `Ignored` 策略**
+   强行采用显式最小值，于是最小高度重新沿布局层层累加到窗口。
+
+   高度需求一律用**提示值**表达：重写 `sizeHint()` / `minimumSizeHint()` /
+   `heightForWidth()`，并给尺寸策略打开 `HeightForWidth`。
+   可变行数的工具条/操作栏请直接用 **`FlowContainer`**
+   （`src/views/ui/flow_layout.py`），它已按此实现；
+   **不要再给它的宿主写任何最小高度**（用 `--no-sync` 之外的任何写法都不行）。
+
+3. **窗口最小尺寸必须 ≤ 屏幕可用区域**。已由
+   `main_window._apply_screen_bounded_minimum()` 统一 clamp（高分屏
+   125% / 150% 会把可用逻辑高度压到低于设计最小尺寸）。不要改回
+   硬编码的绝对最小值。
+
+4. 宽度不要用固定像素去"对齐文字"，用 `field_width()`；
+   自绘控件读 `devicePixelRatio`（参考 `widgets/charts.py`）。
+
+5. 大块内容 / 长列表自带滚动（`ScrollArea`、`data_widgets.side_column`）。
+   窗口变矮时应当是**滚动**，而不是把控件挤到重叠。
 
 ## 6. 视觉层级与分组
 
@@ -113,10 +136,16 @@ $env:QT_QPA_PLATFORM="offscreen"
 
 自检至少覆盖：
 
-1. 在 1080×680 / 1280×800 / 1600×900 三种宽度下，遍历 `FlowLayout` 的分组，
-   断言**分组几何矩形互不相交**，且宿主高度 ≥ `heightForWidth(width)`；
+1. 在 1080×680 / 1280×800 / 1600×900（外加一个更矮的尺寸，如 1080×600）下，
+   遍历 `FlowLayout` 的分组，断言**分组几何矩形互不相交**，
+   且宿主高度 ≥ `heightForWidth(width)`（不被裁剪）；
 2. 向参数输入框发送滚轮事件，断言**数值不变**且所在滚动区**发生了滚动**；
-3. 构建完整 `MainWindow`，确认所有导航页均可构造、无异常。
+3. 构建完整 `MainWindow`，确认所有导航页均可构造、无异常；
+4. **§4.4 回归断言（必做）**：
+   - `win.minimumSizeHint().height() <= 屏幕可用高度`
+   - `win.minimumSize()` 不超出屏幕可用区域
+   - 页面内可变行数容器（`FlowContainer`）的 `minimumHeight() == 0`
+     —— 一旦不为 0，说明有人注入了显式最小尺寸，故障即将复发。
 
 ## 9. 参考实现
 

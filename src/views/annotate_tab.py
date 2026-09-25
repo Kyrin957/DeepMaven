@@ -33,6 +33,7 @@ from qfluentwidgets import (
     PrimaryPushButton,
     ProgressBar,
     PushButton,
+    ScrollArea,
     SegmentedWidget,
     Slider,
     StrongBodyLabel,
@@ -43,7 +44,7 @@ from src.viewmodels.annotate_vm import AnnotateViewModel
 from src.viewmodels.category_vm import CategoryViewModel
 from src.views.data_widgets import side_column
 from src.views.ui import (
-    FlowLayout,
+    FlowContainer,
     SafeDoubleSpinBox,
     SafeSpinBox,
     ToolGroup,
@@ -155,12 +156,30 @@ class AnnotateTab(QWidget):
 
     # --------------------------------------------------- 中间
     def _build_center(self) -> QVBoxLayout:
-        column = QVBoxLayout()
+        """中间列：工具条 + 预标注栏 + 画布。
+
+        整体放进滚动区：窗口较矮（或高分屏缩放把可用高度压小）时，
+        两行工具条加上画布的最小高度可能超出可用高度；此时由本区滚动兜底，
+        避免竖向空间不足把工具条挤到互相重叠（见开发文档 §4.4）。
+        空间充足时内容撑满视口，画布照常占满剩余区域。
+        """
+        area = ScrollArea(self)
+        area.setWidgetResizable(True)
+        area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        body = QWidget()
+        column = QVBoxLayout(body)
+        column.setContentsMargins(0, 0, 0, 0)
         column.setSpacing(T.SPACE_ML)
         column.addWidget(self._build_toolbar())
         column.addWidget(self._build_preannotate_bar())
         column.addWidget(self._build_canvas_card(), 1)
-        return column
+        area.setWidget(body)
+
+        wrapper = QVBoxLayout()
+        wrapper.setContentsMargins(0, 0, 0, 0)
+        wrapper.setSpacing(0)
+        wrapper.addWidget(area)
+        return wrapper
 
     def _build_toolbar(self) -> CardWidget:
         """工具条：按逻辑分组容器化排布，宽度不足时**整组换行**。
@@ -173,8 +192,17 @@ class AnnotateTab(QWidget):
         分组整体折到下一行，因此任意窗口宽度 / 缩放比例下都不会重叠。
         """
         card = CardWidget(self)
-        flow = FlowLayout(card, spacing=T.SPACE_MD)
-        flow.setContentsMargins(T.SPACE_XL, T.SPACE_MD, T.SPACE_XL, T.SPACE_MD)
+        # FlowContainer 只通过 sizeHint / minimumSizeHint 表达折行高度，
+        # 不写显式最小尺寸，因此不会击穿页面的 Ignored 策略（见 §4.4）
+        outer = QVBoxLayout(card)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        container = FlowContainer(
+            card, spacing=T.SPACE_MD,
+            margins=(T.SPACE_XL, T.SPACE_MD, T.SPACE_XL, T.SPACE_MD),
+        )
+        outer.addWidget(container)
+        flow = container.flow()
 
         # ① 绘制工具（浏览 / 矩形 / 多边形 / 掩码；OCR 项目为 浏览 + 文本）
         self.mode_seg = SegmentedWidget(card)
@@ -253,8 +281,15 @@ class AnnotateTab(QWidget):
     def _build_preannotate_bar(self) -> CardWidget:
         """预标注栏：同样容器化 + 可换行，避免窄窗口下控件互相重叠。"""
         card = CardWidget(self)
-        flow = FlowLayout(card, spacing=T.SPACE_MD)
-        flow.setContentsMargins(T.SPACE_XL, T.SPACE_MD, T.SPACE_XL, T.SPACE_MD)
+        outer = QVBoxLayout(card)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        container = FlowContainer(
+            card, spacing=T.SPACE_MD,
+            margins=(T.SPACE_XL, T.SPACE_MD, T.SPACE_XL, T.SPACE_MD),
+        )
+        outer.addWidget(container)
+        flow = container.flow()
 
         self.detect_edit = LineEdit(card)
         self.detect_edit.setText(DEFAULT_DETECT_WEIGHTS)

@@ -15,6 +15,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QAction, QDesktopServices
 from PySide6.QtWidgets import (
+    QApplication,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -98,8 +99,10 @@ class MainWindow(FluentWindow):
         super().__init__(parent)
         self.setWindowTitle(f"{APP_NAME} — 深度学习缺陷检测系统")
         self.resize(1280, 800)
-        # 最小尺寸取自常量，避免与 constants.py 里的定义各写一份
-        self.setMinimumSize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
+        # 最小尺寸取自常量，但必须限制在屏幕可用区域内：高分屏缩放（125% / 150%）
+        # 会把可用「逻辑高度」压到低于 WINDOW_MIN_HEIGHT，此时若仍强制 1080x680，
+        # 窗口会被撑得比屏幕还高、顶部标题栏被顶出可视区（见开发文档 §4.4）。
+        self._apply_screen_bounded_minimum()
         # 应用品牌色
         setThemeColor(BRAND_COLOR)
 
@@ -149,6 +152,35 @@ class MainWindow(FluentWindow):
 
         # 状态栏就绪提示
         self._set_status(f"就绪  ·  {APP_NAME} v{APP_VERSION}")
+
+    # -----------------------------------------------------------
+    # 窗口最小尺寸：受屏幕可用区域约束
+    # -----------------------------------------------------------
+    def _apply_screen_bounded_minimum(self) -> None:
+        """把窗口最小尺寸限制在屏幕可用区域内。
+
+        为什么必须限制：最小尺寸是**硬约束**，窗口无法缩到比它更小。若它大于
+        屏幕可用高度（高分屏缩放下常见），窗口就会比屏幕还高，顶部标题栏
+        （含最小化 / 关闭按钮）被顶出可视区——即 §4.4 描述的故障。
+
+        这里取 `min(设计最小尺寸, 屏幕可用区域)`，并在被收窄时记一条日志，
+        便于排查「窗口变小了」的原因。
+        """
+        screen = self.screen() or QApplication.primaryScreen()
+        minimum_w, minimum_h = WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT
+        if screen is not None:
+            available = screen.availableGeometry()
+            minimum_w = min(minimum_w, max(320, available.width()))
+            minimum_h = min(minimum_h, max(240, available.height()))
+            if (minimum_w, minimum_h) != (WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT):
+                logger.warning(
+                    "屏幕可用区域 %dx%d 小于设计最小尺寸 %dx%d，"
+                    "已按屏幕收窄最小尺寸为 %dx%d",
+                    available.width(), available.height(),
+                    WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT,
+                    minimum_w, minimum_h,
+                )
+        self.setMinimumSize(minimum_w, minimum_h)
 
     # -----------------------------------------------------------
     # 导航栏「展开/收起」按钮定位
@@ -744,6 +776,14 @@ class MainWindow(FluentWindow):
         super().resizeEvent(e)
         self.titleBar.move(0, 0)
         self.titleBar.resize(self.width(), self.titleBar.height())
+
+    def showEvent(self, e) -> None:  # noqa: N802 - Qt 命名
+        """显示时再按实际所在屏幕校正一次最小尺寸。
+
+        构造时取到的可能不是最终屏幕（多屏 / 缩放差异），显示时校正更可靠。
+        """
+        super().showEvent(e)
+        self._apply_screen_bounded_minimum()
 
     def closeEvent(self, e) -> None:  # noqa: N802 - Qt 命名
         logger.info("应用退出")
