@@ -63,11 +63,25 @@ STEPPER_CHARS_NARROW = 6   # 百分比、通道数一类
 STEPPER_CHARS = 8          # 常规数值（epochs / batch / 学习率）
 STEPPER_CHARS_WIDE = 11    # 带后缀或大数值（图像尺寸 px）
 
-# 步进器宽度上下限（防止字符数极少/极多时失真）
+# 步进器宽度下限（防止字符数极少时框太小）
 STEPPER_MIN_W = 64
-STEPPER_MAX_W = 168
-# 步进器除文本外的固定开销：右侧上下按钮 + 左右内边距（逻辑像素）
-STEPPER_CHROME_W = 42
+# 说明：**不设上限**。宽度必须由「文本 + 步进按钮开销」算出来，写死上限等于
+# 在字体变大（Fluent 字体 14px、125% / 150% 缩放）时把数字裁掉——历史上
+# 168px 的上限让训练页 / 标注页 / 评估页一批数值框只露得出 5 个字符。
+
+# 步进器「除文本外」的占位宽度（逻辑像素）——它决定数值框里**真正能显示几个
+# 字符**，必须按控件实际样式取值（见 ``stepper_chrome()``），不能凭感觉给一个
+# 数。数值来自 qfluentwidgets 1.11 的离屏实测：
+#   行内样式（SpinBox / DoubleSpinBox）：文本区左缩进 11 + 两个 31px 步进按钮
+#       + 5px 间距 + 4px 右内边距 + 文本区右侧留白 10 = 92
+#   紧凑样式（CompactSpinBox）：文本区左缩进 11 + 单个 26px 步进按钮 + 1 = 38
+#   普通输入框（无步进按钮）：左右内边距 ≈ 28
+# 历史故障：这里曾写成 42（按「两个按钮 31px」想当然），于是 ``field_width()``
+# 每格少算 50px，数值框外观正常、数字却被裁掉——拆分页的分配表整列看不到数。
+# ``scripts/ui_selfcheck.py`` 会按真实渲染复核该常量。
+STEPPER_CHROME_W_INLINE = 92
+STEPPER_CHROME_W_COMPACT = 38
+STEPPER_CHROME_W_PLAIN = 28
 
 # 标签列最小宽度（表单左侧文字）
 LABEL_MIN_W = 72
@@ -81,10 +95,6 @@ CTRL_W_XL = 180
 # 图标按钮边长
 ICON_BTN_SM = 24
 ICON_BTN_MD = 28
-
-# 窄侧栏里成组排布的紧凑数值框（如「良好 / 异常 × 训练 / 验证 / 测试」的数量与百分比）
-STEPPER_W_TIGHT = 52
-STEPPER_W_TIGHT_PCT = 48
 
 # 侧栏面板最小宽度（图库筛选栏等）
 PANEL_MIN_W = 170
@@ -120,23 +130,40 @@ GROUP_BG = "rgba(128, 128, 128, 0.06)"
 # ---------------------------------------------------------------------------
 # 宽度计算
 # ---------------------------------------------------------------------------
+def stepper_chrome(reference: QWidget) -> int:
+    """步进器「除文本外」的占位宽度。
+
+    按控件自身的样式选择开销：紧凑步进器（``CompactSpinBox``）只有一个按钮，
+    比行内步进器省 54px——窄侧栏里的栅格必须用它，否则数值没有可见空间。
+    """
+    if hasattr(reference, "compactSpinButton"):
+        return STEPPER_CHROME_W_COMPACT
+    if hasattr(reference, "upButton") or hasattr(reference, "downButton"):
+        return STEPPER_CHROME_W_INLINE
+    return STEPPER_CHROME_W_PLAIN
+
+
 def field_width(reference: QWidget, chars: int = STEPPER_CHARS) -> int:
     """按字体度量计算数值输入框宽度（字体/缩放变化时自动适配）。
 
     参数
     ----
-    reference : 任意控件，用它的 fontMetrics 作为测量基准（同页字体一致即可）。
+    reference : 数值输入框本身（用它区分行内 / 紧凑样式），并用它的 fontMetrics
+                作为测量基准。
     chars     : 需要容纳的字符数（含后缀，如 "2048 px" 为 7）。
 
     返回
     ----
-    逻辑像素宽度，已限制在 ``STEPPER_MIN_W`` ~ ``STEPPER_MAX_W`` 之间。
+    逻辑像素宽度 = 文本所需宽度 + ``stepper_chrome(reference)``，
+    **不设上限**（上限会把数字裁掉，见常量区的说明），只保底下限。
+
+    注意：调用时机要早于布局、但此时控件字体必须是最终字体——QFluentWidgets
+    在构造时就 ``setFont`` 了，按控件自身度量即可；自检脚本
+    （``scripts/ui_selfcheck.py``）会按真实渲染复核「文本区 ≥ 文字宽度」。
     """
     fm = reference.fontMetrics()
     text_w = fm.horizontalAdvance("0" * max(1, int(chars)))
-    # 右侧步进按钮占位 + 左右内边距
-    width = text_w + STEPPER_CHROME_W
-    return max(STEPPER_MIN_W, min(STEPPER_MAX_W, width))
+    return max(STEPPER_MIN_W, text_w + stepper_chrome(reference))
 
 
 __all__ = [
@@ -145,12 +172,13 @@ __all__ = [
     "CARD_PAD_H", "CARD_PAD_V", "PAGE_PAD_H", "PAGE_PAD_V",
     "SIDE_W_NARROW", "SIDE_W", "SIDE_W_WIDE",
     "STEPPER_CHARS_NARROW", "STEPPER_CHARS", "STEPPER_CHARS_WIDE",
-    "STEPPER_MIN_W", "STEPPER_MAX_W", "LABEL_MIN_W", "ROW_H",
+    "STEPPER_MIN_W", "LABEL_MIN_W", "ROW_H",
+    "STEPPER_CHROME_W_INLINE", "STEPPER_CHROME_W_COMPACT", "STEPPER_CHROME_W_PLAIN",
     "CTRL_W_SM", "CTRL_W_MD", "CTRL_W_LG", "CTRL_W_XL",
     "ICON_BTN_SM", "ICON_BTN_MD",
-    "STEPPER_W_TIGHT", "STEPPER_W_TIGHT_PCT", "PANEL_MIN_W", "PANEL_W",
+    "PANEL_MIN_W", "PANEL_W",
     "PANEL_W_WIDE", "PAGER_BTN_W",
     "RADIUS_SM", "RADIUS_MD", "RADIUS_LG",
     "CANVAS_BG", "GROUP_BORDER", "GROUP_BG",
-    "field_width",
+    "field_width", "stepper_chrome",
 ]

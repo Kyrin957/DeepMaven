@@ -260,10 +260,16 @@ class AnnotateTab(QWidget):
         self.hole_group.setVisible(False)
         flow.addWidget(self.hole_group)
 
-        # ⑥ 标注存取（保存 / 清空 / 导入 / 导出）
+        # ⑥ 标注存取（保存 / 清空 / 导入）
         self.save_btn = PrimaryPushButton("保存标注", card)
         self.clear_btn = PushButton("清空", card)
         self.import_btn = PushButton("导入标注", card)
+        flow.addWidget(ToolGroup(
+            self.save_btn, self.clear_btn, self.import_btn, parent=card,
+        ))
+
+        # ⑦ 导出标注（格式 + 按钮）。与 ⑥ 分开成两组：五件套合起来近 500px，
+        # 最窄窗口下比工具条还宽，整组折行也放不下（会横向溢出被裁）。
         self.export_combo = ComboBox(card)
         for key, text in (
             ("coco", "COCO json"),
@@ -273,7 +279,6 @@ class AnnotateTab(QWidget):
             self.export_combo.addItem(text, userData=key)
         self.export_btn = PushButton("导出标注", card)
         flow.addWidget(ToolGroup(
-            self.save_btn, self.clear_btn, self.import_btn,
             self.export_combo, self.export_btn, parent=card,
         ))
         return card

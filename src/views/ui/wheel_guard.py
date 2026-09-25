@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
 )
 
+from qfluentwidgets import CompactSpinBox as _QfwCompactSpinBox
 from qfluentwidgets import DoubleSpinBox as _QfwDoubleSpinBox
 from qfluentwidgets import SpinBox as _QfwSpinBox
 
@@ -133,6 +134,23 @@ SafeSpinBox = _make_safe(_QfwSpinBox)
 SafeDoubleSpinBox = _make_safe(_QfwDoubleSpinBox)
 
 
+class SafeCompactSpinBox(_SelfGuardedSpin, _QfwCompactSpinBox):  # type: ignore[misc]
+    """紧凑步进器（滚轮安全）：窄侧栏栅格里的数值框用它。
+
+    相比行内步进器少占 54px（只有一个按钮），是「几个数值并排塞进 ~270px」
+    的唯一可行选择；``tokens.field_width()`` 会按它自动少算开销。
+
+    另有一处刻意偏离默认行为：``CompactSpinBox`` 一聚焦就弹出步进浮层，
+    在密集表格里会盖住相邻行，这里改为**只在点右侧按钮时**弹出。
+    """
+
+    def focusInEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        # 直接落到 QAbstractSpinBox：跳过 CompactSpinBoxBase.focusInEvent 的
+        # _showFlyout()——表格里点一下数值框就弹浮层会遮挡相邻行；
+        # 步进仍可用右侧按钮的浮层。
+        QAbstractSpinBox.focusInEvent(self, event)
+
+
 # ---------------------------------------------------------------------------
 # 全局级：应用事件过滤器
 # ---------------------------------------------------------------------------
@@ -161,5 +179,6 @@ __all__ = [
     "WheelGuard",
     "SafeSpinBox",
     "SafeDoubleSpinBox",
+    "SafeCompactSpinBox",
     "block_wheel_value_change",
 ]

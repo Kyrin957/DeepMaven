@@ -596,14 +596,19 @@ class ProjectTab(QWidget):
         self.recover_hint.setText(f"检测到 {len(items)} 个自动备份")
         for info in items:
             row = QWidget(self.recover_card)
-            layout = QHBoxLayout(row)
+            layout = QVBoxLayout(row)
             layout.setContentsMargins(0, 0, 0, 0)
-            layout.setSpacing(T.SPACE_SM)
-            label = CaptionLabel(
-                f"{info.get('name') or ''} · {info.get('time', '')}", row
-            )
-            label.setToolTip(str(info.get("backup", "")))
-            layout.addWidget(label, 1)
+            layout.setSpacing(T.SPACE_XS)
+            # 名称 / 时间 / 按钮分三行：侧栏只有 320px，「名字 · 时间戳」挤在
+            # 一行会被压成省略号（文字必须完整可读，见 RULE.mdc §1）。
+            name_label = CaptionLabel(str(info.get("name") or ""), row)
+            name_label.setWordWrap(True)
+            name_label.setToolTip(str(info.get("backup", "")))
+            layout.addWidget(name_label)
+            time_label = CaptionLabel(str(info.get("time", "")), row)
+            time_label.setToolTip(str(info.get("backup", "")))
+            layout.addWidget(time_label)
+
             restore = PushButton("恢复", row)
             restore.clicked.connect(
                 lambda _checked=False, target=str(info.get("backup", "")):
@@ -614,8 +619,13 @@ class ProjectTab(QWidget):
                 lambda _checked=False, target=str(info.get("backup", "")):
                 self._vm.discard_backup(target)
             )
-            layout.addWidget(restore)
-            layout.addWidget(discard)
+            buttons = QHBoxLayout()
+            buttons.setContentsMargins(0, 0, 0, 0)
+            buttons.setSpacing(T.SPACE_SM)
+            buttons.addStretch(1)
+            buttons.addWidget(restore)
+            buttons.addWidget(discard)
+            layout.addLayout(buttons)
             self.recover_buttons.addWidget(row)
 
     # -----------------------------------------------------------

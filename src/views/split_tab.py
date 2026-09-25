@@ -37,7 +37,7 @@ from src.utils.constants import SPLIT_COLORS, SPLIT_LABELS, UNLABELED_LABEL
 from src.viewmodels.category_vm import CategoryViewModel
 from src.viewmodels.dataset_vm import DatasetViewModel
 from src.views.data_widgets import side_column
-from src.views.ui import SafeSpinBox
+from src.views.ui import SafeCompactSpinBox, SafeSpinBox
 from src.views.ui import tokens as T
 from src.views.widgets import BarChart, LegendList, PieChart
 
@@ -190,53 +190,63 @@ class SplitTab(QWidget):
 
         异常图的「训练」格禁用：异常检测只用正常样本训练，异常图进验证 /
         测试。约束用控件可用性表达，不写说明文字。
+
+        窄侧栏（~270px）塞不下「4 个数值列并排」：行内步进器光按钮就占 71px/
+        个，4 列要 300px 以上，硬塞的结果是数值被按钮挤没（历史故障）。这里
+        按类别分块竖排，数值框改用**紧凑步进器**（省 54px/个）并按字体度量
+        定宽（``tokens.field_width()``），字体 / 缩放变化时数字仍然完整可见。
         """
         holder = QWidget(self.setting_card)
         grid = QGridLayout(holder)
         grid.setContentsMargins(0, 0, 0, 0)
-        grid.setHorizontalSpacing(4)
-        grid.setVerticalSpacing(4)
+        grid.setHorizontalSpacing(T.SPACE_MD)
+        grid.setVerticalSpacing(T.SPACE_SM)
+
+        # 列头：数量 / 百分比（两类共用，避免每类重复一行表头）
+        grid.addWidget(CaptionLabel("数量", holder), 0, 1)
+        grid.addWidget(CaptionLabel("百分比", holder), 0, 2)
 
         self.anomaly_titles: dict[str, StrongBodyLabel] = {}
-        for index, kind in enumerate(("normal", "abnormal")):
-            column = 1 + index * 2
+        self.anomaly_spins: dict[tuple, SafeCompactSpinBox] = {}
+        row = 1
+        for kind in ("normal", "abnormal"):
             title = StrongBodyLabel(_KIND_LABELS[kind], holder)
-            grid.addWidget(title, 0, column, 1, 2)
+            grid.addWidget(title, row, 0, 1, 3)
             self.anomaly_titles[kind] = title
-            grid.addWidget(CaptionLabel("数量", holder), 1, column)
-            grid.addWidget(CaptionLabel("百分比", holder), 1, column + 1)
-
-        self.anomaly_spins: dict[tuple, SafeSpinBox] = {}
-        for row, sub in enumerate(("train", "val", "test")):
-            grid.addWidget(CaptionLabel(SPLIT_LABELS[sub], holder), 2 + row, 0)
-            for index, kind in enumerate(("normal", "abnormal")):
-                column = 1 + index * 2
+            row += 1
+            for sub in ("train", "val", "test"):
                 editable = not (kind == "abnormal" and sub == "train")
-                count = SafeSpinBox(holder)
+                grid.addWidget(CaptionLabel(SPLIT_LABELS[sub], holder), row, 0)
+                count = SafeCompactSpinBox(holder)
                 count.setRange(0, 999999)
-                # 侧栏只有 ~260px 可用：用专为紧凑栅格准备的定宽令牌，
-                # 避免把卡片顶宽后被裁剪
-                count.setFixedWidth(T.STEPPER_W_TIGHT)
+                count.setFixedWidth(
+                    T.field_width(count, T.STEPPER_CHARS_NARROW)
+                )
                 count.valueChanged.connect(
                     lambda _v, k=kind, s=sub: self._on_anomaly_edited(k, s, "count")
                 )
-                grid.addWidget(count, 2 + row, column)
-                percent = SafeSpinBox(holder)
+                grid.addWidget(count, row, 1)
+                percent = SafeCompactSpinBox(holder)
                 percent.setRange(0, 100)
-                percent.setFixedWidth(T.STEPPER_W_TIGHT_PCT)
+                percent.setSuffix(" %")
+                percent.setFixedWidth(
+                    T.field_width(percent, T.STEPPER_CHARS_NARROW)
+                )
                 percent.valueChanged.connect(
                     lambda _v, k=kind, s=sub: self._on_anomaly_edited(
                         k, s, "percent"
                     )
                 )
-                grid.addWidget(percent, 2 + row, column + 1)
+                grid.addWidget(percent, row, 2)
                 count.setEnabled(editable)
                 percent.setEnabled(editable)
                 self.anomaly_spins[(kind, sub, "count")] = count
                 self.anomaly_spins[(kind, sub, "percent")] = percent
+                row += 1
 
+        grid.setColumnStretch(3, 1)          # 右列留白：数值框左对齐，不拉伸
         self.anomaly_hint = CaptionLabel("", holder)
-        grid.addWidget(self.anomaly_hint, 5, 0, 1, 5)
+        grid.addWidget(self.anomaly_hint, row, 0, 1, 4)
         return holder
 
     def _refresh_anomaly_card(self) -> None:

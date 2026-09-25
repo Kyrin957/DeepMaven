@@ -19,6 +19,7 @@ from src.views.ui.containers import FieldRow, ParamGroup, ToolGroup, tool_separa
 from src.views.ui.flow_layout import FlowContainer, FlowLayout
 from src.views.ui.wheel_guard import (
     ALLOW_WHEEL_ATTR,
+    SafeCompactSpinBox,
     SafeDoubleSpinBox,
     SafeSpinBox,
     WheelGuard,
@@ -31,6 +32,7 @@ __all__ = [
     "WheelGuard",
     "SafeSpinBox",
     "SafeDoubleSpinBox",
+    "SafeCompactSpinBox",
     "ALLOW_WHEEL_ATTR",
     "ParamGroup",
     "ToolGroup",

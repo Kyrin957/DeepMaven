@@ -55,7 +55,13 @@ _MAX_LEVEL = 8
 _COL_FOLDER, _COL_LABEL, _COL_KIND = 0, 1, 2
 _FOLDER_ROLE = Qt.ItemDataRole.UserRole
 _TREE_HEIGHT = 216
-_ROW_HEIGHT = 30
+_COL_KIND_W = 184
+# 「类别类型」行高：树项的文本区比行高上下各小 6px，所以行高必须给足
+# 「按钮高 + 2×留白」＝ 36px。给 30px 时文本区只有 18px，24px 的切换按钮
+# 会被挤到裁切，看起来"偏下"（按钮下沿被切、文字baseline 也随之偏）。
+_KIND_BTN_H = 24
+_ITEM_TEXT_PAD_V = 6
+_ROW_HEIGHT = _KIND_BTN_H + _ITEM_TEXT_PAD_V * 2
 
 # 类别类型（异常检测项目）
 KIND_NORMAL, KIND_ABNORMAL = "normal", "abnormal"
@@ -87,7 +93,7 @@ class _KindSelector(QWidget):
         for key, text in _KIND_ITEMS:
             button = QPushButton(text, self)
             button.setCheckable(True)
-            button.setFixedHeight(24)
+            button.setFixedHeight(_KIND_BTN_H)
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.setStyleSheet(self._QSS)
             button.clicked.connect(lambda _checked=False, k=key: self._on_click(k))
@@ -300,7 +306,7 @@ class ImportImagesDialog(MessageBoxBase):
         if self._is_anomaly:
             tree.setColumnCount(3)
             tree.setHeaderLabels(["文件夹结构", "类别名称", "类别类型"])
-            tree.setColumnWidth(_COL_KIND, 184)
+            tree.setColumnWidth(_COL_KIND, _COL_KIND_W)
         else:
             tree.setColumnCount(2)
             tree.setHeaderLabels(["文件夹结构", "类别名称"])
@@ -414,12 +420,15 @@ class ImportImagesDialog(MessageBoxBase):
                 | Qt.ItemFlag.ItemIsEnabled
             )
             item.setCheckState(_COL_FOLDER, Qt.CheckState.Checked)
+            if self._is_anomaly:
+                # 所有行统一按「能放下切换按钮」的高度给尺寸提示，
+                # 否则含子目录的行矮一截，一列按钮上下参差
+                item.setSizeHint(_COL_KIND, QSize(_COL_KIND_W, _ROW_HEIGHT))
             if key in self._folder_images:
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
                 item.setText(_COL_LABEL, self._label_of(key))
                 item.setToolTip(_COL_LABEL, "双击改名，留空即无标签")
                 if self._is_anomaly:
-                    item.setSizeHint(_COL_KIND, QSize(184, _ROW_HEIGHT))
                     selector = _KindSelector(self._default_kind(key))
                     selector.changed.connect(
                         lambda kind, k=key: self._on_kind_changed(k, kind)
