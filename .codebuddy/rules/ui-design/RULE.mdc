@@ -7,7 +7,7 @@ enabled: true
 # DeepMaven 界面开发规范
 
 技术栈：PySide6 6.11 + QFluentWidgets 1.11（Fluent Design）。界面代码位于
-`DeepMaven/src/views/`，设计系统基座位于 `DeepMaven/src/views/ui/`。
+`src/views/`，设计系统基座位于 `src/views/ui/`（路径均相对仓库根）。
 
 > 本规范用于根治历史上反复出现的问题：**控件重叠**、**输入框横贯整屏**、
 > **滚轮误改参数**、**高分屏错位**。新增 / 修改界面代码时逐条对照。
@@ -106,7 +106,8 @@ enabled: true
 界面改动完成后必须做离屏自检（不要只靠"看起来对"）：
 
 ```powershell
-cd "DeepMaven"; $env:QT_QPA_PLATFORM="offscreen"
+# 在仓库根（工作区根）执行
+$env:QT_QPA_PLATFORM="offscreen"
 .venv\Scripts\python.exe <你的自检脚本>
 ```
 
