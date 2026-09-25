@@ -1,0 +1,125 @@
+---
+description: DeepMaven 界面开发规范（容器化布局、参数框定宽、滚轮不改值、DPI 适配、设计令牌）；改动 src/views 或 src/app.py 的界面代码时应用
+alwaysApply: false
+enabled: true
+---
+
+# DeepMaven 界面开发规范
+
+技术栈：PySide6 6.11 + QFluentWidgets 1.11（Fluent Design）。界面代码位于
+`DeepMaven/src/views/`，设计系统基座位于 `DeepMaven/src/views/ui/`。
+
+> 本规范用于根治历史上反复出现的问题：**控件重叠**、**输入框横贯整屏**、
+> **滚轮误改参数**、**高分屏错位**。新增 / 修改界面代码时逐条对照。
+
+---
+
+## 1. 布局：容器化 + 可换行，禁止"单行塞满"
+
+- **禁止**把 3 个以上控件直接塞进一个 `QHBoxLayout` 作为工具条。`QHBoxLayout`
+  空间不足时**不会换行**，只会压缩到互相覆盖（历史故障：标注页
+  「浏览｜矩形｜多边形｜存标」文字与指示条重叠）。
+- 工具条 / 操作栏一律用 `FlowLayout` + `ToolGroup`：
+
+  ```python
+  from src.views.ui import FlowLayout, ToolGroup
+
+  flow = FlowLayout(card, spacing=T.SPACE_MD)
+  flow.setContentsMargins(T.SPACE_XL, T.SPACE_MD, T.SPACE_XL, T.SPACE_MD)
+  flow.addWidget(ToolGroup(label, combo, parent=card))
+  flow.addWidget(ToolGroup(btn_a, btn_b, parent=card))
+  ```
+
+- 每个 `ToolGroup` 是一个"逻辑分组"，整体折行、不会被拆散。
+- **整组显隐**用 `group.setVisible(...)`，不要逐个隐藏组内控件
+  （`FlowLayout` 会自动跳过隐藏分组，不留空位）。
+
+## 2. 参数输入框：必须有界，禁止拉伸满行
+
+- **禁止** `QFormLayout.addRow(label, spin)` 后放任输入框 `Expanding`
+  （历史故障：参数框横贯整屏，视觉上像"一条长线"）。
+- 数值输入框用 `tokens.field_width(控件, 字符数)` 定宽，按**字体度量**计算，
+  高分屏 / 字体变化时自动适配：
+
+  ```python
+  spin.setFixedWidth(T.field_width(spin, T.STEPPER_CHARS))       # 常规
+  spin.setFixedWidth(T.field_width(spin, T.STEPPER_CHARS_WIDE))  # 带后缀 / 大数值
+  ```
+
+- 成组的参数用 `ParamGroup`（有边框的模块化容器）承载，内部用
+  `add_field()`（单列）或 `add_grid(fields, columns=2)`（多列）。
+- 路径 / 备注 / 名称一类的**文本**输入可以撑满一行；**数值**输入必须定宽。
+- 行内排布：`标签(定宽) + 控件(定宽) + addStretch(1)`，左对齐。
+
+## 3. 滚轮：参数框永不改值
+
+- **参数类**数值输入框一律用 `SafeSpinBox` / `SafeDoubleSpinBox`
+  （`from src.views.ui import SafeSpinBox`），滚轮不再改值，且滚动会
+  转交给所在滚动区。
+- `src/app.py` 已安装全局 `WheelGuard`，覆盖所有历史代码与弹窗中的输入框。
+  **不要移除**：`app.installEventFilter(WheelGuard(app))`。
+- **显示类**控件（亮度 / 对比度 / 缩略图尺寸等）用 `Slider`，不受限制。
+  若确有输入框需要保留滚轮改值，显式设置属性：
+
+  ```python
+  setattr(widget, "_allow_wheel_edit", True)   # 仅限显示类，并在注释里说明理由
+  ```
+
+## 4. 尺寸与间距：只用 tokens
+
+- 禁止在页面里写死间距 / 宽度数字。统一从 `src/views/ui/tokens.py` 取值：
+
+  | 用途 | 令牌 |
+  |------|------|
+  | 间距（4 的倍数） | `SPACE_XXS/XS/SM/MD/LG/XL/XXL` |
+  | 卡片内边距 | `CARD_PAD_H` / `CARD_PAD_V` |
+  | 侧栏宽度 | `SIDE_W_NARROW` / `SIDE_W` / `SIDE_W_WIDE` |
+  | 数值框宽度 | `field_width(...)` + `STEPPER_CHARS*` |
+  | 圆角 | `RADIUS_SM/MD/LG` |
+
+- 侧栏一律用 `data_widgets.side_column(*cards, width=tokens.SIDE_W)`，
+  内容超高时由侧栏自身滚动。
+
+## 5. 高分屏 / 缩放适配
+
+- 不要用固定像素去"对齐文字"。宽度用 `field_width()`，高度留给布局计算。
+- 自绘控件请同时读 `devicePixelRatio`（参考 `widgets/charts.py`）。
+- **禁止**给承载可变行数内容的容器设置 `setFixedHeight`（会裁掉折行内容）。
+  `FlowLayout` 会按当前宽度自动回写宿主最小高度，不要覆盖它。
+
+## 6. 视觉层级与分组
+
+- 层级固定为：**页面 > 卡片（CardWidget）> 分组容器（ParamGroup）> 字段行（FieldRow）**。
+- 同一层级的间距必须一致（用 `SPACE_*` 令牌），避免"东一块西一块"。
+- 卡片标题用 `StrongBodyLabel`，分组标题用加粗 `CaptionLabel`（`ParamGroup` 已处理）。
+- 分隔用 `tool_separator()`，不要用空 `QLabel("|")`。
+
+## 7. 主题与配色
+
+- 常规控件交给 QFluentWidgets 主题，**不要**写死明暗色 `setStyleSheet`
+  背景 / 前景（暗色主题下会失效或刺眼）。
+- 自绘控件的中性色从 tokens 取（`CANVAS_BG` / `GROUP_BORDER` / `GROUP_BG`）。
+- 类别 / 图表配色从 `utils/constants.py` 的 `SPLIT_COLORS` / `PLOT_COLORS` 取。
+
+## 8. 自检要求
+
+界面改动完成后必须做离屏自检（不要只靠"看起来对"）：
+
+```powershell
+cd "DeepMaven"; $env:QT_QPA_PLATFORM="offscreen"
+.venv\Scripts\python.exe <你的自检脚本>
+```
+
+自检至少覆盖：
+
+1. 在 1080×680 / 1280×800 / 1600×900 三种宽度下，遍历 `FlowLayout` 的分组，
+   断言**分组几何矩形互不相交**，且宿主高度 ≥ `heightForWidth(width)`；
+2. 向参数输入框发送滚轮事件，断言**数值不变**且所在滚动区**发生了滚动**；
+3. 构建完整 `MainWindow`，确认所有导航页均可构造、无异常。
+
+## 9. 参考实现
+
+- 工具条容器化 + 换行：`src/views/annotate_tab.py::_build_toolbar`
+- 参数分组容器 + 紧凑步进器：`src/views/train_tab.py::_build_param_card`
+- 基座：`src/views/ui/{tokens,flow_layout,wheel_guard,containers}.py`
+- 背景与取舍：`开发文档.md` §4.5 / §4.6

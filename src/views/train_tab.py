@@ -16,7 +16,6 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QFileDialog,
-    QFormLayout,
     QGridLayout,
     QHBoxLayout,
     QStackedWidget,
@@ -30,14 +29,12 @@ from qfluentwidgets import (
     CardWidget,
     CheckBox,
     ComboBox,
-    DoubleSpinBox,
     LineEdit,
     PrimaryPushButton,
     ProgressBar,
     PushButton,
     ScrollArea,
     SegmentedWidget,
-    SpinBox,
     StrongBodyLabel,
     TableWidget,
     TextEdit,
@@ -56,6 +53,8 @@ from src.viewmodels.model_vm import ModelViewModel
 from src.viewmodels.train_vm import TrainViewModel
 from src.views.data_widgets import side_column
 from src.views.dialogs import ImagePreviewDialog
+from src.views.ui import ParamGroup, SafeDoubleSpinBox, SafeSpinBox
+from src.views.ui import tokens as T
 from src.views.widgets import LegendList, LineChart, PieChart
 
 # ---------------------------------------------------------------
@@ -128,10 +127,10 @@ class TrainTab(QWidget):
         self._model_vm = model_vm
         self._dataset_vm = dataset_vm
         self._syncing = False
-        self._int_spins: dict[str, SpinBox] = {}
-        self._float_spins: dict[str, DoubleSpinBox] = {}
+        self._int_spins: dict[str, SafeSpinBox] = {}
+        self._float_spins: dict[str, SafeDoubleSpinBox] = {}
         self._checks: dict[str, CheckBox] = {}
-        self._aug_spins: dict[str, DoubleSpinBox] = {}
+        self._aug_spins: dict[str, SafeDoubleSpinBox] = {}
         self._tile_values: dict[str, BodyLabel] = {}
         self._build_ui()
         self._bind()
@@ -211,7 +210,7 @@ class TrainTab(QWidget):
         )
         train_layout.addWidget(self.history_list)
 
-        return side_column(project_card, train_card, width=290)
+        return side_column(project_card, train_card, width=T.SIDE_W_WIDE)
 
     # --------------------------------------------------- 中央
     def _build_main(self) -> QVBoxLayout:
@@ -430,64 +429,89 @@ class TrainTab(QWidget):
         return card
 
     def _build_param_card(self) -> CardWidget:
-        card, layout = self._card("训练参数")
-        form = QFormLayout()
-        form.setSpacing(8)
+        """训练参数：模块化容器 + 紧凑步进器（参照 Halcon DLT 的设置分组）。
 
-        self.opt_combo = ComboBox(card)
+        旧实现用 ``QFormLayout.addRow(label, spin)``，输入框默认 ``Expanding``，
+        于是每个参数框都被拉成横贯整栏的"一条长线"——既不美观，也不利于快速
+        扫读。现在改为**分组容器**（优化器 / 超参数 / 训练选项），组内参数用
+        按字符宽度定宽的紧凑步进器、多列排布。
+        """
+        card, layout = self._card("训练参数")
+
+        # —— 分组 1：优化器与设备 ——
+        basics = ParamGroup("优化器与设备", card)
+        self.opt_combo = ComboBox(basics)
         self.opt_combo.addItems(OPTIMIZERS)
         self.opt_combo.currentIndexChanged.connect(self._on_param_changed)
-        form.addRow("求解器", self.opt_combo)
+        basics.add_field("求解器", self.opt_combo)
 
-        device_row = QWidget(card)
+        device_row = QWidget(basics)
         device_layout = QHBoxLayout(device_row)
         device_layout.setContentsMargins(0, 0, 0, 0)
-        device_layout.setSpacing(8)
+        device_layout.setSpacing(T.SPACE_MD)
         self.device_combo = ComboBox(device_row)
         for option in device_options():
             self.device_combo.addItem(option, userData=option.split(" (")[0])
         self.device_combo.currentIndexChanged.connect(self._on_device_changed)
-        device_layout.addWidget(self.device_combo, 1)
+        device_layout.addWidget(self.device_combo)
         self.device_hint = CaptionLabel("", device_row)
         device_layout.addWidget(self.device_hint)
-        form.addRow("设备", device_row)
+        device_layout.addStretch(1)
+        basics.add_field("设备", device_row)
+        layout.addWidget(basics)
 
+        # —— 分组 2：超参数（定宽步进器，两列排布）——
+        hyper = ParamGroup("超参数", card)
+        fields: list[tuple[str, QWidget]] = []
         for key, label, minimum, maximum, default, step, suffix in _INT_PARAMS:
-            spin = SpinBox(card)
+            spin = SafeSpinBox(hyper)
             spin.setRange(minimum, maximum)
             spin.setSingleStep(step)
             spin.setValue(default)
             if suffix:
                 spin.setSuffix(suffix)
+            spin.setFixedWidth(T.field_width(
+                spin, T.STEPPER_CHARS_WIDE if suffix else T.STEPPER_CHARS
+            ))
             spin.valueChanged.connect(self._on_param_changed)
-            form.addRow(label, spin)
             self._int_spins[key] = spin
+            fields.append((label, spin))
 
         for key, label, minimum, maximum, default, step, decimals in _FLOAT_PARAMS:
-            spin = DoubleSpinBox(card)
+            spin = SafeDoubleSpinBox(hyper)
             spin.setRange(minimum, maximum)
             spin.setSingleStep(step)
             spin.setDecimals(decimals)
             spin.setValue(default)
+            spin.setFixedWidth(T.field_width(spin, T.STEPPER_CHARS))
             spin.valueChanged.connect(self._on_param_changed)
-            form.addRow(label, spin)
             self._float_spins[key] = spin
+            fields.append((label, spin))
 
-        layout.addLayout(form)
+        hyper.add_grid(fields, columns=2)
+        layout.addWidget(hyper)
 
+        # —— 分组 3：训练选项 ——
+        options = ParamGroup("训练选项", card)
         check_grid = QGridLayout()
-        check_grid.setSpacing(6)
+        check_grid.setContentsMargins(0, 0, 0, 0)
+        check_grid.setHorizontalSpacing(T.SPACE_LG)
+        check_grid.setVerticalSpacing(T.SPACE_SM)
         for index, (key, label) in enumerate(_CHECK_PARAMS):
-            box = CheckBox(label, card)
+            box = CheckBox(label, options)
             box.stateChanged.connect(self._on_param_changed)
             check_grid.addWidget(box, index // 3, index % 3)
             self._checks[key] = box
-        layout.addLayout(check_grid)
+        for column in range(3):
+            check_grid.setColumnStretch(column, 1)
+        options.add_layout(check_grid)
+        layout.addWidget(options)
 
         # 异常检测专属参数
         self.anomaly_row = QWidget(card)
         anomaly_layout = QHBoxLayout(self.anomaly_row)
         anomaly_layout.setContentsMargins(0, 0, 0, 0)
+        anomaly_layout.setSpacing(T.SPACE_MD)
         self.anomaly_edit = LineEdit(self.anomaly_row)
         self.anomaly_edit.setPlaceholderText("含 normal/ 与 abnormal/ 的目录")
         anomaly_layout.addWidget(self.anomaly_edit, 1)
@@ -501,6 +525,7 @@ class TrainTab(QWidget):
 
         # 训练参数预览：按当前 imgsz 与增强参数生成拼图（letterbox + 增强示意）
         preview_row = QHBoxLayout()
+        preview_row.setSpacing(T.SPACE_MD)
         preview_btn = PushButton("预览参数", card)
         preview_btn.setToolTip(
             "按当前图像尺寸与增强参数生成预览拼图（letterbox + 增强示意）"
@@ -607,14 +632,18 @@ class TrainTab(QWidget):
             box = QWidget(self.aug_holder)
             row = QHBoxLayout(box)
             row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(T.SPACE_SM)
             row.addWidget(CaptionLabel(label, box))
-            spin = DoubleSpinBox(box)
+            spin = SafeDoubleSpinBox(box)
             spin.setRange(minimum, maximum)
             spin.setSingleStep(step)
             spin.setDecimals(3 if step < 0.01 else 2)
             spin.setValue(default)
+            # 定宽步进器：不再拉伸填满栅格
+            spin.setFixedWidth(T.field_width(spin, T.STEPPER_CHARS_NARROW))
             spin.valueChanged.connect(self._on_param_changed)
-            row.addWidget(spin, 1)
+            row.addWidget(spin)
+            row.addStretch(1)
             grid.addWidget(box, index // 3, index % 3)
             self._aug_spins[key] = spin
         layout.addWidget(self.aug_holder)

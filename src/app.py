@@ -22,6 +22,7 @@ from src.utils.config import ConfigManager
 from src.utils.constants import APP_NAME, APP_VERSION, BRAND_COLOR, ORG_NAME
 from src.utils.logger import setup_logger
 from src.views.main_window import MainWindow
+from src.views.ui import WheelGuard
 
 # 高分屏缩放支持
 QApplication.setHighDpiScaleFactorRoundingPolicy(
@@ -58,6 +59,10 @@ def run(argv: list | None = None) -> int:
     app = QApplication([argv[0], *rest])
     app.setApplicationName(APP_NAME)
     app.setOrganizationName(ORG_NAME)
+
+    # 全局滚轮防护：参数输入框不再被滚轮误改（滚轮改交给所在滚动区）
+    # 详见 src/views/ui/wheel_guard.py
+    app.installEventFilter(WheelGuard(app))
 
     # 配置（先读配置，日志的滚动份数 / 单文件上限由偏好设置决定）
     config = ConfigManager()

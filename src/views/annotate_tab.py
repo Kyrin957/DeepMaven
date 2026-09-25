@@ -14,14 +14,12 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QPlainTextEdit,
-    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -44,6 +42,13 @@ from src.services.autolabel_service import DEFAULT_DETECT_WEIGHTS, DEFAULT_SAM_W
 from src.viewmodels.annotate_vm import AnnotateViewModel
 from src.viewmodels.category_vm import CategoryViewModel
 from src.views.data_widgets import side_column
+from src.views.ui import (
+    FlowLayout,
+    SafeDoubleSpinBox,
+    SafeSpinBox,
+    ToolGroup,
+)
+from src.views.ui import tokens as T
 from src.views.widgets import (
     MODE_BOX,
     MODE_BROWSE,
@@ -126,9 +131,12 @@ class AnnotateTab(QWidget):
 
         jump_row = QHBoxLayout()
         jump_row.setSpacing(6)
-        self.jump_spin = QSpinBox(current_card)
+        self.jump_spin = SafeSpinBox(current_card)
         self.jump_spin.setRange(1, 1)
-        jump_row.addWidget(self.jump_spin, 1)
+        self.jump_spin.setFixedWidth(
+            T.field_width(self.jump_spin, T.STEPPER_CHARS_NARROW)
+        )
+        jump_row.addWidget(self.jump_spin)
         self.jump_btn = PushButton("跳转", current_card)
         jump_row.addWidget(self.jump_btn)
         layout.addLayout(jump_row)
@@ -143,7 +151,7 @@ class AnnotateTab(QWidget):
         self.grid.set_wheel_zoom(True)      # Ctrl + 滚轮缩放缩略图
         list_layout.addWidget(self.grid, 1)
 
-        return side_column(current_card, list_card, width=240)
+        return side_column(current_card, list_card, width=T.SIDE_W_NARROW)
 
     # --------------------------------------------------- 中间
     def _build_center(self) -> QVBoxLayout:
@@ -155,58 +163,76 @@ class AnnotateTab(QWidget):
         return column
 
     def _build_toolbar(self) -> CardWidget:
+        """工具条：按逻辑分组容器化排布，宽度不足时**整组换行**。
+
+        旧实现把 15+ 个控件塞进单行 ``QHBoxLayout``；一旦可用宽度不够
+        （窄窗口、或高分屏下字体变宽），Qt 无法换行，只能让控件互相覆盖，
+        于是出现「浏览｜矩形｜多边形｜存标」文字与指示条重叠。
+
+        现在改用 ``FlowLayout`` + ``ToolGroup``：每个分组是独立容器，
+        分组整体折到下一行，因此任意窗口宽度 / 缩放比例下都不会重叠。
+        """
         card = CardWidget(self)
-        layout = QHBoxLayout(card)
-        layout.setContentsMargins(16, 10, 16, 10)
-        layout.setSpacing(10)
+        flow = FlowLayout(card, spacing=T.SPACE_MD)
+        flow.setContentsMargins(T.SPACE_XL, T.SPACE_MD, T.SPACE_XL, T.SPACE_MD)
 
+        # ① 绘制工具（浏览 / 矩形 / 多边形 / 掩码；OCR 项目为 浏览 + 文本）
         self.mode_seg = SegmentedWidget(card)
-        self._reload_tools("box")           # 默认工具集（文本框工具仅 OCR 项目出现）
-        layout.addWidget(self.mode_seg)
+        self._reload_tools("box")
         self.mode_seg.setCurrentItem(MODE_BOX)
+        flow.addWidget(ToolGroup(self.mode_seg, parent=card))
 
-        layout.addWidget(BodyLabel("类别", card))
+        # ② 类别选择
         self.class_combo = ComboBox(card)
-        self.class_combo.setMinimumWidth(150)
-        layout.addWidget(self.class_combo)
+        self.class_combo.setMinimumWidth(140)
+        flow.addWidget(
+            ToolGroup(BodyLabel("类别", card), self.class_combo, parent=card)
+        )
 
-        # 旋转框任务的角度微调（仅「对象检测·旋转框」类型显示）
-        self.rotate_spin = QDoubleSpinBox(card)
+        # ③ 旋转角微调（仅「对象检测·旋转框」，整组显隐）
+        self.rotate_spin = SafeDoubleSpinBox(card)
         self.rotate_spin.setRange(-180.0, 180.0)
         self.rotate_spin.setDecimals(1)
         self.rotate_spin.setSingleStep(5.0)
         self.rotate_spin.setValue(0.0)
         self.rotate_spin.setSuffix(" °")
-        self.rotate_spin.setFixedWidth(96)
-        layout.addWidget(self.rotate_spin)
+        self.rotate_spin.setFixedWidth(
+            T.field_width(self.rotate_spin, T.STEPPER_CHARS_NARROW)
+        )
         self.rotate_btn = PushButton("旋转选中", card)
-        layout.addWidget(self.rotate_btn)
-        self.rotate_spin.setVisible(False)
-        self.rotate_btn.setVisible(False)
+        self.rotate_group = ToolGroup(
+            BodyLabel("角度", card), self.rotate_spin, self.rotate_btn, parent=card
+        )
+        self.rotate_group.setVisible(False)
+        flow.addWidget(self.rotate_group)
 
-        # 掩码工具（画笔 / 橡皮 / 生成轮廓）
-        self.brush_spin = QSpinBox(card)
+        # ④ 掩码工具（画笔 / 橡皮 / 生成轮廓，整组显隐）
+        self.brush_spin = SafeSpinBox(card)
         self.brush_spin.setRange(2, 300)
         self.brush_spin.setValue(24)
         self.brush_spin.setSuffix(" px")
-        self.brush_spin.setFixedWidth(84)
+        self.brush_spin.setFixedWidth(
+            T.field_width(self.brush_spin, T.STEPPER_CHARS_NARROW)
+        )
         self.erase_check = CheckBox("橡皮", card)
         self.brush_label = BodyLabel("笔刷", card)
         self.outline_btn = PushButton("生成轮廓", card)
         self.mask_clear_btn = PushButton("清除掩码", card)
-        for widget in (self.brush_label, self.brush_spin, self.erase_check,
-                       self.outline_btn, self.mask_clear_btn):
-            layout.addWidget(widget)
-            widget.setVisible(False)
+        self.mask_group = ToolGroup(
+            self.brush_label, self.brush_spin, self.erase_check,
+            self.outline_btn, self.mask_clear_btn, parent=card,
+        )
+        self.mask_group.setVisible(False)
+        flow.addWidget(self.mask_group)
 
-        # 孔洞（多边形模式下的子工具）
+        # ⑤ 孔洞（多边形模式下的子工具，整组显隐）
         self.hole_check = CheckBox("孔洞", card)
         self.hole_check.setToolTip("画出的多边形从选中实例中挖掉")
-        layout.addWidget(self.hole_check)
-        self.hole_check.setVisible(False)
+        self.hole_group = ToolGroup(self.hole_check, parent=card)
+        self.hole_group.setVisible(False)
+        flow.addWidget(self.hole_group)
 
-        layout.addStretch(1)
-
+        # ⑥ 标注存取（保存 / 清空 / 导入 / 导出）
         self.save_btn = PrimaryPushButton("保存标注", card)
         self.clear_btn = PushButton("清空", card)
         self.import_btn = PushButton("导入标注", card)
@@ -218,46 +244,48 @@ class AnnotateTab(QWidget):
         ):
             self.export_combo.addItem(text, userData=key)
         self.export_btn = PushButton("导出标注", card)
-        for widget in (self.save_btn, self.clear_btn, self.import_btn,
-                       self.export_combo, self.export_btn):
-            layout.addWidget(widget)
+        flow.addWidget(ToolGroup(
+            self.save_btn, self.clear_btn, self.import_btn,
+            self.export_combo, self.export_btn, parent=card,
+        ))
         return card
 
     def _build_preannotate_bar(self) -> CardWidget:
+        """预标注栏：同样容器化 + 可换行，避免窄窗口下控件互相重叠。"""
         card = CardWidget(self)
-        layout = QHBoxLayout(card)
-        layout.setContentsMargins(16, 10, 16, 10)
-        layout.setSpacing(10)
+        flow = FlowLayout(card, spacing=T.SPACE_MD)
+        flow.setContentsMargins(T.SPACE_XL, T.SPACE_MD, T.SPACE_XL, T.SPACE_MD)
 
-        layout.addWidget(BodyLabel("检测权重", card))
         self.detect_edit = LineEdit(card)
         self.detect_edit.setText(DEFAULT_DETECT_WEIGHTS)
-        self.detect_edit.setMinimumWidth(160)
-        layout.addWidget(self.detect_edit)
+        self.detect_edit.setMinimumWidth(180)
         browse_btn = PushButton("浏览", card)
         browse_btn.clicked.connect(self._on_browse_detect)
-        layout.addWidget(browse_btn)
+        flow.addWidget(ToolGroup(
+            BodyLabel("检测权重", card), self.detect_edit, browse_btn, parent=card,
+        ))
 
-        layout.addWidget(BodyLabel("置信度", card))
-        self.conf_spin = QDoubleSpinBox(card)
+        self.conf_spin = SafeDoubleSpinBox(card)
         self.conf_spin.setDecimals(2)
         self.conf_spin.setSingleStep(0.05)
         self.conf_spin.setRange(0.05, 0.95)
         self.conf_spin.setValue(0.25)
-        layout.addWidget(self.conf_spin)
+        self.conf_spin.setFixedWidth(
+            T.field_width(self.conf_spin, T.STEPPER_CHARS_NARROW)
+        )
+        flow.addWidget(
+            ToolGroup(BodyLabel("置信度", card), self.conf_spin, parent=card)
+        )
 
         self.detect_btn = PrimaryPushButton("预标注未标注图片", card)
         self.sam_btn = PushButton("SAM 细化选中", card)
-        layout.addWidget(self.detect_btn)
-        layout.addWidget(self.sam_btn)
-        layout.addStretch(1)
+        flow.addWidget(ToolGroup(self.detect_btn, self.sam_btn, parent=card))
 
         self.progress_bar = ProgressBar(card)
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setFixedWidth(150)
-        layout.addWidget(self.progress_bar)
         self.task_label = CaptionLabel("", card)
-        layout.addWidget(self.task_label)
+        flow.addWidget(ToolGroup(self.progress_bar, self.task_label, parent=card))
         return card
 
     def _build_canvas_card(self) -> CardWidget:
@@ -354,20 +382,22 @@ class AnnotateTab(QWidget):
         )
         form.addRow("类别", self.item_class_combo)
 
-        self.geo_spins: dict[str, QDoubleSpinBox] = {}
+        self.geo_spins: dict[str, SafeDoubleSpinBox] = {}
         for key, text in (("x", "X"), ("y", "Y"), ("w", "宽"), ("h", "高")):
-            spin = QDoubleSpinBox(self.edit_card)
+            spin = SafeDoubleSpinBox(self.edit_card)
             spin.setRange(0.0, 100000.0)
             spin.setDecimals(1)
-            spin.setFixedWidth(92)
+            spin.setFixedWidth(T.field_width(spin, T.STEPPER_CHARS))
             form.addRow(text, spin)
             self.geo_spins[key] = spin
 
-        self.angle_spin = QDoubleSpinBox(self.edit_card)
+        self.angle_spin = SafeDoubleSpinBox(self.edit_card)
         self.angle_spin.setRange(-360.0, 360.0)
         self.angle_spin.setDecimals(1)
         self.angle_spin.setSuffix(" °")
-        self.angle_spin.setFixedWidth(92)
+        self.angle_spin.setFixedWidth(
+            T.field_width(self.angle_spin, T.STEPPER_CHARS_NARROW)
+        )
         form.addRow("旋转", self.angle_spin)
 
         # 文本框转写（OCR 项目选中文本框时出现）
@@ -400,7 +430,7 @@ class AnnotateTab(QWidget):
 
         return side_column(
             navigator_card, display_card, item_card, self.edit_card, note_card,
-            width=268,
+            width=T.SIDE_W,
         )
 
     # -----------------------------------------------------------
@@ -519,11 +549,9 @@ class AnnotateTab(QWidget):
 
     def _on_mode(self, key: str) -> None:
         self.canvas.set_mode(key)
-        is_mask = key == MODE_MASK
-        for widget in (self.brush_label, self.brush_spin, self.erase_check,
-                       self.outline_btn, self.mask_clear_btn):
-            widget.setVisible(is_mask)
-        self.hole_check.setVisible(key == MODE_POLYGON)
+        # 整组显隐（配合 FlowLayout：隐藏的分组不占位、不重排错位）
+        self.mask_group.setVisible(key == MODE_MASK)
+        self.hole_group.setVisible(key == MODE_POLYGON)
         self.hole_check.setChecked(False)
 
     # -----------------------------------------------------------
@@ -681,8 +709,7 @@ class AnnotateTab(QWidget):
         self._on_mode(target)
 
         is_obb = mode == "obb"
-        self.rotate_spin.setVisible(is_obb)
-        self.rotate_btn.setVisible(is_obb)
+        self.rotate_group.setVisible(is_obb)
         if mode == "none":
             self.status_message("按整图判定，无需框选")
         elif is_obb:
