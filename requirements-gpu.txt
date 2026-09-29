@@ -10,9 +10,19 @@
 #   pip install -r requirements-gpu.txt
 #   pip install -r requirements.txt
 #
-# CUDA 源（PyTorch 官方 index，按需选择 cu118 / cu121 / cu128 等）：
-#   https://download.pytorch.org/whl/cu128
+# CUDA 源（PyTorch 官方 index）：
+#   https://download.pytorch.org/whl/cu130
+# 注意：torch 2.13.0 仅发布于 cu130 源（cu128 源最高只到 2.11.0）。
+#
+# 国内镜像加速（推荐）：
+# 官方源在境外，且 torch wheel 约 1.9 GB，国内直连下载非常慢。
+# 可改用阿里云镜像（国内 CDN，实测速度 1~2 MB/s 以上）：
+#   1) 打开 https://mirrors.aliyun.com/pytorch-wheels/cu130/
+#      选择与当前 Python 版本匹配的 wheel
+#      （Python 3.14 对应 cp314-cp314-win_amd64）；
+#   2) 直接以 URL 安装（Windows 下请保持在同一条命令中）：
+#      pip install -i https://mirrors.aliyun.com/pypi/simple/ "https://mirrors.aliyun.com/pytorch-wheels/cu130/torch-2.13.0%2Bcu130-cp314-cp314-win_amd64.whl" "https://mirrors.aliyun.com/pytorch-wheels/cu130/torchvision-0.28.0%2Bcu130-cp314-cp314-win_amd64.whl"
 # ============================================================
 
-torch==2.13.0+cu128
-torchvision==0.28.0+cu128
+torch==2.13.0+cu130
+torchvision==0.28.0+cu130

@@ -28,9 +28,11 @@
 ## 环境要求
 
 - Python 3.14+
-- 依赖清单：`requirements.txt`（CPU 版）；如需 CUDA 加速，参考 `requirements-gpu.txt`
+- 依赖清单：`requirements.txt`（CPU 版）；如需 CUDA 加速（cu130），参考 `requirements-gpu.txt`
 
 ## 安装
+
+### 基础安装（CPU 版 PyTorch）
 
 ```powershell
 py -3.14 -m venv .venv
@@ -38,6 +40,18 @@ py -3.14 -m venv .venv
 python -m pip install -U pip
 pip install -r requirements.txt
 ```
+
+### GPU 加速（可选，NVIDIA 显卡）
+
+`requirements.txt` 默认安装 CPU 版 PyTorch。如需 CUDA 加速，先卸载 CPU 版，再按 GPU 清单安装：
+
+```powershell
+pip uninstall torch torchvision -y
+pip install -r requirements-gpu.txt
+pip install -r requirements.txt
+```
+
+> GPU 版 wheel 体积约 2 GB，官方源在境外、下载缓慢；国内推荐改用阿里云镜像（附可直接复制的安装命令），见 `requirements-gpu.txt` 内注释。
 
 > 注意：Fluent 组件库必须使用 **PySide6 后端**的 `PySide6-Fluent-Widgets`。它与 PyQt5 后端的 `PyQt-Fluent-Widgets` 共用 `qfluentwidgets` 模块名，二者不可共存，误装会导致启动崩溃。
 
@@ -55,7 +69,6 @@ DeepMaven/
 ├── requirements.txt         # CPU 依赖清单
 ├── requirements-gpu.txt     # CUDA 依赖清单（可选）
 ├── 开发文档.md              # 开发方案与实施步骤
-├── session records.md       # 开发会话记录
 ├── README.md
 └── src/
     ├── app.py               # QApplication 启动、主题与配置初始化
@@ -76,5 +89,4 @@ DeepMaven/
 | 文档 | 内容 |
 |------|------|
 | `开发文档.md` | 项目概述、技术选型、架构设计、界面布局、分步实施计划 |
-| `session records.md` | 各次开发会话的目标、执行过程与结果 |
 | `requirements.txt` / `requirements-gpu.txt` | 依赖清单与安装说明 |
