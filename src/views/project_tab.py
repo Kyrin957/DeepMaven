@@ -155,6 +155,9 @@ class ProjectTab(QWidget):
         self._dataset_vm = dataset_vm
         self._cards: list[ProjectCard] = []
         self._shown_path = ""       # 信息面板当前展示的项目文件路径
+        # 未保存改动处理（由主窗口注入：项目 + 标注两层统一检查 / 保存）
+        self._unsaved_check = None
+        self._unsaved_confirm = None
         self._build_ui()
         self._bind()
         self._reload_recent()
@@ -327,6 +330,33 @@ class ProjectTab(QWidget):
         self.base_edit.editingFinished.connect(self._on_base_path_changed)
 
     # -----------------------------------------------------------
+    # 未保存改动（主窗口注入；项目 + 标注两层统一处理）
+    # -----------------------------------------------------------
+    def set_unsaved_handler(self, check, confirm) -> None:
+        """注入未保存检查器与确认器（由主窗口提供）。
+
+        Args:
+            check: ``() -> bool``，当前是否有未保存改动（项目 + 标注）。
+            confirm: ``(action: str) -> bool``，询问并处理（保存 / 不保存 /
+                取消），返回是否允许继续。
+        """
+        self._unsaved_check = check
+        self._unsaved_confirm = confirm
+
+    def _is_dirty(self) -> bool:
+        """当前是否有未保存改动（未注入检查器时退化为只看项目标记）。"""
+        if self._unsaved_check is not None:
+            return bool(self._unsaved_check())
+        project = self._vm.project
+        return bool(project is not None and project.dirty)
+
+    def _unsaved_guard(self, action: str) -> bool:
+        """替换 / 关闭当前项目前的守卫；返回 False 表示用户选择取消。"""
+        if self._unsaved_confirm is None:
+            return True
+        return bool(self._unsaved_confirm(action))
+
+    # -----------------------------------------------------------
     # 最近项目
     # -----------------------------------------------------------
     def _reload_recent(self) -> None:
@@ -377,6 +407,8 @@ class ProjectTab(QWidget):
             self._vm.message.emit("error", f"项目文件不存在：{path}")
             self._reload_recent()
             return
+        if not self._unsaved_guard("打开其它项目"):
+            return
         self._vm.open_project(path)
 
     def _on_card_menu(self, path: str, position) -> None:
@@ -401,6 +433,19 @@ class ProjectTab(QWidget):
 
     def _on_delete_project(self, path: str) -> None:
         """删除项目：列出项目文件、项目文件夹与其中的训练产物后一次清理。"""
+        # 删除当前项目且存在未保存改动时先提醒（删除后无法恢复）
+        if path == self._vm.current_path and self._is_dirty():
+            project = self._vm.project
+            name = project.name if project is not None else Path(path).stem
+            box = MessageBox(
+                "未保存的更改",
+                f"当前项目「{name}」有未保存的更改，\n删除后这些更改将无法恢复。",
+                self,
+            )
+            box.yesButton.setText("继续删除")
+            box.cancelButton.setText("取消")
+            if not box.exec():
+                return
         name = Path(path).stem
         info = self._vm.project_artifacts(path)
         dialog = DeleteProjectDialog(name, info, self.window())
@@ -409,10 +454,18 @@ class ProjectTab(QWidget):
         self._vm.delete_project(path)
         self._reload_recent()
 
+    def _on_recover(self, backup: str) -> None:
+        """从自动备份恢复项目（恢复会替换当前项目，先处理未保存改动）。"""
+        if not self._unsaved_guard("恢复其它项目"):
+            return
+        self._vm.recover_project(backup)
+
     # -----------------------------------------------------------
     # 项目操作
     # -----------------------------------------------------------
     def _on_new(self) -> None:
+        if not self._unsaved_guard("新建项目"):
+            return
         default_dir = self._vm.project_dir() or str(Path.home() / "Documents")
         dialog = NewProjectDialog(self.window(), default_dir=default_dir)
         if not dialog.exec():
@@ -433,6 +486,8 @@ class ProjectTab(QWidget):
         self._show_project(project, current=True)
 
     def _on_open(self) -> None:
+        if not self._unsaved_guard("打开其它项目"):
+            return
         path, _ = QFileDialog.getOpenFileName(
             self, "打开项目文件", self._vm.project_dir(), PROJECT_FILE_FILTER
         )
@@ -467,9 +522,11 @@ class ProjectTab(QWidget):
         self._vm.save_project_as(path)
 
     def close_project(self) -> None:
-        """关闭当前项目（项目文件保留在磁盘上）。"""
+        """关闭当前项目：先处理未保存改动，再确认关闭。"""
         if not self._vm.has_project():
             self._vm.message.emit("warning", "当前没有打开的项目")
+            return
+        if not self._unsaved_guard("关闭项目"):
             return
         project = self._vm.project
         box = MessageBox(
@@ -612,7 +669,7 @@ class ProjectTab(QWidget):
             restore = PushButton("恢复", row)
             restore.clicked.connect(
                 lambda _checked=False, target=str(info.get("backup", "")):
-                self._vm.recover_project(target)
+                self._on_recover(target)
             )
             discard = PushButton("忽略", row)
             discard.clicked.connect(

@@ -86,6 +86,7 @@ from src.views import (
 )
 from src.views.dialogs.preferences_dialog import PreferencesDialog
 from src.views.dialogs.shortcut_dialog import ShortcutDialog
+from src.views.dialogs.unsaved_dialog import ask_unsaved_changes
 from src.views.shortcuts import ShortcutManager
 from src.views.ui import tokens as T
 
@@ -420,6 +421,10 @@ class MainWindow(FluentWindow):
 
         self.project_tab = ProjectTab(self.project_vm, self.dataset_vm, self)
         self.project_tab.setObjectName("projectTab")
+        # 未保存改动处理（打开 / 新建 / 恢复 / 关闭项目前的询问与保存）
+        self.project_tab.set_unsaved_handler(
+            self._has_unsaved_changes, self._confirm_unsaved
+        )
         self._add_page(PAGE_PROJECT, self.project_tab, FluentIcon.FOLDER, "项目管理")
 
         self.gallery_tab = GalleryTab(self.dataset_vm, self.category_vm, self)
@@ -750,6 +755,40 @@ class MainWindow(FluentWindow):
         """菜单：项目另存为。"""
         self.project_tab.save_project_as()
 
+    # -----------------------------------------------------------
+    # 未保存改动（关闭 / 切换前的询问与保存）
+    # -----------------------------------------------------------
+    def _has_unsaved_changes(self) -> bool:
+        """是否有未保存内容（项目容器 + 当前图片标注）。"""
+        project = self.project_vm.project
+        return bool(
+            (project is not None and project.dirty)
+            or self.annotate_tab.has_unsaved()
+        )
+
+    def _save_all_pending(self) -> bool:
+        """保存全部未保存内容（当前标注 + 项目容器）；返回项目是否保存成功。"""
+        self.annotate_tab.flush_pending()
+        project = self.project_vm.project
+        if project is not None and project.dirty:
+            return bool(self.project_vm.save_project())
+        return True
+
+    def _confirm_unsaved(self, action: str) -> bool:
+        """关闭 / 切换前处理未保存改动；返回是否允许继续（False = 取消）。
+
+        退出程序（``closeEvent``）与项目页各入口（打开 / 新建 / 恢复 / 关闭
+        项目）共用；由用户人工选择「保存 / 不保存 / 取消」。
+        """
+        if not self._has_unsaved_changes():
+            return True
+        choice = ask_unsaved_changes(self, action)
+        if choice == "cancel":
+            return False
+        if choice == "save":
+            self._save_all_pending()
+        return True
+
     def _close_project(self) -> None:
         """菜单：关闭当前项目。"""
         self.project_tab.close_project()
@@ -819,5 +858,9 @@ class MainWindow(FluentWindow):
             self._fit_to_screen()
 
     def closeEvent(self, e) -> None:  # noqa: N802 - Qt 命名
+        # 有未保存内容时先询问（保存 / 不保存 / 取消）；选择「取消」则中止退出
+        if not self._confirm_unsaved("退出程序"):
+            e.ignore()
+            return
         logger.info("应用退出")
         super().closeEvent(e)
