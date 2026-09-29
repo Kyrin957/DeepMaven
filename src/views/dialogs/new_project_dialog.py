@@ -265,7 +265,6 @@ class NewProjectDialog(MessageBoxBase):
         row.addWidget(CaptionLabel("项目名称", container))
         self.name_edit = LineEdit(container)
         self.name_edit.setText("新项目")
-        self.name_edit.textChanged.connect(self._on_name_changed)
         row.addWidget(self.name_edit, 1)
 
         row.addWidget(CaptionLabel("项目文件路径", container))
@@ -295,12 +294,6 @@ class NewProjectDialog(MessageBoxBase):
         bottom.addWidget(self.hint, 2)
         layout.addLayout(bottom)
         return container
-
-    def _on_name_changed(self, text: str) -> None:
-        path = self.path_edit.text().strip()
-        if not path:
-            return
-        self.path_edit.setText(str(Path(path).with_name(f"{text.strip() or '新项目'}.mprj")))
 
     def _on_browse_path(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
