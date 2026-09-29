@@ -11,6 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QFileDialog,
@@ -18,6 +19,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QListWidget,
     QPlainTextEdit,
+    QStyle,
     QVBoxLayout,
     QWidget,
 )
@@ -29,6 +31,7 @@ from qfluentwidgets import (
     ComboBox,
     FluentIcon,
     LineEdit,
+    MessageBox,
     PrimaryPushButton,
     PrimaryToolButton,
     ProgressBar,
@@ -41,10 +44,14 @@ from qfluentwidgets import (
 from src.services.autolabel_service import DEFAULT_DETECT_WEIGHTS, DEFAULT_SAM_WEIGHTS
 from src.viewmodels.annotate_vm import AnnotateViewModel
 from src.viewmodels.category_vm import CategoryViewModel
-from src.views.data_widgets import side_column
+from src.views.data_widgets import ClassCard, side_column
+from src.views.dialogs.tag_edit_dialog import DEFAULT_TAG_COLOR, TagEditDialog
+from src.views.gallery_widgets import SplitMapCard, TagCard
 from src.views.ui import (
+    BusyPopup,
     DisplayDock,
     FlowContainer,
+    SafeCompactSpinBox,
     SafeDoubleSpinBox,
     SafeSpinBox,
     ToolGroup,
@@ -62,6 +69,10 @@ from src.views.widgets import (
 )
 
 
+# 页码框仅需容纳 3 位数字（侧栏宽度有限：紧凑步进器 + 度量定宽）
+_JUMP_CHARS = 3
+
+
 class AnnotateTab(QWidget):
     """图像标注页。"""
 
@@ -74,6 +85,9 @@ class AnnotateTab(QWidget):
         super().__init__(parent)
         self._vm = vm
         self._category_vm = category_vm
+        # 数据集 ViewModel：侧栏「标签类别 / 拆分映射 / 图像标记」卡片共用
+        self._dataset_vm = vm.dataset_vm
+        self.class_card: ClassCard | None = None
         self._canvas_selected = -1
         self._done = 0
         self._total = 0
@@ -92,6 +106,8 @@ class AnnotateTab(QWidget):
         root.setContentsMargins(T.SPACE_XL, T.SPACE_LG, T.SPACE_XL, T.SPACE_LG)
         root.setSpacing(T.SPACE_LG)
 
+        # 左侧：图像 / 标签类别 / 拆分映射 / 图像标记（与图像导入页同构）
+        root.addWidget(self._build_left_column())
         root.addLayout(self._build_center(), 1)
         root.addWidget(self._build_right_column())
 
@@ -273,37 +289,88 @@ class AnnotateTab(QWidget):
         flow.addWidget(ToolGroup(self.progress_bar, self.task_label, parent=card))
         return card
 
+    # --------------------------------------------------- 左侧
+    def _build_left_column(self) -> QWidget:
+        """左侧栏：图像 / 标签类别 / 拆分映射 / 图像标记（与图像导入页同构）。
+
+        这些卡片对**当前图片**生效（标注页按张工作）；显示调试仍在窗口
+        最右的 DisplayDock（RULE §11）。
+        """
+        self.image_card = self._build_image_card()
+        cards: list[QWidget] = [self.image_card]
+        if self._category_vm is not None:
+            self.class_card = ClassCard(self._category_vm, self)
+            cards.append(self.class_card)
+        self.split_map_card = SplitMapCard(self)
+        self.tag_card = TagCard(self)
+        cards.extend([self.split_map_card, self.tag_card])
+        return side_column(*cards, width=T.SIDE_W)
+
+    def _build_image_card(self) -> CardWidget:
+        """图像卡片：当前图名称 / 状态 + 前后切换（自画布条迁入）。
+
+        翻页行用**固定单行**（侧栏宽度固定）：此前用可换行容器，折行后的
+        第二行超出卡片高度被裁剪（下一张 / 末张按钮不可见）。
+        """
+        card = CardWidget(self)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(T.CARD_PAD_H, T.CARD_PAD_V, T.CARD_PAD_H, T.CARD_PAD_V)
+        layout.setSpacing(T.SPACE_SM)
+        layout.addWidget(StrongBodyLabel("图像", card))
+
+        self.strip_name = CaptionLabel("未加载图片", card)
+        self.strip_name.setWordWrap(True)
+        self.strip_state = CaptionLabel("未标注", card)
+        layout.addWidget(self.strip_name)
+        layout.addWidget(self.strip_state)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(T.SPACE_XXS)
+        self.first_btn = icon_button(self._skip_icon(True), "首张图片", card)
+        self.prev_btn = icon_button(FluentIcon.LEFT_ARROW, "上一张图片", card)
+        self.next_btn = icon_button(FluentIcon.RIGHT_ARROW, "下一张图片", card)
+        self.last_btn = icon_button(self._skip_icon(False), "末张图片", card)
+        self.jump_spin = SafeCompactSpinBox(card)
+        self.jump_spin.setRange(1, 1)
+        self.jump_spin.setFixedWidth(
+            T.field_width(self.jump_spin, _JUMP_CHARS)
+        )
+        self.jump_spin.setToolTip("输入序号后回车跳转")
+        self.page_total = CaptionLabel("/ 0", card)
+        row.addStretch(1)
+        row.addWidget(self.first_btn)
+        row.addWidget(self.prev_btn)
+        row.addWidget(self.jump_spin)
+        row.addWidget(self.page_total)
+        row.addWidget(self.next_btn)
+        row.addWidget(self.last_btn)
+        row.addStretch(1)
+        layout.addLayout(row)
+        return card
+
+    def _skip_icon(self, backward: bool) -> QIcon:
+        """「跳到开头 / 结尾」图标。
+
+        用 Qt 媒体跳过图标（``|◀◀`` / ``▶▶|``）：语义清晰、随主题适配；
+        原 FluentIcon.SKIP_BACK / SKIP_FORWARD 的 Fluent 字形在此尺寸下
+        与「上一张 / 下一张」难以区分（用户反馈）。
+        """
+        pixmap = (
+            QStyle.StandardPixmap.SP_MediaSkipBackward
+            if backward
+            else QStyle.StandardPixmap.SP_MediaSkipForward
+        )
+        return self.style().standardIcon(pixmap)
+
+    # --------------------------------------------------- 中间
     def _build_canvas_card(self) -> CardWidget:
         card = CardWidget(self)
         layout = QVBoxLayout(card)
         layout.setContentsMargins(T.SPACE_LG, T.SPACE_ML, T.SPACE_LG, T.SPACE_ML)
         layout.setSpacing(T.SPACE_MD)
 
-        # 翻页行（图标 + 页码，不写文字）：容器化 + 可换行
-        strip_holder = FlowContainer(
-            card, spacing=T.SPACE_SM, margins=(0, 0, 0, 0)
-        )
-        strip = strip_holder.flow()
-        self.first_btn = icon_button(FluentIcon.SKIP_BACK, "首张图片", card)
-        self.prev_btn = icon_button(FluentIcon.LEFT_ARROW, "上一张图片", card)
-        self.next_btn = icon_button(FluentIcon.RIGHT_ARROW, "下一张图片", card)
-        self.last_btn = icon_button(FluentIcon.SKIP_FORWARD, "末张图片", card)
-        self.jump_spin = SafeSpinBox(card)
-        self.jump_spin.setRange(1, 1)
-        self.jump_spin.setFixedWidth(
-            T.field_width(self.jump_spin, T.STEPPER_CHARS_NARROW)
-        )
-        self.jump_spin.setToolTip("输入序号后回车跳转")
-        self.page_total = CaptionLabel("/ 0", card)
-        strip.addWidget(ToolGroup(
-            self.first_btn, self.prev_btn, self.jump_spin,
-            self.page_total, self.next_btn, self.last_btn, parent=card,
-        ))
-        self.strip_name = CaptionLabel("未加载图片", card)
-        self.strip_state = CaptionLabel("未标注", card)
-        strip.addWidget(ToolGroup(self.strip_name, self.strip_state, parent=card))
-        layout.addWidget(strip_holder)
-
+        # 翻页 / 名称已迁到左侧「图像」卡片，画布条只留画布本体
         self.canvas = AnnotationCanvas(card)
         self.canvas.setMinimumHeight(360)
         layout.addWidget(self.canvas, 1)
@@ -481,6 +548,20 @@ class AnnotateTab(QWidget):
         self.display_dock.changed.connect(self._apply_display)
         self.note_btn.clicked.connect(self._on_save_note)
 
+        # 左侧栏：标签类别 / 拆分映射 / 图像标记（对当前图片生效）
+        if self.class_card is not None:
+            self.class_card.classClicked.connect(self._on_class_clicked)
+            self.class_card.changed.connect(lambda: self._refresh_side())
+        self.split_map_card.splitRequested.connect(self._on_split_requested)
+        self.tag_card.tagToggled.connect(self._on_tag_toggled)
+        self.tag_card.addRequested.connect(self._on_add_tag)
+        self.tag_card.editRequested.connect(self._on_edit_tag)
+        self.tag_card.deleteRequested.connect(self._on_delete_tag)
+        if self._dataset_vm is not None:
+            self._dataset_vm.datasetChanged.connect(
+                lambda _value: self._refresh_side()
+            )
+
         if self._category_vm is not None:
             self._category_vm.classesChanged.connect(self._on_classes_changed)
 
@@ -502,6 +583,7 @@ class AnnotateTab(QWidget):
 
     def _on_classes_changed(self, _classes) -> None:
         self._refresh_classes()
+        self._refresh_side()
 
     def _on_class_changed(self, _index: int) -> None:
         value = self.class_combo.currentData()
@@ -728,8 +810,161 @@ class AnnotateTab(QWidget):
     def _apply_display(self) -> None:
         """把显示调试栏的亮度 / 对比度下发给画布（只影响显示）。"""
         values = self.display_dock.values()
-        self.canvas.set_brightness(round(values["brightness"] * 100))
-        self.canvas.set_contrast(round(values["contrast"] * 100))
+        with BusyPopup.scope(self.window(), "正在应用显示效果") as busy:
+            busy.step()          # 先让滑杆 / 读数重绘，再做画布重算
+            self.canvas.set_brightness(round(values["brightness"] * 100))
+            self.canvas.set_contrast(round(values["contrast"] * 100))
+
+    # -----------------------------------------------------------
+    # 左侧栏：图像信息 / 标签类别 / 拆分映射 / 图像标记
+    # -----------------------------------------------------------
+    def _current_paths(self) -> list[str]:
+        """当前图片路径（左侧栏的类别 / 拆分 / 标记都针对它设置）。"""
+        path = self._vm.current_path()
+        return [str(path)] if path is not None else []
+
+    def _class_counts(self) -> dict:
+        """各类别的实际图片数；检测任务额外统计未标注张数（与图库页一致）。"""
+        vm = self._dataset_vm
+        if vm is None:
+            return {}
+        counts = vm.class_distribution()
+        if vm.split_layout() != "classify":
+            flags = vm.annotated_flags()
+            counts["未标注"] = sum(1 for flag in flags if not flag)
+        return counts
+
+    def _refresh_side(self) -> None:
+        """刷新左侧「标签类别 / 拆分映射 / 图像标记」卡片状态。"""
+        vm = self._dataset_vm
+        if vm is None or vm.dataset is None:
+            return
+        if self.class_card is not None and self._category_vm is not None:
+            self.class_card.set_classes(
+                list(self._category_vm.classes), self._class_counts()
+            )
+        current = ""
+        paths = self._current_paths()
+        labels = vm.subset_labels()
+        position = {str(path): index for index, path in enumerate(vm.images())}
+        if paths:
+            index = position.get(paths[0])
+            if index is not None and index < len(labels):
+                current = labels[index]
+        self.split_map_card.set_state(
+            vm.split_name_label(), vm.split_summary(), current, vm.split_locked()
+        )
+        counts: dict[str, int] = {}
+        for values in vm.tag_map().values():
+            for name in values:
+                counts[name] = counts.get(name, 0) + 1
+        self.tag_card.set_tags(
+            vm.all_tag_names(),
+            {item["name"]: item["color"] for item in vm.image_tag_defs()},
+            counts,
+        )
+
+    def _on_class_clicked(self, name: str) -> None:
+        """点类别行 → 当前图片改为该类别（"" = 无标签）。"""
+        paths = self._current_paths()
+        if paths and self._dataset_vm is not None:
+            self._dataset_vm.set_class_for(paths, name)
+            self._refresh_side()
+
+    def _on_split_requested(self, split: str) -> None:
+        """点拆分映射行 → 当前图片改划到该子集。"""
+        vm = self._dataset_vm
+        if vm is None:
+            return
+        if vm.split_locked():
+            self._vm.message.emit("warning", "该拆分已用于训练，无法更改")
+            return
+        paths = self._current_paths()
+        if paths:
+            vm.set_split_for(paths, split)
+            self._refresh_side()
+
+    def _on_tag_toggled(self, name: str) -> None:
+        """点图像标记 → 当前图片没有则追加、已有则删除。"""
+        paths = self._current_paths()
+        if paths and self._dataset_vm is not None:
+            self._dataset_vm.toggle_image_tag(paths, name)
+            self._refresh_side()
+
+    def _on_add_tag(self) -> None:
+        paths = self._current_paths()
+        dialog = TagEditDialog(
+            self.window(), color=DEFAULT_TAG_COLOR, has_selection=bool(paths)
+        )
+        dialog.applied.connect(self._apply_new_tag)
+        if not dialog.exec():
+            return
+        self._apply_new_tag(dialog.result_data())
+
+    def _apply_new_tag(self, data: dict) -> None:
+        """新增标记定义；勾了「为当前图像分配标记」时同时挂到当前图片。"""
+        vm = self._dataset_vm
+        if vm is None or not vm.add_image_tag(data["text"], data["color"]):
+            return
+        if data.get("assign") and self._current_paths():
+            vm.toggle_image_tag(self._current_paths(), data["text"])
+        self._refresh_side()
+
+    def _on_edit_tag(self, name: str) -> None:
+        vm = self._dataset_vm
+        target = None
+        if vm is not None:
+            target = next(
+                (item for item in vm.image_tag_defs() if item["name"] == name),
+                None,
+            )
+        if target is None:
+            return
+        paths = self._current_paths()
+        dialog = TagEditDialog(
+            self.window(),
+            text=target["name"],
+            color=target["color"] or DEFAULT_TAG_COLOR,
+            editing=True,
+            has_selection=bool(paths),
+        )
+        dialog.applied.connect(lambda data: self._apply_edit_tag(name, data))
+        if not dialog.exec():
+            return
+        self._apply_edit_tag(name, dialog.result_data())
+
+    def _apply_edit_tag(self, old_name: str, data: dict) -> None:
+        vm = self._dataset_vm
+        if vm is None or not vm.update_image_tag(
+            old_name, data["text"], data["color"]
+        ):
+            return
+        if data.get("assign") and self._current_paths():
+            vm.toggle_image_tag(self._current_paths(), data["text"])
+        self._refresh_side()
+
+    def _on_delete_tag(self, name: str) -> None:
+        box = MessageBox(
+            "删除图像标记",
+            f"确定要删除标记「{name}」吗？\n\n该标记会从所有图像上一并摘除。",
+            self.window(),
+        )
+        box.yesButton.setText("删除")
+        box.cancelButton.setText("取消")
+        if box.exec() and self._dataset_vm is not None:
+            self._dataset_vm.remove_image_tag(name)
+            self._refresh_side()
+
+    # -----------------------------------------------------------
+    # 未保存改动（关闭 / 切换项目前的检查与冲刷）
+    # -----------------------------------------------------------
+    def has_unsaved(self) -> bool:
+        """当前图片是否有未保存的标注改动。"""
+        return self._vm.has_unsaved()
+
+    def flush_pending(self) -> None:
+        """立即保存当前图片的未保存标注。"""
+        self._vm.flush_pending()
 
     def _on_save_note(self) -> None:
         path = self._vm.current_path()
@@ -751,6 +986,7 @@ class AnnotateTab(QWidget):
         """图片清单变化：更新页码范围与统计（缩略图列表已移除）。"""
         self.jump_spin.setRange(1, max(1, len(paths)))
         self._update_totals()
+        self._refresh_side()
 
     def _on_image_changed(self, index: int) -> None:
         path = self._vm.current_path()
@@ -762,6 +998,7 @@ class AnnotateTab(QWidget):
         self.jump_spin.setValue(index + 1)
         self._syncing = False
         self._update_strip()
+        self._refresh_side()
 
     def _on_annotation_loaded(self, annotation) -> None:
         self.canvas.set_annotations(annotation.items if annotation else [])

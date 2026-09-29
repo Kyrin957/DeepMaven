@@ -62,6 +62,11 @@ class AnnotateViewModel(QObject):
         if dataset_vm is not None:
             dataset_vm.datasetChanged.connect(self._on_dataset_changed)
 
+    @property
+    def dataset_vm(self):
+        """数据集 ViewModel（标注页侧栏的类别 / 拆分 / 标记卡片共用）。"""
+        return self._dataset_vm
+
     def _on_dataset_changed(self, _dataset) -> None:
         # 数据集已切换，旧的未保存改动不再回写（避免写错目录）
         self._dirty = False
@@ -415,6 +420,14 @@ class AnnotateViewModel(QObject):
         self._dirty = False
         self._emit_status()
         self.message.emit("success", f"标注已保存：{path.name}")
+
+    def has_unsaved(self) -> bool:
+        """当前图片是否有未保存的标注改动（关闭 / 切换项目前的检查入口）。"""
+        return bool(self._dirty and self._current is not None)
+
+    def flush_pending(self) -> None:
+        """立即保存当前图片的未保存标注（关闭 / 切换项目前的冲刷入口）。"""
+        self._autosave()
 
     # -----------------------------------------------------------
     # 半自动预标注
