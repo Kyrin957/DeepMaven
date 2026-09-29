@@ -183,6 +183,9 @@ $env:QT_QPA_PLATFORM="offscreen"
    并把控件渲染到白底上确认文本区**确实画出了字**。
    不满足即说明数字被步进按钮挤掉——用户看到的是"空输入框"，参数无从核对
    （§4.10，拆分页分配表 12 个框整列中招）。新增数值框 / 改宽度后必须复跑。
+7. **文案与提示断言（必做）**：遍历页面与弹窗可见控件的文本（标签 / 按钮），
+   断言不含解释性论述（「仅影响显示」「不改动图片」「无法更改」式的说明句，
+   见 §10）；显示调试等图标按钮必须带非空 `toolTip()`。
 
 ## 9. 参考实现
 
@@ -191,4 +194,47 @@ $env:QT_QPA_PLATFORM="offscreen"
 - 窄侧栏里的数值栅格（紧凑步进器 + 度量定宽）：
   `src/views/split_tab.py::_build_anomaly_card`
 - 基座：`src/views/ui/{tokens,flow_layout,wheel_guard,containers}.py`
+- 右侧显示调试栏：`src/views/ui/display_dock.py`（图标 + 悬浮面板）
 - 背景与取舍：`开发文档.md` §4.5 / §4.6 / §4.10
+
+## 10. 文案与提示：说明只走 tooltip，界面不写"论述"
+
+- **界面正文不得出现解释性 / 论述性文字**（历史写法：「仅影响显示，不改动图片」
+  「已用于训练，无法更改」这类贴在控件旁的说明句）。凡用户可能需要的解释，
+  一律挂到控件的悬停提示：`setToolTip("…")`。
+- 按钮 / 字段 / 分组只用**功能名**（2~6 字，如「亮度」「规则」「统计」），
+  不加形容与解释；确需补充的写进 tooltip，保持一句话。
+- 状态数据（计数、比例、当前值）可以显示，但必须**一行、简短**
+  （如「显示 12 / 240 张 · 已选 3」），不属于论述文字。
+- **简单操作按钮一律用图标**：统一用
+  `views.ui.icon_button(icon, "说明", parent, primary=False)` 创建
+  （32px 边长 / 20px 图标 / 无文字 / tooltip 即说明）。保存、清空、删除、
+  导入导出、翻页、适应窗口等「一看图标就懂」的动作不写文字；
+  承载范围语义的复杂操作（如「预标注未标注图片」）可保留文字。
+- 悬浮面板 / 弹窗内同样适用：滑杆、开关旁不写解释句；参数含义写在
+  滑杆 tooltip 上（参照 `DisplayDock` 的悬浮面板），面板里只放滑杆 + 读数。
+- 例外：流程必需的即时反馈（空列表占位、「请先选择图像」等操作提示）
+  允许存在，但同样要短。
+
+## 11. 显示调试栏：图像页统一的右侧图标栏（DisplayDock）
+
+- 图像导入 / 图像标注 / 标注检查三页的**显示调试**（亮度、对比度、类别名叠加、
+  缩略图尺寸、复位）统一收在窗口**最右侧**的 `DisplayDock`（参照 Halcon DLT
+  的右侧图标栏），不再用横向「显示条」占一行；说明文字按 §10 走 tooltip。
+- 交互形态固定为「**竖直图标按钮 + 点击弹出 Flyout 悬浮面板**」：
+  图标取 FluentIcon（亮度 `BRIGHTNESS` / 对比度 `CONSTRACT` / 类别名 `FONT` /
+  缩略图尺寸 `ZOOM` / 复位 `SYNC`），含义写在按钮 tooltip；
+  面板里只放滑杆 + 读数，调节实时生效、只影响显示不改动图片。
+- 图标按钮取 `ICON_BTN_LG`（32）、图标绘制边长 `ICON_GLYPH_LG`（20）——
+  qfluentwidgets ToolButton 默认图标只有 16px，在侧栏里显小，必须显式放大；
+  栏宽 = 按钮边长 + 两侧 `SPACE_XS`。
+- 新增显示类调试项时**扩展 `DisplayDock`**，不要再回页面里加横条。
+- 使用方式：
+
+  ```python
+  from src.views.ui import DisplayDock
+
+  self.display_dock = DisplayDock(self, with_size=True)   # 需要尺寸档位时
+  self.display_dock.set_thumb_steps(THUMB_STEPS)           # 与网格档位一致
+  self.display_dock.changed.connect(self._apply_display)   # 下发到网格 / 画布
+  ```

@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSize, Qt
 from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
@@ -25,7 +25,12 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from qfluentwidgets import CaptionLabel
+from qfluentwidgets import (
+    CaptionLabel,
+    PrimaryToolButton,
+    ToolButton,
+    TransparentToolButton,
+)
 
 from src.views.ui import tokens as T
 
@@ -153,4 +158,23 @@ def tool_separator(parent=None) -> QFrame:
     return line
 
 
-__all__ = ["ToolGroup", "FieldRow", "ParamGroup", "tool_separator"]
+def icon_button(
+    icon, tooltip: str, parent=None, primary: bool = False
+) -> ToolButton:
+    """统一的图标按钮：``ICON_BTN_LG``（32px 边长）/ ``ICON_GLYPH_LG``（20px 图标）。
+
+    ``primary=True`` 用主色样式（保存等主要操作）。qfluentwidgets 的 ToolButton
+    默认图标只有 16px，在工具条 / 侧栏里显小，这里统一放大一档；按钮不写文字，
+    含义一律走 tooltip（UI 规则 §10 / §11）。
+    """
+    factory = PrimaryToolButton if primary else TransparentToolButton
+    button = factory(icon, parent)
+    button.setToolTip(tooltip)
+    button.setIconSize(QSize(T.ICON_GLYPH_LG, T.ICON_GLYPH_LG))
+    button.setFixedSize(T.ICON_BTN_LG, T.ICON_BTN_LG)
+    return button
+
+
+__all__ = [
+    "ToolGroup", "FieldRow", "ParamGroup", "tool_separator", "icon_button",
+]

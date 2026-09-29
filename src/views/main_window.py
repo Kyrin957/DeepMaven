@@ -614,8 +614,8 @@ class MainWindow(FluentWindow):
         canvas.set_region_opacity(config.region_opacity)
         canvas.set_wheel_inverted(config.wheel_inverted)
         canvas.set_show_pixel(config.show_pixel_value)
-        self.annotate_tab.brightness_slider.setValue(config.default_brightness)
-        self.annotate_tab.contrast_slider.setValue(config.default_contrast)
+        self.annotate_tab.display_dock.set_brightness(config.default_brightness)
+        self.annotate_tab.display_dock.set_contrast(config.default_contrast)
         # 自动保存间隔随偏好变化重设
         self.project_vm.load_preferences()
         # CPU 线程数：未手动改过时跟随偏好（默认 4）

@@ -26,14 +26,12 @@ from qfluentwidgets import (
     PrimaryPushButton,
     PushButton,
     SegmentedWidget,
-    Slider,
     StrongBodyLabel,
     TransparentToolButton,
 )
 
 from src.views.dialogs.class_edit_dialog import PRESET_COLORS, ClassEditDialog
 from src.views.ui import tokens as T
-from src.views.widgets import THUMB_LARGE, THUMB_STEPS
 
 _COLOR_FALLBACK = "#66CCFF"
 _UNLABELED_ROW_LABEL = "无标签"
@@ -400,16 +398,12 @@ class ClassCard(CardWidget):
 
 
 class FilterCard(CardWidget):
-    """浏览筛选：全部 / 已标注 / 未标注 + 缩略图尺寸。"""
+    """浏览筛选：全部 / 已标注 / 未标注。"""
 
     filterChanged = Signal(str)      # all / annotated / unannotated
-    thumbSizeChanged = Signal(int)
 
-    def __init__(self, with_size: bool = True, parent=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
-        # 尺寸档位与网格共用同一套（页面用 set_thumb_steps 再收窄）
-        self._thumb_steps: tuple[int, ...] = THUMB_STEPS
-        self._syncing_thumb = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(T.CARD_PAD_H, T.CARD_PAD_V, T.CARD_PAD_H, T.CARD_PAD_V)
         layout.setSpacing(T.SPACE_SM)
@@ -424,17 +418,8 @@ class FilterCard(CardWidget):
         self.segment.setCurrentItem("all")
 
         self.summary = CaptionLabel("共 0 张", self)
+        self.summary.setToolTip("图像总数与已标注数")
         layout.addWidget(self.summary)
-
-        if with_size:
-            size_row = QHBoxLayout()
-            size_row.addWidget(CaptionLabel("缩略图", self))
-            self.size_slider = Slider(Qt.Orientation.Horizontal, self)
-            self.size_slider.setRange(0, max(0, len(self._thumb_steps) - 1))
-            self.size_slider.setValue(self._thumb_index(THUMB_LARGE))
-            self.size_slider.valueChanged.connect(self._on_slider_value)
-            size_row.addWidget(self.size_slider, 1)
-            layout.addLayout(size_row)
 
     def _on_filter(self, key: str) -> None:
         self._key = key
@@ -449,48 +434,6 @@ class FilterCard(CardWidget):
 
     def filter_key(self) -> str:
         return self._key
-
-    def set_thumb_steps(self, steps) -> None:
-        """配置尺寸档位（与 `ThumbnailGrid.set_thumb_steps` 保持一致）。"""
-        values = sorted({int(s) for s in (steps or []) if int(s) > 0})
-        if not values:
-            return
-        self._thumb_steps = tuple(values)
-        slider = getattr(self, "size_slider", None)
-        if slider is not None:
-            slider.setRange(0, len(self._thumb_steps) - 1)
-
-    def set_thumb_size(self, size: int) -> None:
-        """按「尺寸」同步旋钮位置（Ctrl + 滚轮缩放后调用）。
-
-        不能用 `blockSignals` 同步：qfluentwidgets 的滑杆靠自身 valueChanged
-        驱动旋钮移动，阻塞信号会出现「数值变了但旋钮不动」。
-        这里改用短标志忽略本次回调；页面侧处理是幂等的，不会来回打架。
-        """
-        slider = getattr(self, "size_slider", None)
-        if slider is None:
-            return
-        index = self._thumb_index(size)
-        if slider.value() == index:
-            return
-        self._syncing_thumb = True
-        try:
-            slider.setValue(index)
-        finally:
-            self._syncing_thumb = False
-
-    def _thumb_index(self, size: int) -> int:
-        """尺寸 → 档位下标（取最近档位）。"""
-        return min(
-            range(len(self._thumb_steps)),
-            key=lambda i: abs(self._thumb_steps[i] - int(size)),
-        )
-
-    def _on_slider_value(self, value: int) -> None:
-        if self._syncing_thumb:
-            return
-        self.thumbSizeChanged.emit(int(value))
-
 
 class SectionLabel(CaptionLabel):
     """小节标题（用于侧栏分隔）。"""

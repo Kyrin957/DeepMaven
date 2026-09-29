@@ -32,7 +32,6 @@ from qfluentwidgets import (
     PushButton,
     RoundMenu,
     SearchLineEdit,
-    Slider,
     StrongBodyLabel,
     TransparentToolButton,
 )
@@ -43,7 +42,6 @@ from src.views.ui import tokens as T
 
 # 标记 / 类别色块边长（装饰性尺寸，组件内部常量）
 _SWATCH_SIZE = 14
-from src.views.widgets import THUMB_MEDIUM, THUMB_STEPS
 
 _COLOR_EMPTY = "#1B1B1B"
 
@@ -142,7 +140,7 @@ def color_icon(color: str, size: int = 11) -> QIcon:
 
 
 class FilterBar(CardWidget):
-    """图像窗口上方的筛选栏：三个多选下拉菜单 + 文本筛选 + 缩略图尺寸。
+    """图像窗口上方的筛选栏：三个多选下拉菜单 + 文本筛选。
 
     每个菜单都是「下拉 + 勾选项」，**可多选**；选项自动取自左侧各面板：
         标签       已标注 / 未标注 / 无标签 / 各标签类别（左侧「标签类别」）
@@ -153,12 +151,11 @@ class FilterBar(CardWidget):
 
     filterChanged = Signal()
     textChanged = Signal(str)
-    thumbSizeChanged = Signal(int)
     rulesRequested = Signal()         # 打开「自定义筛选规则」弹窗
     rulesCleared = Signal()           # 清除自定义规则
     statsRequested = Signal()         # 打开「标签统计」弹窗
 
-    def __init__(self, parent=None, with_size: bool = True):
+    def __init__(self, parent=None):
         super().__init__(parent)
         self._annotated: list[str] = []   # 已标注 / 未标注（空 = 全部）
         self._classes: list[str] = []     # 类别勾选（"" = 无标签；空 = 全部）
@@ -214,23 +211,9 @@ class FilterBar(CardWidget):
         self.search.searchSignal.connect(lambda _t: self.textChanged.emit(self.text()))
         flow.addWidget(ToolGroup(self.search, parent=self))
 
-        # 尺寸档位与网格共用同一套（页面用 set_thumb_steps 再收窄）
-        self._thumb_steps: tuple[int, ...] = THUMB_STEPS
-        self._syncing_thumb = False
-        self.size_slider = None
-        if with_size:
-            self.size_slider = Slider(Qt.Orientation.Horizontal, self)
-            self.size_slider.setRange(0, max(0, len(self._thumb_steps) - 1))
-            self.size_slider.setValue(self._thumb_index(THUMB_MEDIUM))
-            self.size_slider.setFixedWidth(T.CTRL_W_SM)
-            self.size_slider.setToolTip("缩略图尺寸（Ctrl + 滚轮）")
-            self.size_slider.valueChanged.connect(self._on_slider_value)
-
         self.summary = CaptionLabel("", self)
-        flow.addWidget(ToolGroup(
-            *[w for w in (self.size_slider, self.summary) if w is not None],
-            parent=self,
-        ))
+        self.summary.setToolTip("当前显示 / 全部张数（含选中数）")
+        flow.addWidget(ToolGroup(self.summary, parent=self))
 
         self._refresh_buttons()
 
@@ -373,8 +356,12 @@ class FilterBar(CardWidget):
     def text(self) -> str:
         return self.search.text().strip()
 
-    def set_summary(self, shown: int, total: int) -> None:
-        self.summary.setText(f"显示 {shown} / {total} 张")
+    def set_summary(self, shown: int, total: int, selected: int = 0) -> None:
+        """更新计数：显示张数 / 总数（有选中时附选中数）。"""
+        text = f"显示 {shown} / {total} 张"
+        if selected:
+            text += f" · 已选 {selected}"
+        self.summary.setText(text)
 
     def set_rule_summary(self, count: int, description: str = "") -> None:
         """更新规则按钮状态（条数 + 悬停显示规则内容）。"""
@@ -386,46 +373,6 @@ class FilterBar(CardWidget):
             "按条件组合筛选（名称 / 尺寸 / 标注 / 标记…）"
         )
         self.rules_clear_btn.setToolTip(f"清除规则：{description}" if description else "清除自定义筛选规则")
-
-    def set_thumb_steps(self, steps) -> None:
-        """配置尺寸档位（与 `ThumbnailGrid.set_thumb_steps` 保持一致）。"""
-        values = sorted({int(s) for s in (steps or []) if int(s) > 0})
-        if not values:
-            return
-        self._thumb_steps = tuple(values)
-        if self.size_slider is not None:
-            self.size_slider.setRange(0, len(self._thumb_steps) - 1)
-
-    def set_thumb_size(self, size: int) -> None:
-        """按「尺寸」同步旋钮位置（Ctrl + 滚轮缩放后调用）。
-
-        不能用 `blockSignals` 同步：qfluentwidgets 的滑杆靠自身 valueChanged
-        驱动旋钮移动，阻塞信号会出现「数值变了但旋钮不动」。
-        这里改用短标志忽略本次回调；页面侧处理是幂等的，不会来回打架。
-        """
-        slider = self.size_slider
-        if slider is None:
-            return
-        index = self._thumb_index(size)
-        if slider.value() == index:
-            return
-        self._syncing_thumb = True
-        try:
-            slider.setValue(index)
-        finally:
-            self._syncing_thumb = False
-
-    def _thumb_index(self, size: int) -> int:
-        """尺寸 → 档位下标（取最近档位）。"""
-        return min(
-            range(len(self._thumb_steps)),
-            key=lambda i: abs(self._thumb_steps[i] - int(size)),
-        )
-
-    def _on_slider_value(self, value: int) -> None:
-        if self._syncing_thumb:
-            return
-        self.thumbSizeChanged.emit(int(value))
 
     def reset(self) -> None:
         """复位到「全部」。"""
@@ -497,6 +444,7 @@ class SplitMapCard(CardWidget):
         self.name_box.setToolTip("当前使用的拆分名称")
         layout.addWidget(self.name_box)
 
+        # 锁定提示只用图标 + tooltip（界面不写说明文字，见 UI 规则 §10）
         lock = QWidget(self)
         lock_layout = QHBoxLayout(lock)
         lock_layout.setContentsMargins(0, 0, 0, 0)
@@ -505,10 +453,9 @@ class SplitMapCard(CardWidget):
         lock_icon.setIcon(FluentIcon.CONSTRACT)
         lock_icon.setFixedSize(T.ICON_BTN_SM, T.ICON_BTN_SM)
         lock_icon.setEnabled(False)
+        lock_icon.setToolTip("该拆分已用于训练，划分不可更改")
         lock_layout.addWidget(lock_icon)
-        self.lock_label = CaptionLabel("已用于训练，无法更改", lock)
-        self.lock_label.setWordWrap(True)
-        lock_layout.addWidget(self.lock_label, 1)
+        lock_layout.addStretch(1)
         layout.addWidget(lock)
         self.lock_row = lock
 
@@ -623,105 +570,4 @@ class TagCard(CardWidget):
         menu.exec(chip.mapToGlobal(position))
 
 
-class DisplayBar(CardWidget):
-    """显示增强条：亮度 / 对比度 / 类别名叠加（**只影响显示，不改动图片**）。
 
-    与 Halcon DLT 一致 —— 暗光 / 过曝的工业图在不修改原文件的前提下调亮看清，
-    调整结果不会写回图片，也不会进入训练数据。
-    """
-
-    changed = Signal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        # 同样容器化 + 可换行：窄窗口 / 高缩放下整组折行，不压窄控件
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-        container = FlowContainer(
-            self, spacing=T.SPACE_MD,
-            margins=(T.SPACE_LG, T.SPACE_MD, T.SPACE_LG, T.SPACE_MD),
-        )
-        outer.addWidget(container)
-        flow = container.flow()
-
-        flow.addWidget(ToolGroup(StrongBodyLabel("显示", self), parent=self))
-
-        self.brightness = Slider(Qt.Orientation.Horizontal, self)
-        self.brightness.setRange(-100, 100)
-        self.brightness.setValue(0)
-        self.brightness.setFixedWidth(T.CTRL_W_MD)
-        self.brightness.setToolTip("显示亮度（仅影响显示）")
-        flow.addWidget(ToolGroup(
-            CaptionLabel("亮度", self), self.brightness, parent=self,
-        ))
-
-        self.contrast = Slider(Qt.Orientation.Horizontal, self)
-        self.contrast.setRange(-100, 100)
-        self.contrast.setValue(0)
-        self.contrast.setFixedWidth(T.CTRL_W_MD)
-        self.contrast.setToolTip("显示对比度（仅影响显示）")
-        flow.addWidget(ToolGroup(
-            CaptionLabel("对比度", self), self.contrast, parent=self,
-        ))
-
-        self.name_check = CheckBox("类别名", self)
-        self.name_check.setToolTip("在缩略图上叠加类别名")
-        self.name_width = Slider(Qt.Orientation.Horizontal, self)
-        self.name_width.setRange(25, 100)
-        self.name_width.setValue(60)
-        self.name_width.setFixedWidth(T.CTRL_W_SM)
-        self.name_width.setToolTip("类别名框宽度（占缩略图比例）")
-        flow.addWidget(ToolGroup(
-            self.name_check, self.name_width, parent=self,
-        ))
-
-        self.reset_btn = PushButton("复位", self)
-        self.reset_btn.setToolTip("恢复默认显示")
-        flow.addWidget(ToolGroup(self.reset_btn, parent=self))
-
-        self.hint = CaptionLabel("仅影响显示，不改动图片", self)
-        flow.addWidget(ToolGroup(self.hint, parent=self))
-
-        self._syncing = False
-        self.brightness.valueChanged.connect(self._on_change)
-        self.contrast.valueChanged.connect(self._on_change)
-        self.name_width.valueChanged.connect(self._on_change)
-        self.name_check.toggled.connect(self._on_change)
-        self.reset_btn.clicked.connect(self.reset)
-
-    # -----------------------------------------------------------
-    def values(self) -> dict:
-        return {
-            "brightness": self.brightness.value() / 100.0,
-            "contrast": self.contrast.value() / 100.0,
-            "show_class_names": bool(self.name_check.isChecked()),
-            "name_width": self.name_width.value() / 100.0,
-        }
-
-    def _on_change(self, *_args) -> None:
-        if self._syncing:
-            return
-        values = self.values()
-        if not any((values["brightness"], values["contrast"])):
-            text = "仅影响显示，不改动图片"
-        else:
-            text = (
-                f"仅影响显示 · 亮度 {values['brightness']:+.2f} · "
-                f"对比度 {values['contrast']:+.2f}"
-            )
-        self.hint.setText(text)
-        self.changed.emit()
-
-    def reset(self) -> None:
-        """恢复默认显示参数。"""
-        self._syncing = True
-        try:
-            self.brightness.setValue(0)
-            self.contrast.setValue(0)
-            self.name_width.setValue(60)
-            self.name_check.setChecked(False)
-        finally:
-            self._syncing = False
-        self.hint.setText("仅影响显示，不改动图片")
-        self.changed.emit()

@@ -95,6 +95,11 @@ CTRL_W_XL = 180
 # 图标按钮边长
 ICON_BTN_SM = 24
 ICON_BTN_MD = 28
+ICON_BTN_LG = 32           # 右侧显示调试栏（图标需更醒目）
+
+# 图标绘制边长（qfluentwidgets ToolButton 默认 16，偏小）
+ICON_GLYPH_SM = 16
+ICON_GLYPH_LG = 20         # 与 ICON_BTN_LG 搭配
 
 # 侧栏面板最小宽度（图库筛选栏等）
 PANEL_MIN_W = 170
@@ -175,7 +180,8 @@ __all__ = [
     "STEPPER_MIN_W", "LABEL_MIN_W", "ROW_H",
     "STEPPER_CHROME_W_INLINE", "STEPPER_CHROME_W_COMPACT", "STEPPER_CHROME_W_PLAIN",
     "CTRL_W_SM", "CTRL_W_MD", "CTRL_W_LG", "CTRL_W_XL",
-    "ICON_BTN_SM", "ICON_BTN_MD",
+    "ICON_BTN_SM", "ICON_BTN_MD", "ICON_BTN_LG",
+    "ICON_GLYPH_SM", "ICON_GLYPH_LG",
     "PANEL_MIN_W", "PANEL_W",
     "PANEL_W_WIDE", "PAGER_BTN_W",
     "RADIUS_SM", "RADIUS_MD", "RADIUS_LG",

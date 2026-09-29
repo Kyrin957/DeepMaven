@@ -26,7 +26,6 @@ from PySide6.QtWidgets import (
 )
 from qfluentwidgets import (
     Action,
-    CaptionLabel,
     CardWidget,
     MessageBox,
     RoundMenu,
@@ -45,7 +44,8 @@ from src.views.dialogs import (
     TagEditDialog,
 )
 from src.views.dialogs.tag_edit_dialog import DEFAULT_TAG_COLOR
-from src.views.gallery_widgets import DisplayBar, FilterBar, SplitMapCard, TagCard
+from src.views.gallery_widgets import FilterBar, SplitMapCard, TagCard
+from src.views.ui import DisplayDock
 from src.views.ui import tokens as T
 from src.views.widgets import THUMB_STEPS, ThumbnailGrid
 
@@ -111,19 +111,16 @@ class GalleryTab(QWidget):
         self.filter_bar = FilterBar(self)
         main.addWidget(self.filter_bar)
 
-        # 显示增强（亮度 / 对比度 / 类别名），只影响显示
-        self.display_bar = DisplayBar(self)
-        main.addWidget(self.display_bar)
-
         self.grid = ThumbnailGrid(self)
         self.grid.set_wheel_zoom(True)      # Ctrl + 滚轮缩放缩略图
         main.addWidget(self.grid, 1)
-        self._apply_display()
-
-        self.hint = CaptionLabel("", self)
-        self.hint.setWordWrap(True)
-        main.addWidget(self.hint)
         root.addLayout(main, 1)
+
+        # 显示调试栏：窗口右侧竖直图标（亮度 / 对比度 / 类别名 / 缩略图尺寸）
+        self.display_dock = DisplayDock(self, with_size=True)
+        self.display_dock.set_thumb_steps(_THUMB_STEPS)
+        root.addWidget(self.display_dock)
+        self._apply_display()
 
     # -----------------------------------------------------------
     # 绑定
@@ -134,11 +131,11 @@ class GalleryTab(QWidget):
 
         self.filter_bar.filterChanged.connect(self.refresh)
         self.filter_bar.textChanged.connect(lambda _t: self.refresh())
-        self.filter_bar.thumbSizeChanged.connect(self._on_thumb_size)
         self.filter_bar.rulesRequested.connect(self._on_rules)
         self.filter_bar.rulesCleared.connect(self._on_rules_cleared)
         self.filter_bar.statsRequested.connect(self._on_stats)
-        self.display_bar.changed.connect(self._apply_display)
+        self.display_dock.thumbSizeChanged.connect(self._on_thumb_size)
+        self.display_dock.changed.connect(self._apply_display)
         # Ctrl + 滚轮缩放后回同步滑杆
         self.grid.thumbSizeChanged.connect(self._on_grid_thumb_size)
 
@@ -176,7 +173,7 @@ class GalleryTab(QWidget):
     # -----------------------------------------------------------
     def _apply_display(self) -> None:
         """把显示增强参数下发给缩略图网格（只影响显示）。"""
-        self.grid.set_display(**self.display_bar.values())
+        self.grid.set_display(**self.display_dock.values())
 
     def _rule_options(self) -> dict:
         """规则弹窗的候选值（类别 / 标记；拆分与状态由模型自带候选）。"""
@@ -258,14 +255,11 @@ class GalleryTab(QWidget):
             )
 
         total = len(self._vm.images())
-        self.filter_bar.set_summary(len(new_paths), total)
+        self.filter_bar.set_summary(
+            len(new_paths), total, len(self.grid.selected_indexes())
+        )
         rules = FilterRules(self._vm.filter_rules())
         self.filter_bar.set_rule_summary(rules.active_count(), rules.describe())
-        self.hint.setText(
-            "尚未导入图像"
-            if dataset is None
-            else f"已选 {len(self.grid.selected_indexes())} / {len(new_paths)} 张"
-        )
         self._update_side_state()
         self._stale = False
 
@@ -323,8 +317,8 @@ class GalleryTab(QWidget):
         self._vm.notify(f"缩略图尺寸：{self.grid.thumb_size()}px")
 
     def _on_grid_thumb_size(self, size: int) -> None:
-        """Ctrl + 滚轮缩放后，把尺寸滑杆同步到对应档位。"""
-        self.filter_bar.set_thumb_size(int(size))
+        """Ctrl + 滚轮缩放后，把尺寸档位同步到调试栏。"""
+        self.display_dock.set_thumb_size(int(size))
         self._vm.notify(f"缩略图尺寸：{int(size)}px")
 
     def _on_double_click(self, index: int) -> None:

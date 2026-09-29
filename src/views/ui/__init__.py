@@ -15,7 +15,14 @@
 """
 
 from src.views.ui import tokens
-from src.views.ui.containers import FieldRow, ParamGroup, ToolGroup, tool_separator
+from src.views.ui.containers import (
+    FieldRow,
+    ParamGroup,
+    ToolGroup,
+    icon_button,
+    tool_separator,
+)
+from src.views.ui.display_dock import DisplayDock
 from src.views.ui.flow_layout import FlowContainer, FlowLayout
 from src.views.ui.wheel_guard import (
     ALLOW_WHEEL_ATTR,
@@ -29,6 +36,7 @@ __all__ = [
     "tokens",
     "FlowLayout",
     "FlowContainer",
+    "DisplayDock",
     "WheelGuard",
     "SafeSpinBox",
     "SafeDoubleSpinBox",
@@ -38,4 +46,5 @@ __all__ = [
     "ToolGroup",
     "FieldRow",
     "tool_separator",
+    "icon_button",
 ]

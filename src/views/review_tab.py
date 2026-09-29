@@ -29,8 +29,8 @@ from src.services.annotation_service import AnnotationService
 from src.viewmodels.category_vm import CategoryViewModel
 from src.viewmodels.dataset_vm import DatasetViewModel
 from src.views.data_widgets import ClassCard, FilterCard, side_column
+from src.views.ui import DisplayDock
 from src.views.ui import tokens as T
-from src.views.gallery_widgets import DisplayBar
 from src.views.widgets import (
     THUMB_LARGE,
     THUMB_MEDIUM,
@@ -70,8 +70,13 @@ class ReviewTab(QWidget):
         root.setContentsMargins(T.SPACE_XL, T.SPACE_LG, T.SPACE_XL, T.SPACE_LG)
         root.setSpacing(T.SPACE_LG)
 
+        # 显示调试栏：窗口右侧竖直图标（亮度 / 对比度 / 类别名 / 缩略图尺寸）
+        self.display_dock = DisplayDock(self, with_size=True)
+        self.display_dock.set_thumb_steps(_THUMB_STEPS)
+
         root.addWidget(self._build_side())
         root.addLayout(self._build_main(), 1)
+        root.addWidget(self.display_dock)
 
     def _build_side(self) -> QWidget:
         self.detail_card = CardWidget(self)
@@ -128,24 +133,15 @@ class ReviewTab(QWidget):
         layout.addWidget(self.count_label)
         column.addWidget(card)
 
-        self.filter_card = FilterCard(with_size=True, parent=self)
-        self.filter_card.set_thumb_steps(_THUMB_STEPS)
-        self.filter_card.set_thumb_size(THUMB_LARGE)   # 与网格初始档位一致
+        self.filter_card = FilterCard(parent=self)
         column.addWidget(self.filter_card)
 
-        # 显示增强（亮度 / 对比度 / 类别名）：只影响显示
-        self.display_bar = DisplayBar(self)
-        column.addWidget(self.display_bar)
-
         self.grid = ThumbnailGrid(self)
-        self.grid.set_thumb_steps(_THUMB_STEPS)   # 档位与滑杆一一对应
+        self.grid.set_thumb_steps(_THUMB_STEPS)   # 档位与调试栏滑杆一一对应
         self.grid.set_thumb_size(THUMB_LARGE)
         self.grid.set_wheel_zoom(True)      # Ctrl + 滚轮缩放缩略图
         column.addWidget(self.grid, 1)
         self._apply_display()
-
-        self.hint = CaptionLabel("", self)
-        column.addWidget(self.hint)
         return column
 
     # -----------------------------------------------------------
@@ -153,8 +149,8 @@ class ReviewTab(QWidget):
     # -----------------------------------------------------------
     def _bind(self) -> None:
         self.filter_card.filterChanged.connect(self._on_filter)
-        self.filter_card.thumbSizeChanged.connect(self._on_thumb_size)
-        self.display_bar.changed.connect(self._apply_display)
+        self.display_dock.thumbSizeChanged.connect(self._on_thumb_size)
+        self.display_dock.changed.connect(self._apply_display)
         self.grid.thumbSizeChanged.connect(self._on_grid_thumb_size)
         self.grid.imageActivated.connect(self._on_selected)
         self.class_card.classClicked.connect(self._on_class_clicked)
@@ -200,8 +196,9 @@ class ReviewTab(QWidget):
 
         dataset = self._vm.dataset
         self.title.setText(f"标注检查 · {dataset.name}" if dataset else "标注检查")
-        self.hint.setText(
-            f"显示 {len(pairs)} / {total} 张（{condition}），已标注 {annotated} 张"
+        # 筛选条件与标注率走悬停提示，界面上不堆说明文字
+        self.count_label.setToolTip(
+            f"筛选：{condition} · 已标注 {annotated} 张"
             f"（{0 if not total else round(annotated * 100 / total)}%）"
         )
         if self.isVisible():
@@ -209,7 +206,7 @@ class ReviewTab(QWidget):
 
     def _apply_display(self) -> None:
         """把显示增强参数下发给缩略图网格（只影响显示）。"""
-        self.grid.set_display(**self.display_bar.values())
+        self.grid.set_display(**self.display_dock.values())
 
     def _render_grid(self) -> None:
         """真正绘制缩略图（仅在页面可见时调用）。"""
@@ -277,8 +274,8 @@ class ReviewTab(QWidget):
         self.grid.selectAll()
 
     def _on_grid_thumb_size(self, size: int) -> None:
-        """Ctrl + 滚轮缩放后，把尺寸滑杆同步到对应档位。"""
-        self.filter_card.set_thumb_size(int(size))
+        """Ctrl + 滚轮缩放后，把尺寸档位同步到调试栏。"""
+        self.display_dock.set_thumb_size(int(size))
 
     def _on_selected(self, index: int) -> None:
         path = self.grid.path_at(index)
