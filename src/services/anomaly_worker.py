@@ -14,6 +14,7 @@ from pathlib import Path
 
 
 from src.services.worker_utils import emit, use_utf8_stdio
+from src.utils.pretrained import apply_model_env
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -60,6 +61,7 @@ def lightning_device(device: str) -> tuple[str, object]:
 
 def main(argv: list[str] | None = None) -> int:
     use_utf8_stdio()
+    apply_model_env()          # 骨干权重缓存指向项目内 models/（离线可用）
     args = build_parser().parse_args(argv)
     total = max(1, args.epochs)
     accelerator, devices = lightning_device(args.device)

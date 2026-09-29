@@ -13,6 +13,16 @@
 #   pip uninstall torch torchvision
 #   pip install -r requirements-gpu.txt
 #   pip install -r requirements.txt
+#
+# ---------- 预训练模型（无需安装，随程序发布） ----------
+# 本项目用到的预训练权重放在项目目录 models/<供应商>/<模型>，开发、测试与
+# 最终用户都无需联网下载：
+#   models/ultralytics/   YOLO11 / YOLO26 全系列（检测/分割/分类/旋转框）
+#                         + MobileSAM（预标注细化）
+#   models/anomalib/      异常检测骨干（timm：resnet18 / wide_resnet50_2）缓存
+# 跨机开发（新电脑 clone 后）运行一次以下脚本即可拉齐（可重复运行、补齐缺失）：
+#   python scripts/download_models.py
+# 清单见 models/README.md；路径解析见 src/utils/pretrained.py。
 # ============================================================
 
 # ---------- GUI 框架（PySide6 官方绑定） ----------

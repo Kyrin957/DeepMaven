@@ -15,6 +15,8 @@ ORG_NAME = "DeepMaven"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 # 数据目录（缓存、日志等本地产物）
 DATA_DIR = PROJECT_ROOT / "data"
+# 预训练模型（随程序发布；路径约定 models/供应商/模型，见 src/utils/pretrained.py）
+MODELS_DIR = PROJECT_ROOT / "models"
 # 运行产物（训练结果、导出模型等）
 RUNS_DIR = PROJECT_ROOT / "runs"
 
@@ -70,6 +72,19 @@ TASK_MODEL_SUFFIX = {
     spec["key"]: spec["model_suffix"]
     for spec in project_types() if spec["model_suffix"]
 }
+
+
+def base_variant_key(key: str) -> str:
+    """去掉任务模型后缀（-cls / -seg / -obb），得到变体基础 key。
+
+    用于把「带任务后缀的模型 key」（如分类的 yolo11n-cls）与
+    `YOLO_MODEL_VARIANTS`（无后缀）互相匹配。
+    """
+    text = str(key or "")
+    for suffix in set(TASK_MODEL_SUFFIX.values()):
+        if suffix and text.endswith(suffix):
+            return text[: -len(suffix)]
+    return text
 
 # ---------------------------------------------------------------
 # 项目类型（深度学习任务）——定义在任务注册表 src/utils/tasks.py

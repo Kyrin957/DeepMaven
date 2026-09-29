@@ -46,6 +46,7 @@ from src.utils.constants import (
     SPLIT_COLORS,
     SPLIT_LABELS,
     YOLO_MODEL_VARIANTS,
+    base_variant_key,
 )
 from src.utils.device import device_label, device_options
 from src.viewmodels.dataset_vm import DatasetViewModel
@@ -832,11 +833,7 @@ class TrainTab(QWidget):
             return
         if self._model_vm is not None:
             self._model_vm.select_variant(key)
-        variant = next(
-            (v for v in YOLO_MODEL_VARIANTS if v["key"] == key), None
-        )
-        if variant is not None:
-            self.variant_desc.setText(f"{variant['desc']} · {variant['imgsz']}px")
+        self._update_variant_desc(key)
         # 变体换了以后，官方权重路径要跟着换（自定义权重保留）
         current = self.weights_edit.text().strip()
         changes = {"model_key": key}
@@ -844,6 +841,14 @@ class TrainTab(QWidget):
             self.weights_edit.setText("")
             changes["weights_path"] = ""
         self._apply(changes)
+
+    def _update_variant_desc(self, key: str) -> None:
+        """显示变体描述（key 可能带任务后缀，如分类的 yolo11n-cls）。"""
+        base = base_variant_key(key)
+        variant = next((v for v in YOLO_MODEL_VARIANTS if v["key"] == base), None)
+        self.variant_desc.setText(
+            f"{variant['desc']} · {variant['imgsz']}px" if variant is not None else ""
+        )
 
     def _on_device_changed(self, _index: int = 0) -> None:
         self._update_device_hint()
@@ -939,6 +944,7 @@ class TrainTab(QWidget):
             key_index = self.variant_combo.findData(str(getattr(config, "model_key", "")))
             if key_index >= 0:
                 self.variant_combo.setCurrentIndex(key_index)
+            self._update_variant_desc(str(getattr(config, "model_key", "")))
             self.weights_edit.setText(str(getattr(config, "weights_path", "")))
             self.anomaly_edit.setText(str(getattr(config, "anomaly_root", "")))
             self.anomaly_check.setChecked(

@@ -4,8 +4,9 @@
     1. **YOLO 预标注**：用预训练 / 已训练权重批量生成候选框；
     2. **SAM 细化**：以候选框或点击点为提示，用 SAM 分割出掩码并转为多边形。
 
-两者均通过 Ultralytics 实现（已安装），SAM 权重由 Ultralytics 按需下载，
-无需额外安装分割依赖。前置依赖采用方法内懒加载。
+两者均通过 Ultralytics 实现（已安装）；权重随程序提供在 `models/ultralytics/`
+（`yolo11n.pt` / `mobile_sam.pt`），经 `resolve_pretrained` 解析为本地路径，
+无需联网下载。前置依赖采用方法内懒加载。
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from typing import Callable
 from src.models.annotation import BOX, Annotation
 from src.utils.device import normalize_device
 from src.utils.logger import get_logger
+from src.utils.pretrained import resolve_pretrained
 
 logger = get_logger("autolabel")
 
@@ -73,7 +75,7 @@ class AutoLabelService:
             return {}
 
         progress(0, f"加载模型 {weights}")
-        model = YOLO(weights or DEFAULT_DETECT_WEIGHTS)
+        model = YOLO(resolve_pretrained(weights or DEFAULT_DETECT_WEIGHTS))
 
         progress(5, "开始推理")
         results = model.predict(
@@ -136,7 +138,7 @@ class AutoLabelService:
         """用 SAM 对提示（框或点）分割，返回归一化多边形列表。"""
         from ultralytics import SAM
 
-        model = SAM(weights or DEFAULT_SAM_WEIGHTS)
+        model = SAM(resolve_pretrained(weights or DEFAULT_SAM_WEIGHTS))
         if boxes:
             results = model(image_path, bboxes=boxes)
         elif points:

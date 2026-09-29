@@ -7,7 +7,8 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Signal
 
 from src.services.yolo_service import YOLOService
-from src.utils.constants import YOLO_MODEL_VARIANTS
+from src.utils.constants import YOLO_MODEL_VARIANTS, base_variant_key
+from src.utils.pretrained import resolve_pretrained
 from src.utils.logger import get_logger
 from src.utils.workers import FunctionWorker
 from src.viewmodels.project_vm import ProjectViewModel
@@ -44,8 +45,9 @@ class ModelViewModel(QObject):
         info = dict(getattr(project, "model", None) or {}) if project is not None else {}
         key = str(info.get("key", ""))
         self._weights = str(info.get("weights_path", ""))
+        base = base_variant_key(key)
         self._selected = next(
-            (v for v in self._variants if v["key"] == key), self._variants[0]
+            (v for v in self._variants if v["key"] == base), self._variants[0]
         )
         self.modelSelected.emit(self._selected)
         self.weightsImported.emit(self._weights)
@@ -81,15 +83,26 @@ class ModelViewModel(QObject):
     # 命令
     # -----------------------------------------------------------
     def select_variant(self, key: str) -> None:
-        """按 key 选择模型变体。"""
-        for variant in self._variants:
-            if variant["key"] == key:
-                self._selected = variant
-                self._persist()
-                self.modelSelected.emit(variant)
-                self.message.emit("info", f"已选择模型：{variant['label']}")
-                return
-        self.message.emit("warning", f"未知模型变体：{key}")
+        """按 key 选择模型变体。
+
+        接受带任务后缀的 key（如分类的 ``yolo11n-cls``）：按去掉后缀的基础
+        key 匹配变体，并保留原 key——它与 ``TrainingConfig.model_key`` 一致，
+        是实际加载的权重名（``yolo11n-cls.pt``）。
+        """
+        text = str(key or "")
+        base = base_variant_key(text)
+        variant = next(
+            (v for v in self._variants if v["key"] == base), None
+        )
+        if variant is None:
+            self.message.emit("warning", f"未知模型变体：{key}")
+            return
+        self._selected = dict(variant)
+        if text:
+            self._selected["key"] = text
+        self._persist()
+        self.modelSelected.emit(self._selected)
+        self.message.emit("info", f"已选择模型：{variant['label']}")
 
     def import_weights(self, path: str) -> None:
         """导入自定义预训练权重（.pt）并探测模型信息。"""
@@ -105,8 +118,8 @@ class ModelViewModel(QObject):
         self._probe(path, f"探测权重 {Path(path).name}")
 
     def prepare_variant(self) -> None:
-        """加载当前变体的官方预训练权重（缺失时由 Ultralytics 自动下载）。"""
-        weights = f"{self._selected['key']}.pt"
+        """加载当前变体的官方预训练权重（优先用项目内 models/ 的副本）。"""
+        weights = resolve_pretrained(f"{self._selected['key']}.pt")
         self._weights = weights
         self.weightsImported.emit(weights)
         self._probe(weights, f"加载 {weights}")

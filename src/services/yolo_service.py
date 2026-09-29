@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from src.utils.logger import get_logger
+from src.utils.pretrained import resolve_pretrained
 
 logger = get_logger("yolo")
 
@@ -17,7 +18,7 @@ class YOLOService:
     """基于 Ultralytics YOLO 的训练与推理封装。"""
 
     def __init__(self, weights: str | Path = "yolo11n.pt"):
-        self._weights = str(weights)
+        self._weights = resolve_pretrained(weights)
         self._model = None  # 懒加载的 YOLO 实例
 
     # -----------------------------------------------------------
@@ -39,7 +40,7 @@ class YOLOService:
 
     def set_weights(self, weights: str) -> None:
         self._model = None
-        self._weights = weights
+        self._weights = resolve_pretrained(weights)
 
     # -----------------------------------------------------------
     # 训练

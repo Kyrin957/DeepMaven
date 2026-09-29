@@ -29,6 +29,8 @@
 
 - Python 3.14+
 - 依赖清单：`requirements.txt`（CPU 版）；如需 CUDA 加速（cu130），参考 `requirements-gpu.txt`
+- 预训练模型：**已随程序提供在 `models/`**（YOLO11 / YOLO26 全系列、MobileSAM、异常检测骨干，
+  约 2 GB），开发、测试与发布运行都无需联网下载；清单与更新方法见 `models/README.md`
 
 ## 安装
 
@@ -52,6 +54,19 @@ pip install -r requirements.txt
 ```
 
 > GPU 版 wheel 体积约 2 GB，官方源在境外、下载缓慢；国内推荐改用阿里云镜像（附可直接复制的安装命令），见 `requirements-gpu.txt` 内注释。
+
+### 预训练模型（新机器 / 新克隆）
+
+约 2 GB 模型不入 git（`.gitignore` 已忽略 `models/` 下的权重），新电脑克隆后
+运行一次脚本即可拉齐（可重复运行，已存在的文件自动跳过、缺失的补齐）：
+
+```powershell
+python scripts/download_models.py            # 默认走国内加速镜像
+python scripts/download_models.py --direct   # 官方源直连（境外网络）
+```
+
+脚本会下载 YOLO11 / YOLO26 全系列与 MobileSAM，并经 HF 镜像缓存异常检测骨干；
+清单与手工下载方式见 `models/README.md`。
 
 > 注意：Fluent 组件库必须使用 **PySide6 后端**的 `PySide6-Fluent-Widgets`。它与 PyQt5 后端的 `PyQt-Fluent-Widgets` 共用 `qfluentwidgets` 模块名，二者不可共存，误装会导致启动崩溃。
 

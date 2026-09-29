@@ -21,6 +21,7 @@ from qfluentwidgets import FluentIcon, FluentWindow, isDarkTheme, setTheme, Them
 from src.utils.config import ConfigManager
 from src.utils.constants import APP_NAME, APP_VERSION, BRAND_COLOR, ORG_NAME
 from src.utils.logger import setup_logger
+from src.utils.pretrained import apply_model_env
 from src.views.main_window import MainWindow
 from src.views.ui import WheelGuard
 
@@ -55,6 +56,9 @@ def run(argv: list | None = None) -> int:
     if args.version:
         print(f"{APP_NAME} {APP_VERSION}")
         return 0
+
+    # 预训练模型随程序发布：缓存与查找都指向项目内 models/（见 utils/pretrained.py）
+    apply_model_env()
 
     app = QApplication([argv[0], *rest])
     app.setApplicationName(APP_NAME)

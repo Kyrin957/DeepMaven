@@ -37,3 +37,8 @@ data/
 *.log
 Thumbs.db
 .DS_Store
+
+# 预训练模型：随发布包分发（复制 models/ 目录），不入 git 历史
+# 清单与重新下载方法见 models/README.md（该说明文件入库）
+models/ultralytics/
+models/anomalib/

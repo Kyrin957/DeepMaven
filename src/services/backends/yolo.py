@@ -26,6 +26,7 @@ from src.utils.constants import (
     YOLO_MODEL_VARIANTS,
 )
 from src.utils.device import normalize_device
+from src.utils.pretrained import resolve_pretrained
 
 
 class YoloBackend(BackendAdapter):
@@ -70,7 +71,9 @@ class YoloBackend(BackendAdapter):
         args = [
             "-m", "src.services.train_worker",
             "--data", config.data_yaml,
-            "--weights", config.weights_path or f"{config.model_key}.pt",
+            "--weights", resolve_pretrained(
+                config.weights_path or f"{config.model_key}.pt"
+            ),
             "--epochs", str(config.epochs),
             "--batch", str(config.batch),
             "--imgsz", str(config.imgsz),

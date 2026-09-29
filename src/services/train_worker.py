@@ -22,6 +22,7 @@ import traceback
 from pathlib import Path
 
 from src.services.worker_utils import emit, use_utf8_stdio, wait_if_paused
+from src.utils.pretrained import apply_model_env
 
 # 批次级进度事件的限流间隔（秒）
 _ITERATION_INTERVAL = 0.5
@@ -77,6 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     use_utf8_stdio()
+    apply_model_env()          # 模型缓存指向项目内 models/（离线可用）
     args = build_parser().parse_args(argv)
 
     try:
