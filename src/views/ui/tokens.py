@@ -101,6 +101,10 @@ ICON_BTN_LG = 32           # 右侧显示调试栏（图标需更醒目）
 ICON_GLYPH_SM = 16
 ICON_GLYPH_LG = 20         # 与 ICON_BTN_LG 搭配
 
+# 右侧显示调试栏：按钮与栏等宽（整块可点，参照 Halcon DLT），图标再大一档
+DOCK_W = 40
+DOCK_GLYPH = 24
+
 # 侧栏面板最小宽度（图库筛选栏等）
 PANEL_MIN_W = 170
 # 评估 / 导出页右栏面板固定宽度
@@ -182,6 +186,7 @@ __all__ = [
     "CTRL_W_SM", "CTRL_W_MD", "CTRL_W_LG", "CTRL_W_XL",
     "ICON_BTN_SM", "ICON_BTN_MD", "ICON_BTN_LG",
     "ICON_GLYPH_SM", "ICON_GLYPH_LG",
+    "DOCK_W", "DOCK_GLYPH",
     "PANEL_MIN_W", "PANEL_W",
     "PANEL_W_WIDE", "PAGER_BTN_W",
     "RADIUS_SM", "RADIUS_MD", "RADIUS_LG",

@@ -174,6 +174,7 @@ class GalleryTab(QWidget):
     def _apply_display(self) -> None:
         """把显示增强参数下发给缩略图网格（只影响显示）。"""
         self.grid.set_display(**self.display_dock.values())
+        self.grid.prewarm_visible()
 
     def _rule_options(self) -> dict:
         """规则弹窗的候选值（类别 / 标记；拆分与状态由模型自带候选）。"""
@@ -242,8 +243,8 @@ class GalleryTab(QWidget):
                 decorations["colors"],
                 decorations["markers"],
                 decorations["subsets"],
+                classnames=names,
             )
-            self.grid.set_class_names(names)
         else:
             self.grid.set_images(
                 new_paths,

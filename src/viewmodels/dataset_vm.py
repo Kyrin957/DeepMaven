@@ -1325,7 +1325,7 @@ class DatasetViewModel(QObject):
         )
 
     def class_names_for(self, paths: list) -> list[str]:
-        """给定图片序列 → 每张图的类别名（供缩略图叠加类别名）。"""
+        """给定图片序列 → 每张图的类别名（缩略图右上角标签展开时显示）。"""
         names = {
             str(image): self._class_name_of(self.image_class(image))
             for image in self.images()

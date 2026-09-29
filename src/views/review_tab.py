@@ -207,6 +207,7 @@ class ReviewTab(QWidget):
     def _apply_display(self) -> None:
         """把显示增强参数下发给缩略图网格（只影响显示）。"""
         self.grid.set_display(**self.display_dock.values())
+        self.grid.prewarm_visible()
 
     def _render_grid(self) -> None:
         """真正绘制缩略图（仅在页面可见时调用）。"""
@@ -234,9 +235,9 @@ class ReviewTab(QWidget):
             self._render_grid()
             return
         colors, _subsets = self._vm.decorations_for([path for path, _ in pairs])
-        self.grid.set_annotated([flag for _, flag in pairs], colors)
-        self.grid.set_class_names(
-            self._vm.class_names_for([path for path, _ in pairs])
+        self.grid.set_annotated(
+            [flag for _, flag in pairs], colors,
+            classnames=self._vm.class_names_for([path for path, _ in pairs]),
         )
         self.filter_card.set_summary(
             len(self._vm.images()), self._vm.annotated_count()

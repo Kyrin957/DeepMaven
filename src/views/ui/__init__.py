@@ -15,6 +15,7 @@
 """
 
 from src.views.ui import tokens
+from src.views.ui.busy_popup import BusyPopup
 from src.views.ui.containers import (
     FieldRow,
     ParamGroup,
@@ -37,6 +38,7 @@ __all__ = [
     "FlowLayout",
     "FlowContainer",
     "DisplayDock",
+    "BusyPopup",
     "WheelGuard",
     "SafeSpinBox",
     "SafeDoubleSpinBox",
