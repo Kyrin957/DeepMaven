@@ -57,6 +57,11 @@ albumentations==2.0.8
 # ---------- 异常检测（Anomalib，可选任务类型） ----------
 anomalib==2.6.2
 
+# ---------- 图标（qtawesome：Material Design Icons / Font Awesome 等 9 套字体） ----------
+# 语义名接口见 src/views/ui/icons.py（翻页、全选等 FluentIcon 缺字形处使用）
+qtawesome==1.4.2
+qtpy==2.4.3            # qtawesome 的 Qt 绑定适配层（PySide6）
+
 # ---------- 可视化与工具 ----------
 matplotlib==3.11.1
 pyyaml==6.0.3

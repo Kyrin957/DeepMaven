@@ -159,10 +159,13 @@ def tool_separator(parent=None) -> QFrame:
 
 
 def icon_button(
-    icon, tooltip: str, parent=None, primary: bool = False
+    icon, tooltip: str, parent=None, primary: bool = False,
+    size: int = T.ICON_BTN_LG,
 ) -> ToolButton:
-    """统一的图标按钮：``ICON_BTN_LG``（32px 边长）/ ``ICON_GLYPH_LG``（20px 图标）。
+    """统一的图标按钮：默认 ``ICON_BTN_LG``（32px 边长）/ ``ICON_GLYPH_LG``（20px 图标）。
 
+    密集行（如侧栏翻页行：4 个按钮 + 页码框 + 总页数）传
+    ``size=T.ICON_BTN_MD``（28px 边长 / 16px 图标），给页码留出空间。
     ``primary=True`` 用主色样式（保存等主要操作）。qfluentwidgets 的 ToolButton
     默认图标只有 16px，在工具条 / 侧栏里显小，这里统一放大一档；按钮不写文字，
     含义一律走 tooltip（UI 规则 §10 / §11）。
@@ -170,8 +173,9 @@ def icon_button(
     factory = PrimaryToolButton if primary else TransparentToolButton
     button = factory(icon, parent)
     button.setToolTip(tooltip)
-    button.setIconSize(QSize(T.ICON_GLYPH_LG, T.ICON_GLYPH_LG))
-    button.setFixedSize(T.ICON_BTN_LG, T.ICON_BTN_LG)
+    glyph = T.ICON_GLYPH_LG if size >= T.ICON_BTN_LG else T.ICON_GLYPH_SM
+    button.setIconSize(QSize(glyph, glyph))
+    button.setFixedSize(size, size)
     return button
 
 

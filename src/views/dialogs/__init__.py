@@ -2,9 +2,7 @@
 
 from .class_edit_dialog import ClassEditDialog, ColorPicker
 from .delete_project_dialog import DeleteProjectDialog
-from .filter_rules_dialog import FilterRulesDialog
 from .import_images_dialog import ImportImagesDialog
-from .label_stats_dialog import LabelStatsDialog
 from .new_project_dialog import NewProjectDialog
 from .ood_dialog import OodDialog
 from .preview_dialog import ImagePreviewDialog
@@ -14,11 +12,9 @@ __all__ = [
     "ClassEditDialog",
     "ColorPicker",
     "DeleteProjectDialog",
-    "FilterRulesDialog",
     "ImagePreviewDialog",
     "ImportImagesDialog",
     "OodDialog",
-    "LabelStatsDialog",
     "NewProjectDialog",
     "TagEditDialog",
 ]

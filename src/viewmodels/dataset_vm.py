@@ -8,7 +8,6 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Signal
 
 from src.models.dataset import Dataset
-from src.models.filter_rules import UNLABELED_NAME, FilterRules
 from src.models.split import Split
 from src.services.annotation_service import AnnotationService
 from src.services.category_service import CategoryService
@@ -88,10 +87,6 @@ class DatasetViewModel(QObject):
         self._label_index: dict | None = None
         # 图片所属子集标记缓存（T/V/E）
         self._subsets: list[str] | None = None
-        # 图像元信息（宽 / 高 / 通道数）与标签信息（数量 / 类别）缓存
-        # —— 仅供自定义筛选规则与标签统计按需读取
-        self._meta_cache: dict[str, dict] = {}
-        self._label_info_cache: dict[str, dict] = {}
 
     @property
     def dataset(self) -> Dataset | None:
@@ -1081,8 +1076,6 @@ class DatasetViewModel(QObject):
         self._images = None
         self._label_index = None
         self._subsets = None
-        self._meta_cache = {}
-        self._label_info_cache = {}
 
     def images(self, refresh: bool = False) -> list[Path]:
         """当前数据集的图片清单（带缓存，已排除从数据集移除的图片）。"""
@@ -1705,53 +1698,6 @@ class DatasetViewModel(QObject):
     # -----------------------------------------------------------
     # 组合筛选：标签状态 / 图像标记 / 数据集划分 / 文本
     # -----------------------------------------------------------
-    # -----------------------------------------------------------
-    # 图像元信息 / 备注 / 标签（供自定义筛选规则与标签统计使用）
-    # -----------------------------------------------------------
-    def image_meta(self, image) -> dict:
-        """图像元信息：{"width", "height", "channels"}。
-
-        只读文件头（PIL 不解码像素），结果按路径缓存 —— 只有用到尺寸 / 通道数的
-        筛选规则才会走这里，避免无谓的解码开销。
-        """
-        key = str(image)
-        cached = self._meta_cache.get(key)
-        if cached is not None:
-            return dict(cached)
-        meta = {"width": 0, "height": 0, "channels": 0}
-        try:
-            from PIL import Image as PILImage
-
-            with PILImage.open(key) as handle:
-                meta["width"], meta["height"] = (int(value) for value in handle.size)
-                meta["channels"] = len(handle.getbands())
-        except Exception as exc:  # noqa: BLE001 - 无法识别的图片按 0 处理
-            logger.debug("读取图像元信息失败 %s: %s", key, exc)
-        self._meta_cache[key] = dict(meta)
-        return dict(meta)
-
-    @staticmethod
-    def _read_label_summary(label_path) -> tuple[int, list[int]]:
-        """读标签文件：返回 (标注数量, 类别 id 列表)。"""
-        if label_path is None:
-            return 0, []
-        try:
-            text = Path(label_path).read_text(encoding="utf-8")
-        except OSError:
-            return 0, []
-        count = 0
-        ids: set[int] = set()
-        for line in text.splitlines():
-            parts = line.split()
-            if not parts:
-                continue
-            count += 1
-            try:
-                ids.add(int(float(parts[0])))
-            except ValueError:
-                continue
-        return count, sorted(ids)
-
     def _class_name_of(self, value) -> str:
         """类别 id / 名称 → 显示用类别名（无法映射时原样返回）。"""
         text = str(value)
@@ -1773,156 +1719,6 @@ class DatasetViewModel(QObject):
                 return str(item.name)
         return text
 
-    def label_info(self, image) -> dict:
-        """图片的标注数量与标注类别：{"count", "classes"}（带缓存）。"""
-        key = self._image_key(image)
-        cached = self._label_info_cache.get(key)
-        if cached is not None:
-            return dict(cached)
-        info = {"count": 0, "classes": []}
-        if self.split_layout() == "classify":
-            name = self.image_class(image)
-            if name and name != UNLABELED_LABEL:
-                info = {"count": 1, "classes": [name]}
-        else:
-            label = self.label_index().get(Path(image).stem)
-            count, ids = self._read_label_summary(label)
-            if count:
-                info = {
-                    "count": count,
-                    "classes": [self._class_name_of(item) for item in ids],
-                }
-        self._label_info_cache[key] = dict(info)
-        return dict(info)
-
-    def notes_dir(self) -> Path | None:
-        """图片备注目录（项目文件同级的 `notes/`，与标注页保持同一口径）。"""
-        project = self._project_vm.project if self._project_vm else None
-        if project is None:
-            return None
-        path = str(project.params.get("path", "") or "")
-        return (Path(path).parent / "notes") if path else None
-
-    def image_note(self, image) -> str:
-        """图片备注文本（没有备注返回空串）。"""
-        directory = self.notes_dir()
-        if directory is None:
-            return ""
-        file = directory / f"{Path(image).stem}.txt"
-        try:
-            return file.read_text(encoding="utf-8").strip() if file.is_file() else ""
-        except OSError:
-            return ""
-
-    # -----------------------------------------------------------
-    # 自定义筛选规则
-    # -----------------------------------------------------------
-    def filter_rules(self) -> dict:
-        """项目里保存的自定义筛选规则（无规则返回空字典）。"""
-        tree = self._params_dict("filter_rules")
-        return dict(tree) if isinstance(tree, dict) else {}
-
-    def set_filter_rules(self, tree) -> None:
-        """保存自定义筛选规则（随项目落盘）。"""
-        project = self._project_vm.project if self._project_vm else None
-        if project is None:
-            self.message.emit("warning", "请先创建或打开项目")
-            return
-        project.params["filter_rules"] = dict(tree or {})
-        self._commit_meta("筛选规则已更新")
-
-    def count_filtered(self, rules: dict) -> tuple[int, int]:
-        """规则预览：返回 (命中张数, 总张数)。"""
-        return len(self.filter_images(rules=rules)), len(self.images())
-
-    # -----------------------------------------------------------
-    # 标签统计
-    # -----------------------------------------------------------
-    def label_statistics(self, paths: list | None = None, scope: str = "all") -> dict:
-        """标签统计：类别 / 数据集拆分 / 图像标记 的数量与占比 + 标注覆盖。
-
-        Args:
-            paths: 限定统计的图片（选中集）；None 表示全部图片。
-            scope: 只作为结果里的标记透传（all / selection）。
-        """
-        images = self.images()
-        if paths is None:
-            selected = list(images)
-        else:
-            wanted = {str(item) for item in paths}
-            selected = [image for image in images if str(image) in wanted]
-        total = len(selected)
-        flags = self.annotated_flags()
-        subsets = self.subset_labels()
-        position = {str(image): index for index, image in enumerate(images)}
-        project = self._project_vm.project if self._project_vm else None
-        class_colors = {
-            str(item.name): str(item.color or "")
-            for item in (getattr(project, "classes", []) or [])
-        }
-
-        classes: dict[str, int] = {}
-        splits: dict[str, int] = {}
-        tags: dict[str, int] = {}
-        annotated = 0
-        tagged = 0
-        for image in selected:
-            index = position.get(str(image), -1)
-            if 0 <= index < len(flags) and flags[index]:
-                annotated += 1
-            name = self.image_class(image)
-            label_name = self._class_name_of(name) if name else ""
-            classes[label_name] = classes.get(label_name, 0) + 1
-            subset = subsets[index] if 0 <= index < len(subsets) else ""
-            split_key = _SUBSET_NAME.get(subset, "none")
-            splits[split_key] = splits.get(split_key, 0) + 1
-            names = self.image_tag_names_of(image)
-            if names:
-                tagged += 1
-            for tag in names:
-                tags[tag] = tags.get(tag, 0) + 1
-
-        def share(count: int) -> float:
-            return (count / total) if total else 0.0
-
-        class_rows = [
-            {"name": key, "count": classes[key], "share": share(classes[key]),
-             "color": class_colors.get(key, "")}
-            for key in sorted(classes, key=lambda item: (-classes[item], str(item)))
-            if key
-        ]
-        if "" in classes:      # 「无标签」固定排在最后
-            class_rows.append({
-                "name": "", "count": classes[""],
-                "share": share(classes[""]), "color": "",
-            })
-
-        split_labels = {"train": "训练", "val": "验证", "test": "测试", "none": "未划分"}
-        split_rows = [
-            {"name": split_labels[key], "count": splits.get(key, 0),
-             "share": share(splits.get(key, 0))}
-            for key in ("train", "val", "test", "none")
-            if splits.get(key, 0)
-        ]
-
-        tag_rows = [
-            {"name": key, "count": tags[key], "share": share(tags[key]),
-             "color": self.tag_color(key)}
-            for key in sorted(tags, key=lambda item: (-tags[item], str(item)))
-        ]
-        missing = total - tagged
-        if missing > 0:
-            tag_rows.append({"name": "", "count": missing, "share": share(missing),
-                             "color": ""})
-        return {
-            "scope": str(scope),
-            "total": total,
-            "annotated": annotated,
-            "classes": class_rows,
-            "splits": split_rows,
-            "tags": tag_rows,
-        }
-
     def filter_images(
         self,
         label="all",
@@ -1930,7 +1726,6 @@ class DatasetViewModel(QObject):
         split="all",
         text: str = "",
         class_name="all",
-        rules: dict | None = None,
     ) -> list[Path]:
         """按 标签状态 / 类别 / 图像标记 / 数据集划分 / 文本 过滤图片。
 
@@ -1940,7 +1735,6 @@ class DatasetViewModel(QObject):
             split: all / train / val / test / none（未划分，可多选）。
             text: 关键词，匹配文件名、类别名与标记名（不区分大小写）。
             class_name: all / ""（无标签）/ 具体类别名（可多选）。
-            rules: 自定义筛选规则（条件树）；None 表示用项目里保存的规则。
 
         除 `text` 外均支持「单个值」或「值列表」；"all" / 空列表表示不筛选。
         """
@@ -1952,17 +1746,6 @@ class DatasetViewModel(QObject):
         classes = [self.image_class(image) for image in images]
         tags = [self.image_tag_names_of(image) for image in images]
         keyword = text.strip().lower()
-
-        # 自定义筛选规则：只在规则真正用到某个字段时才去读图像信息
-        ruleset = FilterRules(self.filter_rules() if rules is None else rules)
-        wanted = set() if ruleset.is_empty() else ruleset.fields()
-        metas = [self.image_meta(image) for image in images] if wanted & {
-            "width", "height", "channels"
-        } else []
-        infos = [self.label_info(image) for image in images] if wanted & {
-            "label_count", "classes"
-        } else []
-        notes = [self.image_note(image) for image in images] if "comment" in wanted else []
         annotated_wanted = _filter_list(label)
         class_wanted = _filter_list(class_name)
         split_wanted = _filter_list(split)
@@ -1996,20 +1779,6 @@ class DatasetViewModel(QObject):
                 or keyword in classes[index].lower()
                 or any(keyword in span.lower() for span in spans)
             ):
-                continue
-            if not ruleset.is_empty() and not ruleset.match({
-                "name": image.name,
-                "path": str(image),
-                "state": "annotated" if annotated else "unannotated",
-                "comment": notes[index] if index < len(notes) else "",
-                "tags": spans,
-                "classes": infos[index]["classes"] if index < len(infos) else [],
-                "split": _SUBSET_NAME.get(subset, "none") or "none",
-                "label_count": infos[index]["count"] if index < len(infos) else 0,
-                "width": metas[index]["width"] if index < len(metas) else 0,
-                "height": metas[index]["height"] if index < len(metas) else 0,
-                "channels": metas[index]["channels"] if index < len(metas) else 0,
-            }):
                 continue
             result.append(image)
         return result
@@ -2147,7 +1916,6 @@ class DatasetViewModel(QObject):
         self._images = None
         self._label_index = None
         self._subsets = None
-        self._label_info_cache = {}
 
     # -----------------------------------------------------------
     # 拆分名称（决定划分产物的目录名）

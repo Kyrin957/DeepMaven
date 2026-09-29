@@ -33,16 +33,10 @@ from qfluentwidgets import (
     StrongBodyLabel,
 )
 
-from src.models.filter_rules import FilterRules
 from src.viewmodels.category_vm import CategoryViewModel
 from src.viewmodels.dataset_vm import DatasetViewModel
 from src.views.data_widgets import ClassCard, ImportCard, StatsCard, side_column
-from src.views.dialogs import (
-    FilterRulesDialog,
-    ImportImagesDialog,
-    LabelStatsDialog,
-    TagEditDialog,
-)
+from src.views.dialogs import ImportImagesDialog, TagEditDialog
 from src.views.dialogs.tag_edit_dialog import DEFAULT_TAG_COLOR
 from src.views.gallery_widgets import FilterBar, SplitMapCard, TagCard
 from src.views.ui import DisplayDock
@@ -131,9 +125,6 @@ class GalleryTab(QWidget):
 
         self.filter_bar.filterChanged.connect(self.refresh)
         self.filter_bar.textChanged.connect(lambda _t: self.refresh())
-        self.filter_bar.rulesRequested.connect(self._on_rules)
-        self.filter_bar.rulesCleared.connect(self._on_rules_cleared)
-        self.filter_bar.statsRequested.connect(self._on_stats)
         self.display_dock.thumbSizeChanged.connect(self._on_thumb_size)
         self.display_dock.changed.connect(self._apply_display)
         # Ctrl + 滚轮缩放后回同步滑杆
@@ -169,43 +160,12 @@ class GalleryTab(QWidget):
             self._stale = True
 
     # -----------------------------------------------------------
-    # 自定义筛选规则 / 标签统计 / 显示增强
+    # 显示增强
     # -----------------------------------------------------------
     def _apply_display(self) -> None:
         """把显示增强参数下发给缩略图网格（只影响显示）。"""
         self.grid.set_display(**self.display_dock.values())
         self.grid.prewarm_visible()
-
-    def _rule_options(self) -> dict:
-        """规则弹窗的候选值（类别 / 标记；拆分与状态由模型自带候选）。"""
-        classes = (
-            [str(cls.name) for cls in self._category_vm.classes]
-            if self._category_vm is not None else []
-        )
-        return {"classes": classes, "tags": self._vm.all_tag_names()}
-
-    def _on_rules(self) -> None:
-        """打开自定义筛选规则弹窗（确定后随项目保存）。"""
-        dialog = FilterRulesDialog(
-            self,
-            tree=self._vm.filter_rules(),
-            options=self._rule_options(),
-            counter=lambda tree: self._vm.count_filtered(tree),
-        )
-        if dialog.exec():
-            self._vm.set_filter_rules(dialog.result_tree())
-
-    def _on_rules_cleared(self) -> None:
-        self._vm.set_filter_rules({})
-
-    def _stats_provider(self, scope: str) -> dict:
-        """标签统计数据源（整体 / 选中集）。"""
-        paths = self.grid.selected_paths() if scope == "selection" else None
-        return self._vm.label_statistics(paths, scope)
-
-    def _on_stats(self) -> None:
-        scope = "selection" if self.grid.selected_paths() else "all"
-        LabelStatsDialog(self, provider=self._stats_provider, scope=scope).exec()
 
     # -----------------------------------------------------------
     # 刷新
@@ -259,8 +219,6 @@ class GalleryTab(QWidget):
         self.filter_bar.set_summary(
             len(new_paths), total, len(self.grid.selected_indexes())
         )
-        rules = FilterRules(self._vm.filter_rules())
-        self.filter_bar.set_rule_summary(rules.active_count(), rules.describe())
         self._update_side_state()
         self._stale = False
 

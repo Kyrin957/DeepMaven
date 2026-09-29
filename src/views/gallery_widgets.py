@@ -29,7 +29,6 @@ from qfluentwidgets import (
     Flyout,
     FlyoutViewBase,
     PillPushButton,
-    PushButton,
     RoundMenu,
     SearchLineEdit,
     StrongBodyLabel,
@@ -151,9 +150,6 @@ class FilterBar(CardWidget):
 
     filterChanged = Signal()
     textChanged = Signal(str)
-    rulesRequested = Signal()         # 打开「自定义筛选规则」弹窗
-    rulesCleared = Signal()           # 清除自定义规则
-    statsRequested = Signal()         # 打开「标签统计」弹窗
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -182,26 +178,6 @@ class FilterBar(CardWidget):
         self.mark_btn = self._menu_button("标记", FluentIcon.FLAG, "mark")
         flow.addWidget(ToolGroup(
             self.label_btn, self.split_btn, self.mark_btn, parent=self,
-        ))
-
-        # 自定义筛选规则 + 标签统计（参照 DLT 的筛选规则 / 统计入口）
-        self.rules_btn = PushButton("规则", self)
-        self.rules_btn.setCheckable(True)
-        self.rules_btn.setToolTip("按条件组合筛选（名称 / 尺寸 / 标注 / 标记…）")
-        self.rules_btn.clicked.connect(lambda: self.rulesRequested.emit())
-
-        self.rules_clear_btn = TransparentToolButton(self)
-        self.rules_clear_btn.setIcon(FluentIcon.DELETE)
-        self.rules_clear_btn.setToolTip("清除自定义筛选规则")
-        self.rules_clear_btn.setFixedSize(T.ICON_BTN_SM, T.ICON_BTN_SM)
-        self.rules_clear_btn.setVisible(False)
-        self.rules_clear_btn.clicked.connect(lambda: self.rulesCleared.emit())
-
-        self.stats_btn = PushButton("统计", self)
-        self.stats_btn.setToolTip("按标签类别 / 数据集拆分 / 图像标记统计数量与占比")
-        self.stats_btn.clicked.connect(lambda: self.statsRequested.emit())
-        flow.addWidget(ToolGroup(
-            self.rules_btn, self.rules_clear_btn, self.stats_btn, parent=self,
         ))
 
         self.search = SearchLineEdit(self)
@@ -362,17 +338,6 @@ class FilterBar(CardWidget):
         if selected:
             text += f" · 已选 {selected}"
         self.summary.setText(text)
-
-    def set_rule_summary(self, count: int, description: str = "") -> None:
-        """更新规则按钮状态（条数 + 悬停显示规则内容）。"""
-        self.rules_btn.setText(f"规则 {count}" if count else "规则")
-        self.rules_btn.setChecked(bool(count))
-        self.rules_clear_btn.setVisible(bool(count))
-        self.rules_btn.setToolTip(
-            f"当前规则：{description}" if description else
-            "按条件组合筛选（名称 / 尺寸 / 标注 / 标记…）"
-        )
-        self.rules_clear_btn.setToolTip(f"清除规则：{description}" if description else "清除自定义筛选规则")
 
     def reset(self) -> None:
         """复位到「全部」。"""

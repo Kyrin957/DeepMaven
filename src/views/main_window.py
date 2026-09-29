@@ -380,6 +380,16 @@ class MainWindow(FluentWindow):
             return
         self.switchTo(self.annotate_tab)
 
+    def _open_in_annotator_item(self, path: str, item_index: int) -> None:
+        """从检查页跳转到标注页：定位图片并选中指定对象实例。"""
+        index = self.annotate_vm.set_image_by_path(path)
+        if index < 0:
+            self._show_message("warning", "未在当前数据集中找到该图片")
+            return
+        if item_index >= 0:
+            self.annotate_tab.canvas.select(item_index)
+        self.switchTo(self.annotate_tab)
+
     def _on_project_loaded(self, project) -> None:
         """打开 / 新建项目后，把项目数据回填到各 ViewModel。
 
@@ -693,6 +703,8 @@ class MainWindow(FluentWindow):
         self.dataset_vm.splitsChanged.connect(self._on_splits_changed)
         # 图库双击图片 → 切到标注页并定位到该图片
         self.gallery_tab.requestAnnotate.connect(self._open_in_annotator)
+        # 检查页双击对象实例 → 切到标注页、定位图片并选中该对象
+        self.review_tab.requestAnnotate.connect(self._open_in_annotator_item)
         # 新建项目时若带数据集目录，直接导入图库
         self.project_tab.requestImportDataset.connect(self.dataset_vm.import_images)
         # 项目信息变化（如完成划分、标注）后刷新项目页

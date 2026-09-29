@@ -1,15 +1,31 @@
 """标注检查页：以缩略图排布复核标注质量与数据质量。
 
 布局参照 Halcon DLT 的检查视图：
-    左侧：已选择图像详情 / 标签类别 / 质检结果
+    左侧：已选择图像详情 / 对象实例 / 标签类别 / 质检结果
     右侧：大卡片缩略图网格（已标注项带彩色角标与描边）
+
+任务差异：
+    * 整图任务（分类 / 异常检测）没有对象实例，按整图类别核对；
+    * 框 / 多边形 / 文本框任务（检测 / 旋转框 / 分割 / OCR）在「对象实例」
+      列表里逐对象展示：裁剪预览 + 类别 + 类型，双击可回标注页修正。
+      注意裁剪只是**核对视图**：本项目 YOLO 系按整图 + 标签文件训练，
+      不把对象裁出来做训练数据（OCR 识别集除外）。
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QPointF, QSize, Qt, Signal
+from PySide6.QtGui import (
+    QColor,
+    QIcon,
+    QImage,
+    QPainter,
+    QPen,
+    QPixmap,
+    QPolygonF,
+)
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QListWidget,
@@ -39,10 +55,19 @@ from src.views.widgets import (
 )
 
 _THUMB_STEPS = (THUMB_MEDIUM, THUMB_LARGE, THUMB_XLARGE)
+# 整图任务的数据布局（无对象实例）
+_WHOLE_IMAGE_LAYOUTS = ("classify", "anomaly_folder")
+# 对象实例的裁剪预览边长（装饰性尺寸）
+_ITEM_ICON = 44
+# 对象类型显示名
+_KIND_TEXT = {"box": "矩形", "polygon": "多边形", "mask": "掩码", "text": "文本"}
+_FALLBACK_COLOR = "#66CCFF"
 
 
 class ReviewTab(QWidget):
     """标注检查页。"""
+
+    requestAnnotate = Signal(str, int)     # 双击对象实例 → 标注页定位（图路径, 实例序号）
 
     def __init__(
         self,
@@ -58,6 +83,8 @@ class ReviewTab(QWidget):
         # 页面不可见时只记录待渲染的图片，切回本页再画
         self._pending_pairs: list = []
         self._stale = True
+        # 「对象实例」列表当前对应的图片路径（双击回标注页用）
+        self._item_path: str | None = None
         self._build_ui()
         self._bind()
         self.refresh()
@@ -97,6 +124,20 @@ class ReviewTab(QWidget):
         self.detail_count = CaptionLabel("标注对象：—", self.detail_card)
         layout.addWidget(self.detail_count)
 
+        # 对象实例：逐对象裁剪预览（整图任务隐藏）
+        self.items_card = CardWidget(self)
+        items_layout = QVBoxLayout(self.items_card)
+        items_layout.setContentsMargins(
+            T.CARD_PAD_H, T.CARD_PAD_V, T.CARD_PAD_H, T.CARD_PAD_V
+        )
+        items_layout.setSpacing(T.SPACE_SM)
+        items_layout.addWidget(StrongBodyLabel("对象实例", self.items_card))
+        self.items_list = QListWidget(self.items_card)
+        self.items_list.setIconSize(QSize(_ITEM_ICON, _ITEM_ICON))
+        self.items_list.setMinimumHeight(150)
+        self.items_list.itemDoubleClicked.connect(self._on_item_activated)
+        items_layout.addWidget(self.items_list)
+
         self.class_card = ClassCard(self._category_vm, self)
         self.class_card.setMaximumHeight(260)
 
@@ -115,7 +156,8 @@ class ReviewTab(QWidget):
         quality_layout.addWidget(self.quality_hint)
 
         return side_column(
-            self.detail_card, self.class_card, self.quality_card, width=292
+            self.detail_card, self.items_card, self.class_card, self.quality_card,
+            width=292,
         )
 
     def _build_main(self) -> QVBoxLayout:
@@ -279,6 +321,10 @@ class ReviewTab(QWidget):
         self.display_dock.set_thumb_size(int(size))
 
     def _on_selected(self, index: int) -> None:
+        # 整图任务（分类 / 异常检测）按整图类别核对，没有对象实例
+        whole = self._vm.split_layout() in _WHOLE_IMAGE_LAYOUTS
+        self.items_card.setVisible(not whole)
+
         path = self.grid.path_at(index)
         if not path:
             self.detail_name.setText("—")
@@ -286,6 +332,7 @@ class ReviewTab(QWidget):
             self.detail_class.setText("类别：—")
             self.detail_state.setText("状态：—")
             self.detail_count.setText("标注对象：—")
+            self._reload_items(None)
             return
 
         image = Path(path)
@@ -297,22 +344,123 @@ class ReviewTab(QWidget):
             if position < len(flags):
                 annotated = flags[position]
 
-        if self._vm.split_layout() == "classify":
-            count_text = "不适用"
-        else:
-            label_dir = self._vm.label_dir()
-            count = 0
-            if label_dir is not None:
-                label = AnnotationService.label_path_for(image, label_dir)
-                if label.is_file():
-                    count = len(AnnotationService.load_yolo(label).items)
-            count_text = f"{count} 个"
-
         self.detail_name.setText(image.name)
         self.detail_path.setText(f"路径：{image.parent}")
         self.detail_class.setText(f"类别：{self._vm.image_class(image)}")
         self.detail_state.setText("状态：已标注" if annotated else "状态：未标注")
-        self.detail_count.setText(f"标注对象：{count_text}")
+
+        if whole:
+            self._reload_items(None)
+            self.detail_count.setText("标注对象：—")
+            return
+        count = self._reload_items(image)
+        self.detail_count.setText(f"标注对象：{count} 个")
+
+    # -----------------------------------------------------------
+    # 对象实例（裁剪核对视图）
+    # -----------------------------------------------------------
+    def _reload_items(self, image: Path | None) -> int:
+        """重建「对象实例」列表，返回对象数（无图时为 0）。
+
+        每个对象展示裁剪预览 + 类别色 + 类型：检测 / 分割核对框与轮廓、
+        OCR 附转写文本。裁剪仅为人工核对，不代表训练口径（整图训练）。
+        """
+        self.items_list.clear()
+        self._item_path = str(image) if image is not None else None
+        if image is None:
+            return 0
+        label_dir = self._vm.label_dir()
+        if label_dir is None:
+            return 0
+        label = AnnotationService.label_path_for(image, label_dir)
+        if not label.is_file():
+            return 0
+        source = QImage(str(image))
+        if source.isNull():
+            return 0
+        annotation = AnnotationService.load_yolo(
+            label, source.width(), source.height()
+        )
+        classes = {}
+        if self._category_vm is not None:
+            classes = {cls.cls_id: cls for cls in self._category_vm.classes}
+        for index, item in enumerate(annotation.items):
+            cls = classes.get(item.cls_id)
+            name = cls.name if cls is not None else str(item.cls_id)
+            color = cls.color if cls is not None else _FALLBACK_COLOR
+            kind = _KIND_TEXT.get(item.kind, item.kind)
+            row = QListWidgetItem(
+                self._item_icon(source, item, color),
+                self._item_label(index, name, kind, item),
+            )
+            row.setToolTip(self._item_tip(annotation, item, name, kind))
+            self.items_list.addItem(row)
+        return len(annotation.items)
+
+    @staticmethod
+    def _item_label(index: int, name: str, kind: str, item) -> str:
+        label = f"{index + 1}. {name} · {kind}"
+        if item.is_text:
+            label += f"：{item.text or '—'}"
+        return label
+
+    @staticmethod
+    def _item_tip(annotation, item, name: str, kind: str) -> str:
+        """实例行提示：类别 · 类型 · 像素尺寸（OCR 附转写）。"""
+        width = max(1, int(annotation.width or 1))
+        height = max(1, int(annotation.height or 1))
+        x1, y1, x2, y2 = item.bounds()
+        px_w = int(round((x2 - x1) * width))
+        px_h = int(round((y2 - y1) * height))
+        text = f"{name} · {kind} · {px_w} × {px_h} px"
+        if item.is_text and item.text:
+            text += f" · {item.text}"
+        return text
+
+    def _item_icon(self, source: QImage, item, color: str) -> QIcon:
+        """对象区域裁剪预览；多边形 / 掩码叠加轮廓与浅填充。"""
+        width, height = source.width(), source.height()
+        x1, y1, x2, y2 = item.bounds()
+        pad = 0.01
+        px1 = max(0, int((x1 - pad) * width))
+        py1 = max(0, int((y1 - pad) * height))
+        px2 = min(width, int((x2 + pad) * width) + 1)
+        py2 = min(height, int((y2 + pad) * height) + 1)
+        if px2 <= px1 or py2 <= py1:
+            return QIcon()
+        preview = source.copy(px1, py1, px2 - px1, py2 - py1).scaled(
+            _ITEM_ICON, _ITEM_ICON,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        if not item.is_rect and len(item.points) >= 3:
+            painter = QPainter(preview)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            sx = preview.width() / (px2 - px1)
+            sy = preview.height() / (py2 - py1)
+            polygon = QPolygonF([
+                QPointF(
+                    (point[0] * width - px1) * sx,
+                    (point[1] * height - py1) * sy,
+                )
+                for point in item.points
+            ])
+            stroke = QColor(color or _FALLBACK_COLOR)
+            painter.setPen(QPen(stroke, 1.5))
+            fill = QColor(stroke)
+            fill.setAlpha(60)
+            painter.setBrush(fill)
+            painter.drawPolygon(polygon)
+            painter.end()
+        return QIcon(QPixmap.fromImage(preview))
+
+    def _on_item_activated(self, item) -> None:
+        """双击对象实例 → 在标注页打开该图并选中对应对象。"""
+        if self._item_path is None:
+            return
+        self.requestAnnotate.emit(
+            self._item_path, self.items_list.row(item)
+        )
 
     # -----------------------------------------------------------
     # 质检

@@ -9,6 +9,7 @@
 * ``FlowLayout``  可换行流式布局（解决控件重叠）
 * ``WheelGuard``  全局滚轮防护（参数框不再被滚轮误改）
 * ``SafeSpinBox`` / ``SafeDoubleSpinBox``  滚轮安全的输入框
+* ``icon`` / ``bind_icon``  qtawesome 图标（语义名 + 明暗主题跟随）
 * ``ParamGroup`` / ``ToolGroup`` / ``FieldRow``  容器化布局组件
 
 界面开发约定见 `.codebuddy/rules/ui-design.mdc`。
@@ -25,6 +26,7 @@ from src.views.ui.containers import (
 )
 from src.views.ui.display_dock import DisplayDock
 from src.views.ui.flow_layout import FlowContainer, FlowLayout
+from src.views.ui.icons import bind_icon, icon, refresh_icons
 from src.views.ui.wheel_guard import (
     ALLOW_WHEEL_ATTR,
     SafeCompactSpinBox,
@@ -49,4 +51,7 @@ __all__ = [
     "FieldRow",
     "tool_separator",
     "icon_button",
+    "icon",
+    "bind_icon",
+    "refresh_icons",
 ]

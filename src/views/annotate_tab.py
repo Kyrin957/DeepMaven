@@ -10,16 +10,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QIcon
+from PySide6.QtCore import QSize, Qt, QUrl
+from PySide6.QtGui import QColor, QDesktopServices, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QListWidget,
+    QListWidgetItem,
     QPlainTextEdit,
-    QStyle,
     QVBoxLayout,
     QWidget,
 )
@@ -55,6 +55,8 @@ from src.views.ui import (
     SafeDoubleSpinBox,
     SafeSpinBox,
     ToolGroup,
+    bind_icon,
+    icon,
     icon_button,
 )
 from src.views.ui import tokens as T
@@ -69,8 +71,21 @@ from src.views.widgets import (
 )
 
 
-# 页码框仅需容纳 3 位数字（侧栏宽度有限：紧凑步进器 + 度量定宽）
-_JUMP_CHARS = 3
+# 标注对象列表左侧的类别色块（与「标签类别」行同风格）
+_CHIP_PX = 10
+_FALLBACK_CHIP = "#66CCFF"
+# 「另存图像为…」的文件过滤器
+_IMAGE_FILTER = "图片 (*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp)"
+# 标注方式 → 可用绘制工具（标注框类型互不混用，参照 DLT）
+_TOOLS_BY_ANNOTATION: dict[str, list[tuple[str, str]]] = {
+    "none": [(MODE_BROWSE, "浏览")],
+    "box": [(MODE_BROWSE, "浏览"), (MODE_BOX, "矩形")],
+    "obb": [(MODE_BROWSE, "浏览"), (MODE_BOX, "矩形")],
+    "polygon": [
+        (MODE_BROWSE, "浏览"), (MODE_POLYGON, "多边形"), (MODE_MASK, "掩码"),
+    ],
+    "text": [(MODE_BROWSE, "浏览"), (MODE_TEXT, "文本")],
+}
 
 
 class AnnotateTab(QWidget):
@@ -132,7 +147,8 @@ class AnnotateTab(QWidget):
         column.setContentsMargins(0, 0, 0, 0)
         column.setSpacing(T.SPACE_ML)
         column.addWidget(self._build_toolbar())
-        column.addWidget(self._build_preannotate_bar())
+        self.preannotate_card = self._build_preannotate_bar()
+        column.addWidget(self.preannotate_card)
         column.addWidget(self._build_canvas_card(), 1)
         area.setWidget(body)
 
@@ -165,7 +181,7 @@ class AnnotateTab(QWidget):
         outer.addWidget(container)
         flow = container.flow()
 
-        # ① 绘制工具（浏览 / 矩形 / 多边形 / 掩码；OCR 项目为 浏览 + 文本）
+        # ① 绘制工具（由项目标注方式决定：整图 / 矩形 / 旋转矩形 / 多边形 / 文本）
         self.mode_seg = SegmentedWidget(card)
         self._reload_tools("box")
         self.mode_seg.setCurrentItem(MODE_BOX)
@@ -221,13 +237,14 @@ class AnnotateTab(QWidget):
         self.hole_group.setVisible(False)
         flow.addWidget(self.hole_group)
 
-        # ⑥ 标注存取（保存 / 清空 / 导入）
+        # ⑥ 标注存取（保存 / 清空 / 导入）——整图任务没有标注文件，整组隐藏
         self.save_btn = icon_button(FluentIcon.SAVE, "保存标注", card, primary=True)
         self.clear_btn = icon_button(FluentIcon.BROOM, "清空当前图标注", card)
         self.import_btn = icon_button(FluentIcon.DOWNLOAD, "导入标注文件", card)
-        flow.addWidget(ToolGroup(
+        self.transfer_group = ToolGroup(
             self.save_btn, self.clear_btn, self.import_btn, parent=card,
-        ))
+        )
+        flow.addWidget(self.transfer_group)
 
         # ⑦ 导出标注（格式 + 按钮）。与 ⑥ 分开成两组：五件套合起来近 500px，
         # 最窄窗口下比工具条还宽，整组折行也放不下（会横向溢出被裁）。
@@ -239,9 +256,10 @@ class AnnotateTab(QWidget):
         ):
             self.export_combo.addItem(text, userData=key)
         self.export_btn = icon_button(FluentIcon.IMAGE_EXPORT, "导出标注", card)
-        flow.addWidget(ToolGroup(
+        self.export_group = ToolGroup(
             self.export_combo, self.export_btn, parent=card,
-        ))
+        )
+        flow.addWidget(self.export_group)
         return card
 
     def _build_preannotate_bar(self) -> CardWidget:
@@ -309,10 +327,13 @@ class AnnotateTab(QWidget):
     def _build_image_card(self) -> CardWidget:
         """图像卡片：当前图名称 / 状态 + 前后切换（自画布条迁入）。
 
-        翻页行用**固定单行**（侧栏宽度固定）：此前用可换行容器，折行后的
-        第二行超出卡片高度被裁剪（下一张 / 末张按钮不可见）。
+        翻页区用**固定两行**（见《开发文档.md》§4.28）：上行四个翻页按钮、
+        下行页码框 + 总页数——单行时「4 按钮 + 页码框 + 总数」在 268px 侧栏里
+        几乎顶满，字体稍大即被裁；页码框宽度交给控件自身 ``sizeHint()``
+        （按最大页码文字计算），不写定宽。
         """
         card = CardWidget(self)
+        self.image_card = card
         layout = QVBoxLayout(card)
         layout.setContentsMargins(T.CARD_PAD_H, T.CARD_PAD_V, T.CARD_PAD_H, T.CARD_PAD_V)
         layout.setSpacing(T.SPACE_SM)
@@ -324,44 +345,46 @@ class AnnotateTab(QWidget):
         layout.addWidget(self.strip_name)
         layout.addWidget(self.strip_state)
 
-        row = QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(T.SPACE_XXS)
-        self.first_btn = icon_button(self._skip_icon(True), "首张图片", card)
-        self.prev_btn = icon_button(FluentIcon.LEFT_ARROW, "上一张图片", card)
-        self.next_btn = icon_button(FluentIcon.RIGHT_ARROW, "下一张图片", card)
-        self.last_btn = icon_button(self._skip_icon(False), "末张图片", card)
+        # 第一行：翻页按钮。图标统一走 qtawesome（Material Design Icons，
+        # 见 views.ui.icons）；两行布局让 4 个按钮与页码框在窄侧栏（268px）
+        # 与高分屏大字体下都放得下（单行时 4 按钮 + 页码 + 总数会顶满被裁）
+        self.first_btn = icon_button(icon("first"), "首张图片", card)
+        self.prev_btn = icon_button(icon("prev"), "上一张图片", card)
+        self.next_btn = icon_button(icon("next"), "下一张图片", card)
+        self.last_btn = icon_button(icon("last"), "末张图片", card)
+        for button, name in (
+            (self.first_btn, "first"), (self.prev_btn, "prev"),
+            (self.next_btn, "next"), (self.last_btn, "last"),
+        ):
+            bind_icon(button, name)      # 明暗主题切换时自动重绘
+        nav_row = QHBoxLayout()
+        nav_row.setContentsMargins(0, 0, 0, 0)
+        nav_row.setSpacing(T.SPACE_XS)
+        nav_row.addStretch(1)
+        for button in (self.first_btn, self.prev_btn,
+                       self.next_btn, self.last_btn):
+            nav_row.addWidget(button)
+        nav_row.addStretch(1)
+        layout.addLayout(nav_row)
+
+        # 第二行：页码框 + 总页数。
+        # 页码框**不写定宽**：qfluentwidgets 的 sizeHint 本就按 maximum 的
+        # 文字宽度 + 步进器开销计算（max=1→60px、272→80px、12345→98px），
+        # 即「长度由最大页码决定」，且随字体 / DPI 自动适配；两端 stretch
+        # 保证布局只给它 sizeHint 宽度、不被拉伸。
         self.jump_spin = SafeCompactSpinBox(card)
         self.jump_spin.setRange(1, 1)
-        self.jump_spin.setFixedWidth(
-            T.field_width(self.jump_spin, _JUMP_CHARS)
-        )
         self.jump_spin.setToolTip("输入序号后回车跳转")
         self.page_total = CaptionLabel("/ 0", card)
-        row.addStretch(1)
-        row.addWidget(self.first_btn)
-        row.addWidget(self.prev_btn)
-        row.addWidget(self.jump_spin)
-        row.addWidget(self.page_total)
-        row.addWidget(self.next_btn)
-        row.addWidget(self.last_btn)
-        row.addStretch(1)
-        layout.addLayout(row)
+        page_row = QHBoxLayout()
+        page_row.setContentsMargins(0, 0, 0, 0)
+        page_row.setSpacing(T.SPACE_XS)
+        page_row.addStretch(1)
+        page_row.addWidget(self.jump_spin)
+        page_row.addWidget(self.page_total)
+        page_row.addStretch(1)
+        layout.addLayout(page_row)
         return card
-
-    def _skip_icon(self, backward: bool) -> QIcon:
-        """「跳到开头 / 结尾」图标。
-
-        用 Qt 媒体跳过图标（``|◀◀`` / ``▶▶|``）：语义清晰、随主题适配；
-        原 FluentIcon.SKIP_BACK / SKIP_FORWARD 的 Fluent 字形在此尺寸下
-        与「上一张 / 下一张」难以区分（用户反馈）。
-        """
-        pixmap = (
-            QStyle.StandardPixmap.SP_MediaSkipBackward
-            if backward
-            else QStyle.StandardPixmap.SP_MediaSkipForward
-        )
-        return self.style().standardIcon(pixmap)
 
     # --------------------------------------------------- 中间
     def _build_canvas_card(self) -> CardWidget:
@@ -391,8 +414,6 @@ class AnnotateTab(QWidget):
         layout.addWidget(StrongBodyLabel("导航器", navigator_card))
         self.navigator = Navigator(navigator_card)
         layout.addWidget(self.navigator)
-        self.fit_btn = icon_button(FluentIcon.FIT_PAGE, "适应窗口", navigator_card)
-        layout.addWidget(self.fit_btn)
 
         item_card = CardWidget(self)
         item_layout = QVBoxLayout(item_card)
@@ -401,6 +422,8 @@ class AnnotateTab(QWidget):
         item_layout.addWidget(StrongBodyLabel("标注对象", item_card))
         self.item_list = QListWidget(item_card)
         self.item_list.setMinimumHeight(110)
+        # 行首为类别色块图标（与「标签类别」行同色）
+        self.item_list.setIconSize(QSize(_CHIP_PX + 2, _CHIP_PX + 2))
         # 支持多选（Ctrl 点选 / Shift 连选），与画布选中同步
         self.item_list.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection
@@ -409,7 +432,8 @@ class AnnotateTab(QWidget):
 
         action_row = QHBoxLayout()
         self.delete_btn = icon_button(FluentIcon.DELETE, "删除选中标注", item_card)
-        self.select_all_btn = icon_button(FluentIcon.CHECKBOX, "全选标注", item_card)
+        self.select_all_btn = icon_button(icon("select-all"), "全选标注", item_card)
+        bind_icon(self.select_all_btn, "select-all")
         action_row.addWidget(self.delete_btn)
         action_row.addWidget(self.select_all_btn)
         item_layout.addLayout(action_row)
@@ -544,9 +568,11 @@ class AnnotateTab(QWidget):
         self.detect_btn.clicked.connect(self._on_preannotate)
         self.sam_btn.clicked.connect(self._on_sam)
 
-        self.fit_btn.clicked.connect(self._on_fit_view)
         self.display_dock.changed.connect(self._apply_display)
         self.note_btn.clicked.connect(self._on_save_note)
+        # 画布右键菜单：另存图像 / 打开所在位置
+        self.canvas.saveImageRequested.connect(self._on_save_image)
+        self.canvas.openImageFolderRequested.connect(self._on_open_image_folder)
 
         # 左侧栏：标签类别 / 拆分映射 / 图像标记（对当前图片生效）
         if self.class_card is not None:
@@ -593,16 +619,13 @@ class AnnotateTab(QWidget):
     # -----------------------------------------------------------
     # 交互
     # -----------------------------------------------------------
-    def _reload_tools(self, mode: str) -> None:
-        """按标注方式重建工具条：OCR 项目为「浏览 + 文本」，其余为原四件套。"""
-        tools = (
-            [(MODE_BROWSE, "浏览"), (MODE_TEXT, "文本")]
-            if mode == "text"
-            else [
-                (MODE_BROWSE, "浏览"), (MODE_BOX, "矩形"),
-                (MODE_POLYGON, "多边形"), (MODE_MASK, "掩码"),
-            ]
-        )
+    def _reload_tools(self, annotation: str) -> None:
+        """按标注方式重建工具条。
+
+        整图任务（分类 / 异常检测）只保留「浏览」；水平框与旋转框只保留
+        「矩形」；实例 / 语义分割为「多边形 + 掩码」；OCR 为「文本」。
+        """
+        tools = _TOOLS_BY_ANNOTATION.get(annotation, _TOOLS_BY_ANNOTATION["box"])
         signature = "|".join(key for key, _text in tools)
         if getattr(self, "_tool_signature", "") == signature:
             return
@@ -762,22 +785,30 @@ class AnnotateTab(QWidget):
             self.status_message(f"已修改 {changed} 个标注的类别")
 
     def apply_project_type(self) -> None:
-        """按项目类型限定标注方式（项目类型决定标注工具，参照 DLT）。"""
-        mode = self._vm.annotation_mode()
+        """按项目类型限定标注方式与工具（整图 / 矩形 / 旋转矩形 / 多边形 / 文本）。
+
+        任务差异全部用「工具与栏位的可用性」表达，不写说明文字：
+            * 整图任务（分类 / 异常检测）无标注文件 —— 隐藏存取与导出组，
+              预标注栏也隐藏（整图判定在左栏「标签类别」完成）；
+            * 旋转框（obb）—— 只给矩形工具 + 角度组（拖框后调角度）；
+            * 实例 / 语义分割 —— 多边形 + 掩码，可用 SAM 细化；
+            * OCR —— 文本框。
+        """
+        annotation = self._vm.annotation_mode()
         target = {
             "box": MODE_BOX, "obb": MODE_BOX, "polygon": MODE_POLYGON,
             "text": MODE_TEXT,
-        }.get(mode, MODE_BROWSE)
-        self._reload_tools(mode)
+        }.get(annotation, MODE_BROWSE)
+        self._reload_tools(annotation)
         self.mode_seg.setCurrentItem(target)
         self._on_mode(target)
 
-        is_obb = mode == "obb"
-        self.rotate_group.setVisible(is_obb)
-        if mode == "none":
-            self.status_message("按整图判定，无需框选")
-        elif is_obb:
-            self.status_message("旋转框：拖框后用「旋转选中」调角度")
+        self.rotate_group.setVisible(annotation == "obb")
+        self.preannotate_card.setVisible(annotation in ("box", "obb", "polygon"))
+        self.sam_btn.setVisible(annotation == "polygon")
+        has_files = annotation != "none"
+        self.transfer_group.setVisible(has_files)
+        self.export_group.setVisible(has_files)
 
     def _on_rotate(self) -> None:
         delta = self.rotate_spin.value()
@@ -803,9 +834,30 @@ class AnnotateTab(QWidget):
             return
         self._vm.set_current(self.jump_spin.value() - 1)
 
-    def _on_fit_view(self) -> None:
-        self.canvas.fit_to_view()
-        self.status_message("已恢复为适应窗口")
+    # -----------------------------------------------------------
+    # 图像文件操作（画布右键菜单）
+    # -----------------------------------------------------------
+    def _on_save_image(self) -> None:
+        """另存当前图像到指定路径。"""
+        source = self._vm.current_path()
+        if source is None:
+            return
+        target, _ = QFileDialog.getSaveFileName(
+            self, "另存图像为", str(source), _IMAGE_FILTER
+        )
+        if target:
+            self._dataset_vm.save_image_as(source, target)
+
+    def _on_open_image_folder(self) -> None:
+        """打开当前图像所在目录。"""
+        source = self._vm.current_path()
+        if source is None:
+            return
+        directory = Path(source).parent
+        if not directory.is_dir():
+            self.status_message("图像所在目录不存在")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
 
     def _apply_display(self) -> None:
         """把显示调试栏的亮度 / 对比度下发给画布（只影响显示）。"""
@@ -1107,21 +1159,72 @@ class AnnotateTab(QWidget):
     # 渲染
     # -----------------------------------------------------------
     def _rebuild_item_list(self, annotation) -> None:
-        names = {cls.cls_id: cls.name for cls in self._vm.class_items()}
-        self._canvas_selected = -1
+        """重建右侧「标注对象」列表：类别色块 + 序号 + 名称 + 类型。"""
+        classes = {cls.cls_id: cls for cls in self._vm.class_items()}
         self.item_list.blockSignals(True)
         self.item_list.clear()
         if annotation is not None:
             for index, item in enumerate(annotation.items):
+                cls = classes.get(item.cls_id)
+                name = cls.name if cls is not None else str(item.cls_id)
+                color = cls.color if cls is not None else _FALLBACK_CHIP
                 kind = {"box": "矩形", "polygon": "多边形", "mask": "掩码",
                         "text": "文本"}.get(item.kind, item.kind)
-                name = names.get(item.cls_id, item.cls_id)
                 label = f"{index + 1}. {name} · {kind}"
                 if item.is_text:
                     label += f"：{item.text or '（空）'}"
-                self.item_list.addItem(label)
+                row = QListWidgetItem(self._chip_icon(color), label)
+                row.setToolTip(self._item_tooltip(annotation, item, name, kind))
+                self.item_list.addItem(row)
         self.item_list.blockSignals(False)
+        self._sync_list_selection()
         self._sync_property_fields()
+
+    def _sync_list_selection(self) -> None:
+        """把画布选中状态回填到对象列表。
+
+        画完自动选中时，选择信号先于列表重建发出（此刻列表还是旧内容，
+        同步不到），因此列表重建后必须按画布状态再回填一次。
+        """
+        indexes = self.canvas.selection()
+        primary = self.canvas.selected_index()
+        self._canvas_selected = primary
+        self._syncing = True
+        try:
+            self.item_list.clearSelection()
+            for index in indexes:
+                row = self.item_list.item(index)
+                if row is not None:
+                    row.setSelected(True)
+            if 0 <= primary < self.item_list.count():
+                self.item_list.setCurrentRow(primary)
+        finally:
+            self._syncing = False
+
+    def _chip_icon(self, color: str) -> QIcon:
+        """类别色块图标（与「标签类别」行的色块同色，便于逐对象核对）。"""
+        pixmap = QPixmap(_CHIP_PX, _CHIP_PX)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(color or _FALLBACK_CHIP))
+        painter.drawRoundedRect(0, 0, _CHIP_PX, _CHIP_PX, 2, 2)
+        painter.end()
+        return QIcon(pixmap)
+
+    @staticmethod
+    def _item_tooltip(annotation, item, name: str, kind: str) -> str:
+        """对象列表行提示：类别 · 类型 · 像素尺寸（OCR 附转写）。"""
+        width = max(1, int(getattr(annotation, "width", 0) or 1))
+        height = max(1, int(getattr(annotation, "height", 0) or 1))
+        x1, y1, x2, y2 = item.bounds()
+        px_w = int(round((x2 - x1) * width))
+        px_h = int(round((y2 - y1) * height))
+        text = f"{name} · {kind} · {px_w} × {px_h} px"
+        if item.is_text and item.text:
+            text += f" · {item.text}"
+        return text
 
     def _update_totals(self) -> None:
         self._done = self._vm.annotated_count()

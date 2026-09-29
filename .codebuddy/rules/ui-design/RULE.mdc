@@ -74,6 +74,10 @@ enabled: true
   `add_field()`（单列）或 `add_grid(fields, columns=2)`（多列）。
 - 路径 / 备注 / 名称一类的**文本**输入可以撑满一行；**数值**输入必须定宽。
 - 行内排布：`标签(定宽) + 控件(定宽) + addStretch(1)`，左对齐。
+- **长度随内容变化的框**（页码 / 计数一类，最大值即最长文本）：**不要手算
+  字符宽度**，交给控件自身 `sizeHint()`（`QSpinBox` 按 `maximum` 的文字宽 +
+  样式开销计算，随字体 / DPI 自适应），行内两端加 `addStretch(1)` 使其只取
+  sizeHint 宽度、不被拉伸（参考：标注页「图像」卡片的页码框）。
 
 ## 3. 滚轮：参数框永不改值
 
@@ -208,9 +212,15 @@ $env:QT_QPA_PLATFORM="offscreen"
   （如「显示 12 / 240 张 · 已选 3」），不属于论述文字。
 - **简单操作按钮一律用图标**：统一用
   `views.ui.icon_button(icon, "说明", parent, primary=False)` 创建
-  （32px 边长 / 20px 图标 / 无文字 / tooltip 即说明）。保存、清空、删除、
+  （32px 边长 / 20px 图标 / 无文字 / tooltip 即说明；密集行可传
+  `size=tokens.ICON_BTN_MD` 用 28px / 16px）。保存、清空、删除、
   导入导出、翻页、适应窗口等「一看图标就懂」的动作不写文字；
   承载范围语义的复杂操作（如「预标注未标注图片」）可保留文字。
+- **图标来源**：默认 `FluentIcon`；FluentIcon 缺合适字形时改用
+  `views.ui.icons`（qtawesome 图标库，语义名 + `bind_icon` 主题跟随），
+  **不得**借用 Qt 标准图标（`QStyle.StandardPixmap`，如媒体播放图标冒充
+  翻页）或在页面里直接写 `qta.icon(...)`。新增语义名集中加在
+  `icons.py::_NAMES`。
 - 悬浮面板 / 弹窗内同样适用：滑杆、开关旁不写解释句；参数含义写在
   滑杆 tooltip 上（参照 `DisplayDock` 的悬浮面板），面板里只放滑杆 + 读数。
 - 例外：流程必需的即时反馈（空列表占位、「请先选择图像」等操作提示）

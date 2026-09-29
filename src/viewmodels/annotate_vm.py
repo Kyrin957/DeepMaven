@@ -413,6 +413,10 @@ class AnnotateViewModel(QObject):
         if path is None or label_dir is None or self._current is None:
             self.message.emit("warning", "请先导入数据集")
             return
+        if self.annotation_mode() == "none":
+            # 整图任务（分类 / 异常检测）没有标注文件：类别在左栏「标签类别」选择
+            self.message.emit("warning", "整图任务无需保存标注")
+            return
         AnnotationService.save_yolo(
             self._current,
             AnnotationService.label_path_for(path, label_dir),

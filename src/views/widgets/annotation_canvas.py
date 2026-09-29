@@ -8,12 +8,14 @@
     * 浏览模式：点选 / `Ctrl` 多选 / `Shift` 框选 / `Ctrl+A` 全选，拖动即移动；
     * 方向键微调（`Alt` 或 `Shift` 更细 / 更大步长）；
     * 多边形模式：单击加点、右键或双击闭合；开启「孔洞」后画的是孔洞；
-    * 掩码模式：画笔涂抹、橡皮擦除，`生成轮廓` 把掩码转成多边形实例。
+    * 掩码模式：画笔涂抹、橡皮擦除，`生成轮廓` 把掩码转成多边形实例；
+    * 右上角常驻显示按钮（放大 / 缩小 / 适应窗口 / 原始大小），
+      光标处像素信息固定在窗口**右下角**，右键弹出图像操作菜单。
 """
 
 from __future__ import annotations
 
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -29,10 +31,15 @@ from PySide6.QtWidgets import (
     QGraphicsRectItem,
     QGraphicsScene,
     QGraphicsView,
+    QHBoxLayout,
+    QWidget,
 )
+from qfluentwidgets import Action, RoundMenu, TransparentToolButton
 
 from src.models.annotation import BOX, POLYGON, TEXT, Annotation
 from src.utils.geometry import area, merge_holes, rotate, translate
+from src.views.ui import icon
+from src.views.ui import tokens as T
 
 MODE_BROWSE = "browse"
 MODE_BOX = "box"
@@ -45,6 +52,9 @@ _FALLBACK_COLOR = "#66CCFF"
 _NUDGE_PIXELS = {"normal": 1.0, "fine": 0.2, "coarse": 10.0}
 # 掩码上过小的连通域直接丢弃（图片面积的比例；归一化面积本身即占比）
 _MIN_MASK_AREA = 0.00001
+# 右上角显示按钮（HUD）：画布背景恒为深色，图标固定用白色（不随主题）
+_HUD_ICON_COLOR = "#FFFFFF"
+_HUD_MARGIN = 8
 
 
 class AnnotationCanvas(QGraphicsView):
@@ -61,6 +71,8 @@ class AnnotationCanvas(QGraphicsView):
     editFinished = Signal(str)                 # 编辑结束（参数为动作名）
     viewChanged = Signal()                     # 视口/缩放变化（供导航器同步）
     maskChanged = Signal()                     # 掩码内容变化
+    saveImageRequested = Signal()              # 右键菜单：另存当前图像
+    openImageFolderRequested = Signal()        # 右键菜单：打开图像所在位置
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -88,6 +100,8 @@ class AnnotationCanvas(QGraphicsView):
         self._shapes: list = []
         self._selected = -1
         self._selection: list[int] = []
+        # 画完一个对象后，待「标注回填」时自动选中的索引（连续绘制的关键体验）
+        self._pending_select: int | None = None
 
         # 交互中间态
         self._panning = False
@@ -123,6 +137,34 @@ class AnnotationCanvas(QGraphicsView):
         self._region_opacity = 50
         self._wheel_inverted = False
         self._show_pixel = True
+
+        # 右上角显示按钮（放大 / 缩小 / 适应窗口 / 原始大小）：
+        # 常用显示操作贴在图像窗口右上角（参照主流图片查看器）
+        self._hud = QWidget(self.viewport())
+        self._hud.setObjectName("canvasHud")
+        self._hud.setStyleSheet(
+            "#canvasHud { background: rgba(0, 0, 0, 0.38);"
+            " border-radius: 6px; }"
+        )
+        hud_layout = QHBoxLayout(self._hud)
+        hud_layout.setContentsMargins(
+            T.SPACE_XXS, T.SPACE_XXS, T.SPACE_XXS, T.SPACE_XXS
+        )
+        hud_layout.setSpacing(T.SPACE_XXS)
+        for name, tip, slot in (
+            ("zoom-out", "缩小", self.zoom_out),
+            ("zoom-in", "放大", self.zoom_in),
+            ("fit", "适应窗口", self.fit_to_view),
+            ("actual-size", "原始大小", self.actual_size),
+        ):
+            button = TransparentToolButton(self._hud)
+            button.setIcon(icon(name, color=_HUD_ICON_COLOR))
+            button.setIconSize(QSize(T.ICON_GLYPH_SM, T.ICON_GLYPH_SM))
+            button.setFixedSize(T.ICON_BTN_MD, T.ICON_BTN_MD)
+            button.setToolTip(tip)
+            button.clicked.connect(slot)
+            hud_layout.addWidget(button)
+        self._place_hud()
 
     # -----------------------------------------------------------
     # 显示选项
@@ -211,6 +253,7 @@ class AnnotationCanvas(QGraphicsView):
             return 0
         self.clear_mask()
         for points in polygons:
+            self._pending_select = len(self._items)
             self.annotationAdded.emit(self._pending_class, POLYGON, points)
         return len(polygons)
 
@@ -449,7 +492,13 @@ class AnnotationCanvas(QGraphicsView):
             return image
 
     def set_annotations(self, items: list) -> None:
-        """重建标注图形。"""
+        """重建标注图形。
+
+        刚画完新对象时（`_pending_select` 已登记）把它自动设为选中项，
+        使「画 → 调角度 / 改类别 / 微调」不用再手点一次，也便于连续绘制。
+        """
+        pending = self._pending_select
+        self._pending_select = None
         for shape in self._shapes:
             self._scene.removeItem(shape)
         self._shapes = []
@@ -461,6 +510,9 @@ class AnnotationCanvas(QGraphicsView):
             shape = self._make_shape(item)
             self._scene.addItem(shape)
             self._shapes.append(shape)
+        if pending is not None and 0 <= pending < len(self._items):
+            self.select_many([pending], primary=pending)
+            return
         self._apply_selection()
         self.selectionListChanged.emit([])
 
@@ -493,6 +545,10 @@ class AnnotationCanvas(QGraphicsView):
     def selection(self) -> list[int]:
         """当前选中的全部标注索引。"""
         return list(self._selection)
+
+    def selected_index(self) -> int:
+        """主选中索引（-1 表示无选中）。"""
+        return self._selected
 
     def set_selected_points(self, index: int, points: list) -> bool:
         """直接设置某个标注的点列（数值编辑用）。"""
@@ -655,18 +711,43 @@ class AnnotationCanvas(QGraphicsView):
     def _to_polygon_points(points: list) -> list:
         return [QPointF(x, y) for x, y in points]
 
+    @staticmethod
+    def _square_rect(start: QPointF, current: QPointF) -> QRectF:
+        """起点到光标构成的矩形约束为正方形（Shift 绘制，按较长边取齐）。"""
+        dx = current.x() - start.x()
+        dy = current.y() - start.y()
+        side = max(abs(dx), abs(dy))
+        end = QPointF(
+            start.x() + (side if dx >= 0 else -side),
+            start.y() + (side if dy >= 0 else -side),
+        )
+        return QRectF(start, end).normalized()
+
     # -----------------------------------------------------------
     # 鼠标 / 键盘
     # -----------------------------------------------------------
     def showEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         super().showEvent(event)
+        self._place_hud()
         if self._auto_fit:
             QTimer.singleShot(0, self._fit)
 
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         super().resizeEvent(event)
+        self._place_hud()
         if self._auto_fit:
             QTimer.singleShot(0, self._fit)
+
+    def _place_hud(self) -> None:
+        """把右上角显示按钮（HUD）贴到视口右上角。"""
+        hud = getattr(self, "_hud", None)
+        if hud is None:
+            return
+        hud.adjustSize()
+        hud.move(
+            max(0, self.viewport().width() - hud.width() - _HUD_MARGIN),
+            _HUD_MARGIN,
+        )
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         position = event.position().toPoint()
@@ -767,7 +848,11 @@ class AnnotationCanvas(QGraphicsView):
             self._band_item.setRect(QRectF(self._start, scene_pos).normalized())
             return
         if self._drawing and self._rubber is not None and self._start is not None:
-            self._rubber.setRect(QRectF(self._start, scene_pos).normalized())
+            # Shift 约束为正方形（按较长边取齐），与多数标注工具一致
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                self._rubber.setRect(self._square_rect(self._start, scene_pos))
+            else:
+                self._rubber.setRect(QRectF(self._start, scene_pos).normalized())
         elif self._mode == MODE_POLYGON and self._poly_points and self._poly_preview:
             self._poly_preview.setPolygon(
                 QPolygonF(self._poly_points + [scene_pos])
@@ -806,6 +891,7 @@ class AnnotationCanvas(QGraphicsView):
             if rect.width() >= _MIN_SIZE and rect.height() >= _MIN_SIZE:
                 points = self._to_normalized([rect.topLeft(), rect.bottomRight()])
                 kind = TEXT if self._mode == MODE_TEXT else BOX
+                self._pending_select = len(self._items)
                 self.annotationAdded.emit(self._pending_class, kind, points)
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802 - Qt 命名
@@ -823,6 +909,31 @@ class AnnotationCanvas(QGraphicsView):
         self.scale(factor, factor)
         self.viewChanged.emit()
 
+    def contextMenuEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        """图像窗口右键菜单：显示操作 + 图像另存 / 打开所在位置。
+
+        绘制中（多边形取点 / 拖框）右键用于闭合或取消，不弹菜单。
+        """
+        if self._poly_points or self._drawing:
+            return
+        menu = RoundMenu(parent=self)
+        menu.addAction(Action("放大", triggered=self.zoom_in))
+        menu.addAction(Action("缩小", triggered=self.zoom_out))
+        menu.addAction(Action("适应窗口", triggered=self.fit_to_view))
+        menu.addAction(Action("原始大小", triggered=self.actual_size))
+        if self._img_w:
+            menu.addSeparator()
+            # 注意：triggered 会带一个 checked 参数，必须用 lambda 吞掉，
+            # 直接把 Signal.emit 当槽会因多一个参数抛 TypeError
+            menu.addAction(Action(
+                "另存图像为…", triggered=lambda: self.saveImageRequested.emit()
+            ))
+            menu.addAction(Action(
+                "打开文件所在位置",
+                triggered=lambda: self.openImageFolderRequested.emit(),
+            ))
+        menu.exec(event.globalPos())
+
     def leaveEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         self._cursor_scene = None
         self.viewport().update()
@@ -835,6 +946,14 @@ class AnnotationCanvas(QGraphicsView):
         super().drawForeground(painter, rect)
         if not self._img_w or self._cursor_scene is None:
             return
+        if self._drawing and self._rubber is not None:
+            # 绘制中实时显示新对象的像素尺寸（矩形 / 文本框）
+            box = self._rubber.rect()
+            self._draw_badge(
+                painter,
+                QPointF(box.right() + 8, box.bottom() + 8),
+                f"{int(round(box.width()))} × {int(round(box.height()))}",
+            )
         if self._crosshair:
             alpha = int(255 * self._crosshair_opacity / 100)
             pen = QPen(QColor(255, 255, 255, alpha), 1, Qt.PenStyle.DashLine)
@@ -843,21 +962,45 @@ class AnnotationCanvas(QGraphicsView):
             x, y = self._cursor_scene.x(), self._cursor_scene.y()
             painter.drawLine(QPointF(x, 0.0), QPointF(x, float(self._img_h)))
             painter.drawLine(QPointF(0.0, y), QPointF(float(self._img_w), y))
-        if self._show_pixel:
-            text = self._pixel_text()
-            if not text:
-                return
-            painter.setPen(QPen(QColor("#FFFFFF"), 1))
-            font = painter.font()
-            font.setPointSizeF(max(7.5, font.pointSizeF() - 1.0))
-            painter.setFont(font)
-            metrics = painter.fontMetrics()
-            box = QRectF(
-                self._cursor_scene.x() + 8, self._cursor_scene.y() + 8,
-                metrics.horizontalAdvance(text) + 10, metrics.height() + 4,
-            )
-            painter.fillRect(box, QColor(0, 0, 0, 170))
-            painter.drawText(box, Qt.AlignmentFlag.AlignCenter, text)
+        if not self._show_pixel:
+            return
+        text = self._pixel_text()
+        if not text:
+            return
+        # 像素信息固定在视口**右下角**：切回视口坐标绘制（不随缩放放大，
+        # 也不遮挡光标附近的图像内容）
+        painter.save()
+        painter.resetTransform()
+        font = painter.font()
+        font.setPointSizeF(max(7.5, font.pointSizeF() - 1.0))
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        box_w = metrics.horizontalAdvance(text) + 12
+        box_h = metrics.height() + 6
+        box = QRectF(
+            max(0.0, self.viewport().width() - box_w - _HUD_MARGIN),
+            max(0.0, self.viewport().height() - box_h - _HUD_MARGIN),
+            box_w, box_h,
+        )
+        painter.setPen(QPen(QColor("#FFFFFF"), 1))
+        painter.fillRect(box, QColor(0, 0, 0, 170))
+        painter.drawText(box, Qt.AlignmentFlag.AlignCenter, text)
+        painter.restore()
+
+    @staticmethod
+    def _draw_badge(painter, anchor: QPointF, text: str) -> None:
+        """在场景坐标 anchor 处绘制黑底白字的小标签（像素值 / 绘制尺寸）。"""
+        painter.setPen(QPen(QColor("#FFFFFF"), 1))
+        font = painter.font()
+        font.setPointSizeF(max(7.5, font.pointSizeF() - 1.0))
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        box = QRectF(
+            anchor.x(), anchor.y(),
+            metrics.horizontalAdvance(text) + 10, metrics.height() + 4,
+        )
+        painter.fillRect(box, QColor(0, 0, 0, 170))
+        painter.drawText(box, Qt.AlignmentFlag.AlignCenter, text)
 
     def _pixel_text(self) -> str:
         """光标处的像素值（灰度 / RGB）。"""
@@ -903,6 +1046,23 @@ class AnnotationCanvas(QGraphicsView):
         self._auto_fit = True
         self._fit()
 
+    def zoom_in(self) -> None:
+        """放大一档（与滚轮 / `Ctrl + =` 同档位）。"""
+        self._zoom_by(1.15)
+
+    def zoom_out(self) -> None:
+        """缩小一档。"""
+        self._zoom_by(1 / 1.15)
+
+    def actual_size(self) -> None:
+        """原始大小（100%）：1 场景单位 = 1 屏幕像素。"""
+        if self._pixmap_item is None:
+            return
+        self._auto_fit = False
+        self.resetTransform()
+        self.centerOn(self._pixmap_item)
+        self.viewChanged.emit()
+
     def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         key = event.key()
         mods = event.modifiers()
@@ -910,6 +1070,14 @@ class AnnotationCanvas(QGraphicsView):
         alt = bool(mods & Qt.KeyboardModifier.AltModifier)
         shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
 
+        # 多边形绘制中：Backspace 退掉最后一个顶点（先退点、没有点时才是删除）
+        if (
+            key == Qt.Key.Key_Backspace
+            and self._mode == MODE_POLYGON
+            and self._poly_points
+        ):
+            self._undo_polygon_point()
+            return
         if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
             if self._selected >= 0 or self._selection:
                 self.deleteRequested.emit()
@@ -986,6 +1154,19 @@ class AnnotationCanvas(QGraphicsView):
             return
         self.select_many([])
 
+    def _undo_polygon_point(self) -> None:
+        """撤掉多边形正在绘制的最后一个顶点（Backspace）。"""
+        if not self._poly_points:
+            return
+        self._poly_points.pop()
+        if self._poly_preview is None:
+            return
+        if self._poly_points:
+            self._poly_preview.setPolygon(QPolygonF(self._poly_points))
+        else:
+            self._scene.removeItem(self._poly_preview)
+            self._poly_preview = None
+
     def _finish_polygon(self) -> None:
         points = list(self._poly_points)
         self._poly_points.clear()
@@ -998,8 +1179,10 @@ class AnnotationCanvas(QGraphicsView):
         if self._hole_mode:
             # 孔洞：并入当前选中的实例
             if not self.apply_hole(normalized):
+                self._pending_select = len(self._items)
                 self.annotationAdded.emit(self._pending_class, POLYGON, normalized)
             return
+        self._pending_select = len(self._items)
         self.annotationAdded.emit(self._pending_class, POLYGON, normalized)
 
     def _shape_index_at(self, scene_pos: QPointF) -> int:
