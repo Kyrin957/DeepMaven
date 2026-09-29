@@ -219,15 +219,21 @@ $env:QT_QPA_PLATFORM="offscreen"
 ## 11. 显示调试栏：图像页统一的右侧图标栏（DisplayDock）
 
 - 图像导入 / 图像标注 / 标注检查三页的**显示调试**（亮度、对比度、类别名叠加、
-  缩略图尺寸、复位）统一收在窗口**最右侧**的 `DisplayDock`（参照 Halcon DLT
+  缩略图尺寸）统一收在窗口**最右侧**的 `DisplayDock`（参照 Halcon DLT
   的右侧图标栏），不再用横向「显示条」占一行；说明文字按 §10 走 tooltip。
 - 交互形态固定为「**竖直图标按钮 + 点击弹出 Flyout 悬浮面板**」：
-  图标取 FluentIcon（亮度 `BRIGHTNESS` / 对比度 `CONSTRACT` / 类别名 `FONT` /
-  缩略图尺寸 `ZOOM` / 复位 `SYNC`），含义写在按钮 tooltip；
-  面板里只放滑杆 + 读数，调节实时生效、只影响显示不改动图片。
-- 图标按钮取 `ICON_BTN_LG`（32）、图标绘制边长 `ICON_GLYPH_LG`（20）——
-  qfluentwidgets ToolButton 默认图标只有 16px，在侧栏里显小，必须显式放大；
-  栏宽 = 按钮边长 + 两侧 `SPACE_XS`。
+  图标取 FluentIcon（亮度 `BRIGHTNESS` / 对比度 `CONSTRACT` /
+  缩略图尺寸 `ZOOM`），含义写在按钮 tooltip；面板里只放滑杆 + 读数，
+  调节实时生效、只影响显示不改动图片。
+- 按钮**与栏等宽**（`DOCK_W = 40`，栏内零左右边距、整块可点，参照 Halcon DLT），
+  图标绘制边长 `DOCK_GLYPH = 24`；qfluentwidgets ToolButton 默认图标只有 16px，
+  在侧栏里显小，必须显式放大。
+- 面板滑杆一律用 **`TickedSlider`**（轨道上绘制**可点击刻度**）：
+  点击刻度**精确跳到该值**——亮度 / 对比度刻度为 `-100 / -50 / 0 / 50 / 100`；
+  缩略图尺寸每个档位一个刻度。
+- 复原刻度（亮度 / 对比度的 `0`）画成**主题色竖线**（`emphasis` 参数），命中
+  范围也比普通刻度更大——它替代「复位」按钮，必须醒目、好点；档位刻度保持
+  小圆点，两类样式刻意区分。
 - 新增显示类调试项时**扩展 `DisplayDock`**，不要再回页面里加横条。
 - 使用方式：
 
@@ -238,3 +244,90 @@ $env:QT_QPA_PLATFORM="offscreen"
   self.display_dock.set_thumb_steps(THUMB_STEPS)           # 与网格档位一致
   self.display_dock.changed.connect(self._apply_display)   # 下发到网格 / 画布
   ```
+
+## 12. 耗时操作：置顶进度弹窗（BusyPopup）
+
+- 预计可能超过 ~150ms 的**同步**操作（批量重算、全量重绘、尺寸档位切换、
+  大图显示增强等）必须用 `BusyPopup` 报进度：
+
+  ```python
+  from src.views.ui import BusyPopup
+
+  with BusyPopup.scope(self.window(), "正在应用显示效果") as busy:
+      for position, item in enumerate(items):
+          ...
+          busy.step(position + 1, len(items))   # 刷新进度 + 保持界面重绘
+  ```
+
+- `BusyPopup` 已内建三条体验约束，**不要绕过**：
+  - **延迟显示**（`SHOW_DELAY_MS = 150`）：快操作不闪现；
+  - **`step()` 只处理重绘、不处理用户输入**
+    （`processEvents(ExcludeUserInputEvents)`）：界面不死、也不会因点击重入；
+  - 无边框 / 置顶 / 不抢焦点（Tool），显示时自动居中于父窗口。
+- 显示类参数（亮度 / 对比度 / 缩略图尺寸）**走 `DisplayDock` 的去抖广播**
+  （~80ms）：滑杆与读数即时响应，重活停稳后只做一次；不要在 `valueChanged`
+  里直接做重活，需要同步生效时用 `display_dock.flush()`。
+- 后台任务（训练 / 推理 / 导出）继续用 worker 进程 + 页面内进度条，
+  不用本组件。
+- 参考接入点：`ThumbnailGrid.set_thumb_size`（尺寸切换）、
+  `ThumbnailGrid.prewarm_visible`（显示增强预热）、画布显示增强下发。
+
+## 13. 缩略图角标与标签（点亮即展开）
+
+- 缩略图上有两个**可点击标签**（参照 Halcon DLT），点击**任一**同类标签会对
+  **全部图像**生效（全局开关）：
+
+  | 位置 | 收起态 | 展开态 | 数据 |
+  |------|--------|--------|------|
+  | 图片右上角 | 已标注三角（类别色） | 类别名胶囊 | `_CLASS_ROLE`（`classnames`） |
+  | 图片右下角 | T / V / E 字母方块 | 「训练 / 验证 / 测试」胶囊 | `_SUBSET_ROLE`（SPLIT_COLORS） |
+
+- **展开前后位置必须一致**：展开态胶囊由
+  `_tag_rect(thumb_rect, scale, corner, text)` 计算——**右对齐**、贴图片框
+  右上 / 右下角内侧，与收起态角标同一 inset；**不得**改动卡片尺寸
+  （不追加高度、不触发 `doItemsLayout` 重排）。
+- **胶囊长度与文字相符**：宽度 = **int 字体度量**（`QFontMetrics`，与绘制端
+  `painter.fontMetrics()` 同源）文字宽 + 2 × 留白（`_TAG_PAD_H`，下限
+  `_TAG_MIN_PAD`）+ 容差 `_TAG_SLACK`（2px）；超长才限流到 `_TAG_MAX_RATIO`。
+  字体取 `_tag_font(scale)`（绘制与度量共用）。**禁止固定比例宽度**——
+  短文字会被拖长、长文字会不足。
+- **禁止对自适应宽度的文字无条件省略**：`_paint_tag` 只在
+  `int 度量文字宽 > 可见宽` 时才 `elidedText`。float 度量（`QFontMetricsF`）
+  与 int 度量在字体 hinting 下会差 ~1px，无条件省略会把「刚好放得下」的
+  文字整段退化成 `…`（历史故障，见 `开发文档.md` §4.24）。
+- **绘制与命中检测共用同一几何**（`class_hit_rect` / `subset_hit_rect` /
+  `_tag_rect`），命中区略放大 3~4px，保证「点哪儿亮哪儿」。
+- 悬停时各自给专属 tooltip（「类别：缺陷（点击展开全部标签）」/
+  「数据集：train（训练）（……）」），标签以外按 §10 走整卡提示。
+- 新增同类角标时扩展 `ThumbnailDelegate` 并按本标准接入，不要在页面里另画。
+
+## 14. 未保存保护：关闭 / 切换前必须询问
+
+- **凡会让未保存内容离开编辑现场的操作**（退出程序、关闭项目、打开 / 新建 /
+  恢复项目），一律先经 `MainWindow._confirm_unsaved(action)`：有未保存 →
+  弹「保存 / 不保存 / 取消」三选（`views/dialogs/unsaved_dialog.py` 的
+  `ask_unsaved_changes`）；无未保存 → 直接放行。
+  **禁止静默保存或静默丢弃。**
+- 判断口径 `_has_unsaved_changes()`：项目容器 `dirty` **或** 当前图片标注
+  未保存（`annotate_tab.has_unsaved()`）——两层都要覆盖。
+- 「取消」必须真正中止操作：`closeEvent` 里 `e.ignore()`；项目页 `return`。
+  关闭窗口 / Esc 一律视为「取消」（安全默认）。
+- 新增"替换当前项目"的入口时，必须接 `ProjectTab._unsaved_guard(action)`；
+  删除类操作至少用 `ProjectTab._is_dirty()` 给出提醒。
+- 保存动作统一走 `_save_all_pending()`（标注冲刷 + 项目落盘），不要各处
+  自行拼装。参考实现：`main_window.py::_confirm_unsaved`。
+
+## 15. 图像页侧栏结构（标注页与图库页同构）
+
+- **图库导入 / 图像标注两页的左侧栏承载同一组「图像管理」卡片**：
+  图像（名称 + 前后切换）/ 标签类别（`ClassCard`）/ 数据集拆分
+  （`SplitMapCard`）/ 图像标记（`TagCard`）——一律复用 `data_widgets` /
+  `gallery_widgets` 既有组件，不要在页面里重画一套。
+- 卡片对**所选图像集合**生效：图库页 = 网格选中集合；标注页 = 当前图片。
+  写操作统一走 `DatasetViewModel` 的 `set_class_for / set_split_for /
+  toggle_image_tag / add_image_tag / update_image_tag / remove_image_tag`。
+- 标注页**右侧**固定为画布辅助（导航器 / 标注对象 / 编辑 / 备注），最右是
+  DisplayDock（§11）；标注页不重复放「图像管理」类卡片。
+- 新增「图像管理」卡片时两页同步接入，保持结构一致。
+- 状态刷新统一走页面 `_refresh_side()`（切图 / 清单变化 / 数据集与类别变化
+  后调用），无数据集时空操作返回。
