@@ -94,9 +94,12 @@ def to_entry_id(data: bytes) -> str:
 class ProjectContainer:
     """一个 .mprj 容器：持有原始字节与反序列化后的 Project。"""
 
-    def __init__(self, data: bytes, project: Project):
+    def __init__(self, data: bytes, project: Project, zip_sha256: str = ""):
         self.data = data
         self.project = project
+        # ZIP 载荷哈希（打开 / 打包时已算过）：自动备份重打包时复用，
+        # 避免对几百 MB 的载荷再做一次哈希
+        self.zip_sha256 = zip_sha256
 
     # -----------------------------------------------------------
     # 构建
@@ -104,8 +107,8 @@ class ProjectContainer:
     @classmethod
     def create(cls, project: Project, files: dict[str, bytes] | None = None) -> "ProjectContainer":
         """从 Project 构建新容器（files 为 entry_id -> 字节，可为空）。"""
-        data = cls._pack(project, files or {})
-        return cls(data, project)
+        data, zip_sha = cls._pack(project, files or {})
+        return cls(data, project, zip_sha)
 
     # -----------------------------------------------------------
     # 解析
@@ -147,11 +150,12 @@ class ProjectContainer:
         # 容器级完整性：校验整个 ZIP 载荷（含头部/校验字段）哈希
         zip_bytes = data[manifest_end:]
         embedded = raw_dict.pop("__container_sha256", "")
-        if sha256_bytes(zip_bytes) != embedded:
+        zip_sha = sha256_bytes(zip_bytes)
+        if zip_sha != embedded:
             raise ProjectFormatError("项目文件完整性校验失败（已被篡改或损坏）")
 
         project = Project.from_dict(raw_dict)
-        container = cls(data, project)
+        container = cls(data, project, zip_sha)
 
         # 校验归档内每条文件哈希
         if verify:
@@ -182,8 +186,34 @@ class ProjectContainer:
             entry_ids = {f.entry_id for f in project.files}
             for entry_id in entry_ids:
                 files[entry_id] = zf.read(entry_id)
-        data = self._pack(project, files)
-        return ProjectContainer(data, project)
+        data, zip_sha = self._pack(project, files)
+        return ProjectContainer(data, project, zip_sha)
+
+    # -----------------------------------------------------------
+    # 自动备份：清单重打包（ZIP 载荷字节复用，不重压缩）
+    # -----------------------------------------------------------
+    @staticmethod
+    def pack_with_manifest(
+        source_data: bytes, manifest: dict, zip_sha256: str = ""
+    ) -> bytes:
+        """按快照清单重打包一份 .mprj 字节（ZIP 载荷字节级复用）。
+
+        自动备份专用：文件的归档字节总是先于清单落盘（`add_files` 即时
+        写回），因此备份只需替换清单段——**不解压、不重新压缩**归档条目
+        （历史实现走 `rebuild` 全量重压缩，几百 MB 项目会冻结界面数秒）。
+        输入均为不可变数据（源字节 + 主线程备好的清单字典），可在后台
+        线程调用。
+
+        Args:
+            source_data: 现有 .mprj 字节（用内存容器的 `data`）。
+            manifest: 主线程快照的 ``project.to_dict()``。
+            zip_sha256: 源 ZIP 载荷哈希（``ProjectContainer.zip_sha256``；
+                未缓存时现算）。
+        """
+        manifest_len = _HEADER.unpack_from(source_data, 0)[4]
+        zip_bytes = source_data[_HEADER_SIZE + manifest_len:]
+        sha = zip_sha256 or sha256_bytes(zip_bytes)
+        return ProjectContainer._assemble(zip_bytes, manifest, sha)
 
     # -----------------------------------------------------------
     # 文件读取
@@ -221,8 +251,12 @@ class ProjectContainer:
         return zipfile.ZipFile(io.BytesIO(zip_bytes), "r")
 
     @staticmethod
-    def _pack(project: Project, files: dict[str, bytes]) -> bytes:
-        """将 Project 与文件字节打包为完整 .mprj 字节序列。"""
+    def _pack(project: Project, files: dict[str, bytes]) -> tuple[bytes, str]:
+        """将 Project 与文件字节打包为完整 .mprj 字节序列。
+
+        Returns:
+            (完整字节, ZIP 载荷哈希)——哈希供自动备份重打包复用。
+        """
         # ZIP 载荷
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -231,11 +265,20 @@ class ProjectContainer:
                 info.compress_type = zipfile.ZIP_DEFLATED
                 zf.writestr(info, content)
         zip_bytes = buf.getvalue()
+        zip_sha = sha256_bytes(zip_bytes)
+        return ProjectContainer._assemble(
+            zip_bytes, project.to_dict(), zip_sha
+        ), zip_sha
 
+    @staticmethod
+    def _assemble(zip_bytes: bytes, manifest: dict, zip_sha256: str) -> bytes:
+        """把 ZIP 载荷与清单组装为完整 .mprj 字节（清单加密 + 文件头）。"""
         # 容器级完整性：把 ZIP 载荷哈希写入清单，打开时校验
-        manifest = project.to_dict()
-        manifest["__container_sha256"] = sha256_bytes(zip_bytes)
-        manifest_plain = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
+        payload = dict(manifest)
+        payload["__container_sha256"] = zip_sha256
+        manifest_plain = json.dumps(
+            payload, ensure_ascii=False, indent=2
+        ).encode("utf-8")
         manifest_cipher = encrypt_manifest(manifest_plain)
 
         flags = FLAG_MANIFEST_ENCRYPTED

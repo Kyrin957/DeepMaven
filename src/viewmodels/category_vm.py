@@ -158,15 +158,11 @@ class CategoryViewModel(QObject):
         return project
 
     def _commit(self, text: str) -> None:
-        """标记改动并即时保存，然后广播变更。"""
+        """登记改动（未保存，随「保存项目」/ 退出询问统一落盘）并广播变更。"""
         project = self._project()
-        project.touch()
-        try:
-            self._project_vm.service.save(project)
-        except (OSError, ValueError) as exc:
-            logger.warning("保存类别失败: %s", exc)
-            self.message.emit("error", f"保存类别失败：{exc}")
+        if project is None:
             return
+        project.touch()
         self.classesChanged.emit(list(project.classes))
         self._project_vm.notify_changed()
         self.message.emit("success", text)

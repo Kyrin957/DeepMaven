@@ -86,6 +86,7 @@ from src.views import (
 )
 from src.views.dialogs.preferences_dialog import PreferencesDialog
 from src.views.dialogs.shortcut_dialog import ShortcutDialog
+from src.views.dialogs.backup_dialog import ask_backup_version
 from src.views.dialogs.unsaved_dialog import ask_unsaved_changes
 from src.views.shortcuts import ShortcutManager
 from src.views.ui import tokens as T
@@ -121,6 +122,19 @@ class MainWindow(FluentWindow):
         # 导出页要读评估结果来生成模型报告，因此把评估 ViewModel 传入
         self.export_vm = ExportViewModel(self.project_vm, self.evaluate_vm, self)
 
+        # 未保存状态：窗口标题加 ● 前缀（改动后实时可见，保存 / 丢弃后消失）
+        self._base_title = self.windowTitle()
+        for signal in (
+            self.project_vm.projectChanged,
+            self.dataset_vm.datasetChanged,
+            self.category_vm.classesChanged,
+            self.annotate_vm.dirtyChanged,
+            self.train_vm.configChanged,
+            self.evaluate_vm.configChanged,
+            self.export_vm.configChanged,
+        ):
+            signal.connect(lambda *_: self._refresh_title())
+
         # 隐藏导航栏顶部的「返回」后退按钮
         self.navigationInterface.setReturnButtonVisible(False)
         # 把导航栏的「展开/收起」按钮放进导航栏内（避开顶部标题栏区域）
@@ -144,9 +158,6 @@ class MainWindow(FluentWindow):
         self.setAcceptDrops(True)
         # 应用已保存的偏好设置（十字准线、区域不透明度、滚轮方向等）
         self._apply_preferences()
-        self.project_vm.recoverableChanged.emit(
-            self.project_vm.recoverable_projects()
-        )
 
         # 统一消息提示
         self._wire_messages()
@@ -434,6 +445,10 @@ class MainWindow(FluentWindow):
         # 未保存改动处理（打开 / 新建 / 恢复 / 关闭项目前的询问与保存）
         self.project_tab.set_unsaved_handler(
             self._has_unsaved_changes, self._confirm_unsaved
+        )
+        # 打开项目时若存在异常退出残留的自动备份：人工对比时间、选择版本
+        self.project_vm.set_backup_prompt(
+            lambda info: ask_backup_version(self, info)
         )
         self._add_page(PAGE_PROJECT, self.project_tab, FluentIcon.FOLDER, "项目管理")
 
@@ -770,21 +785,34 @@ class MainWindow(FluentWindow):
     # -----------------------------------------------------------
     # 未保存改动（关闭 / 切换前的询问与保存）
     # -----------------------------------------------------------
+    def _refresh_title(self) -> None:
+        """窗口标题按未保存状态加 ● 前缀（界面建齐前调用则跳过）。"""
+        if not hasattr(self, "project_tab") or not hasattr(self, "annotate_tab"):
+            return
+        dirty = self._has_unsaved_changes()
+        self.setWindowTitle(("● " if dirty else "") + self._base_title)
+
     def _has_unsaved_changes(self) -> bool:
-        """是否有未保存内容（项目容器 + 当前图片标注）。"""
+        """是否有未保存内容（项目容器 + 项目页输入框 + 标注）。"""
         project = self.project_vm.project
         return bool(
             (project is not None and project.dirty)
+            or self.project_tab.has_pending_edits()
             or self.annotate_tab.has_unsaved()
         )
 
     def _save_all_pending(self) -> bool:
-        """保存全部未保存内容（当前标注 + 项目容器）；返回项目是否保存成功。"""
+        """保存全部未保存内容（当前标注 + 项目页输入框 + 项目容器）。
+
+        返回是否全部保存成功；失败时调用方应中止关闭，避免静默丢数据。
+        """
         self.annotate_tab.flush_pending()
+        self.project_tab.commit_edits()   # 输入框里的名称 / 说明先写回项目对象
         project = self.project_vm.project
         if project is not None and project.dirty:
-            return bool(self.project_vm.save_project())
-        return True
+            if not self.project_vm.save_project():
+                return False
+        return not self.annotate_tab.has_unsaved()
 
     def _confirm_unsaved(self, action: str) -> bool:
         """关闭 / 切换前处理未保存改动；返回是否允许继续（False = 取消）。
@@ -798,7 +826,8 @@ class MainWindow(FluentWindow):
         if choice == "cancel":
             return False
         if choice == "save":
-            self._save_all_pending()
+            if not self._save_all_pending():
+                return False          # 保存失败：中止本次关闭，避免静默丢数据
         return True
 
     def _close_project(self) -> None:
@@ -874,5 +903,9 @@ class MainWindow(FluentWindow):
         if not self._confirm_unsaved("退出程序"):
             e.ignore()
             return
+        # 人工已决策（保存 / 丢弃）：正常退出不留自动备份——先等在途写盘
+        # 收尾再清理（避免线程随后又写出 .bak）；残留只可能来自异常退出
+        self.project_vm.shutdown_backup()
+        self.project_vm.discard_current_backup()
         logger.info("应用退出")
         super().closeEvent(e)

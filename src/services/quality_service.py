@@ -116,20 +116,57 @@ class QualityService:
         return result
 
     # -----------------------------------------------------------
-    # 标签校验
+    # 标签校验（按任务差异）
     # -----------------------------------------------------------
-    @staticmethod
-    def check_labels(images: list, label_index: dict) -> dict:
-        """校验 YOLO 标签：空文件、坐标越界、缺失标签、孤立标签。
+    # 各类任务的 YOLO 行规格（每行「类别 + 坐标值」允许的坐标值个数）：
+    #   detect / ocr —— 4 值（cx cy w h；OCR 主标签同为文本框）
+    #   obb —— 4 值（未旋转）或 8 值（旋转后为四角点，见画布 rotate_selected）
+    #   segment / semantic —— 4 值（退化矩形）或 ≥6 且偶数（多边形点列）
+    #   classify / anomaly —— 无 YOLO 标签体系（类别由目录 / 用户标记决定）
+    _FIXED_COORDS: dict[str, tuple[int, ...]] = {
+        "detect": (4,),
+        "ocr": (4,),
+        "obb": (4, 8),
+    }
+    # 多边形类任务：坐标值个数为 4 或 ≥6 的偶数
+    _POLYGON_TASKS: tuple[str, ...] = ("segment", "semantic")
+    # 无 YOLO 标签体系的任务（整图任务）：跳过标签校验，避免全量误报
+    _NO_LABEL_TASKS: tuple[str, ...] = ("classify", "anomaly")
+
+    @classmethod
+    def coord_count_ok(cls, task: str, count: int) -> bool:
+        """某一行的坐标值个数是否符合任务的 YOLO 行规格。"""
+        allowed = cls._FIXED_COORDS.get(task)
+        if allowed is not None:
+            return count in allowed
+        if task in cls._POLYGON_TASKS:
+            return count == 4 or (count >= 6 and count % 2 == 0)
+        # 未知任务按检测口径（4 值）兜底
+        return count == 4
+
+    @classmethod
+    def check_labels(
+        cls, images: list, label_index: dict, task: str = "detect"
+    ) -> dict:
+        """按任务校验 YOLO 标签：空文件、行规格、坐标越界、缺失 / 孤立标签。
 
         Args:
             images: 图片路径列表。
             label_index: {图片文件名主干: 标签路径}。
+            task: 项目任务（detect / obb / segment / semantic / ocr /
+                classify / anomaly）。分类与异常检测没有每图 .txt 标签
+                （类别由目录 / 用户标记决定），跳过校验并置 `skipped`。
 
         Returns:
-            {"empty": [...], "out_of_range": [...],
-             "missing_label": [...], "orphan_label": [...]}
+            {"empty": [...], "out_of_range": [...], "missing_label": [...],
+             "orphan_label": [...], "skipped": bool}
         """
+        if task in cls._NO_LABEL_TASKS:
+            return {
+                "empty": [], "out_of_range": [], "missing_label": [],
+                "orphan_label": [], "skipped": True,
+            }
+
         empty: list[str] = []
         out_of_range: list[str] = []
         missing_label: list[str] = []
@@ -157,13 +194,23 @@ class QualityService:
                 continue
             for line in lines:
                 parts = line.split()
-                if len(parts) < 5:
-                    out_of_range.append(f"{label}: 字段不足 -> {line}")
+                if len(parts) < 2:
+                    out_of_range.append(f"{label}: 缺少类别字段 -> {line}")
                     continue
                 try:
-                    coords = [float(v) for v in parts[1:5]]
+                    float(parts[0])
+                except ValueError:
+                    out_of_range.append(f"{label}: 类别 ID 非法 -> {line}")
+                    continue
+                try:
+                    coords = [float(v) for v in parts[1:]]
                 except ValueError:
                     out_of_range.append(f"{label}: 数值非法 -> {line}")
+                    continue
+                if not cls.coord_count_ok(task, len(coords)):
+                    # 按任务规格校验整行——detect 重复校验、obb 四角点、
+                    # 多边形点列等；不再只看前两个点
+                    out_of_range.append(f"{label}: 行规格不符 -> {line}")
                     continue
                 if any(v < 0.0 or v > 1.0 for v in coords):
                     out_of_range.append(f"{label}: 坐标越界 -> {line}")
@@ -176,4 +223,5 @@ class QualityService:
             "out_of_range": out_of_range,
             "missing_label": missing_label,
             "orphan_label": orphan_label,
+            "skipped": False,
         }

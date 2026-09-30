@@ -32,7 +32,7 @@ class ConfigManager(QObject):
         "pref/region_opacity": 50,          # 标注区域不透明度 %
         "pref/default_brightness": 0,       # 图像默认亮度
         "pref/default_contrast": 0,         # 图像默认对比度
-        "pref/autosave_seconds": 60,        # 自动保存间隔（秒），0 = 关闭
+        "pref/autosave_seconds": 5,         # 自动备份：改动停手后写入延迟（秒），0 = 关闭
         "pref/show_pixel_value": True,      # 按住 Shift 显示像素值
         "pref/log_backup_count": 10,        # 滚动日志保留份数
         "pref/log_max_mb": 5,               # 单个日志文件上限（MB）
@@ -52,6 +52,26 @@ class ConfigManager(QObject):
         for key, value in defaults.items():
             if not self._settings.contains(key):
                 self._settings.setValue(key, value)
+
+        self._migrate_legacy_preferences()
+
+    def _migrate_legacy_preferences(self) -> None:
+        """一次性偏好迁移（键的语义变更后修正历史落盘值）。
+
+        旧版「自动保存间隔」默认 60（每 60 秒轮询写一次备份），已随
+        「改动停手后延迟写」改为「自动备份延迟」（默认 5）。旧默认值
+        在首次运行时就被写进了 QSettings，改默认不会覆盖——这里把残留
+        的 60 迁移为新默认 5；用户自定义过的其它值保留。
+        """
+        if int(self._settings.value("pref/autosave_migrated", 0) or 0) == 1:
+            return
+        try:
+            seconds = int(self._settings.value("pref/autosave_seconds", 5) or 5)
+        except (TypeError, ValueError):
+            seconds = 5
+        if seconds == 60:
+            self._settings.setValue("pref/autosave_seconds", 5)
+        self._settings.setValue("pref/autosave_migrated", 1)
 
     # -----------------------------------------------------------
     # 通用读写

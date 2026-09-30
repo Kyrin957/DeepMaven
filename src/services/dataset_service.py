@@ -474,6 +474,7 @@ class DatasetService:
         layout: str = "detect",
         kinds: dict | None = None,
         counts: dict | None = None,
+        overrides: dict | None = None,
     ) -> dict[str, list[Path]]:
         """把图片分配到 train / val / test。
 
@@ -485,6 +486,9 @@ class DatasetService:
                 abnormal）；给出时改按类别分配（见 `_allocate_by_kind`），
                 训练集只放良好图。
             counts: 按类别指定的各子集数量（`Split.anomaly_counts`）。
+            overrides: 手工拆分映射（``str(图片)`` → "T" / "V" / "E"）——
+                图库 / 标注页指定的图片**优先**进入对应子集、不再参与比例 /
+                分层分配（与 `subset_labels` 的「手工映射优先」口径一致）。
         """
         import random
 
@@ -494,19 +498,38 @@ class DatasetService:
         if not items:
             return buckets
 
+        # 手工映射先落位；其余图片再按比例 / 分层分配
+        marker_to_sub = {"T": "train", "V": "val", "E": "test"}
+        if overrides:
+            rest: list[Path] = []
+            for item in items:
+                target = marker_to_sub.get(str(overrides.get(str(item), "")))
+                if target is None:
+                    rest.append(item)
+                else:
+                    buckets[target].append(item)
+            items = rest
+            if not items:
+                return buckets
+
         if kinds:
-            return DatasetService._allocate_by_kind(
+            # 异常检测按类别分配；结果与手工映射的固定成员合并
+            allocated = DatasetService._allocate_by_kind(
                 items, kinds, counts or {}, split, seed
             )
+            for sub in SPLIT_SUBDIRS:
+                buckets[sub].extend(allocated[sub])
+            return buckets
 
         if not stratified:
             rng.shuffle(items)
             total = len(items)
             n_train = int(total * split[0])
             n_val = int(total * split[1])
-            buckets["train"] = items[:n_train]
-            buckets["val"] = items[n_train:n_train + n_val]
-            buckets["test"] = items[n_train + n_val:]
+            # 追加到已有成员之后：手工映射的固定成员不能被覆盖（赋值会冲掉）
+            buckets["train"].extend(items[:n_train])
+            buckets["val"].extend(items[n_train:n_train + n_val])
+            buckets["test"].extend(items[n_train + n_val:])
             return buckets
 
         groups: dict[tuple, list[Path]] = {}
@@ -611,6 +634,7 @@ class DatasetService:
         label_index: dict | None = None,
         kinds: dict | None = None,
         counts: dict | None = None,
+        overrides: dict | None = None,
     ) -> dict:
         """把图片（及同名标签）复制为可训练的 YOLO 数据集结构。
 
@@ -656,7 +680,7 @@ class DatasetService:
             buckets = DatasetService.split_members(
                 images, {}, split=split, seed=seed,
                 stratified=stratified, layout=layout,
-                kinds=kinds, counts=counts,
+                kinds=kinds, counts=counts, overrides=overrides,
             )
             eval_members = buckets["val"] + buckets["test"]
             layout_dirs = {
@@ -691,7 +715,7 @@ class DatasetService:
         if layout == "classify":
             buckets = DatasetService.split_members(
                 images, {}, split=split, seed=seed,
-                stratified=True, layout="classify",
+                stratified=True, layout="classify", overrides=overrides,
             )
             for sub in SPLIT_SUBDIRS:
                 for img in buckets[sub]:
@@ -712,7 +736,7 @@ class DatasetService:
                 label_index = DatasetService.build_label_index(source)
             buckets = DatasetService.split_members(
                 images, label_index, split=split, seed=seed,
-                stratified=stratified, layout=layout,
+                stratified=stratified, layout=layout, overrides=overrides,
             )
             for sub in SPLIT_SUBDIRS:
                 img_dir = target / "images" / sub
@@ -747,7 +771,7 @@ class DatasetService:
         buckets = DatasetService.split_members(
             images, label_index, split=split, seed=seed,
             stratified=stratified, layout=layout,
-            kinds=kinds, counts=counts,
+            kinds=kinds, counts=counts, overrides=overrides,
         )
 
         for sub in SPLIT_SUBDIRS:
@@ -1004,6 +1028,23 @@ class DatasetService:
         return str(sorted(classes)[0])
 
     @staticmethod
+    def _display_class_of(
+        image: Path,
+        label_index: dict,
+        layout: str,
+        class_overrides: dict,
+        class_names: list,
+    ) -> str:
+        """统计 / 展示用类别名（手工覆盖 > 标签 / 目录派生，数字 id 转名称）。"""
+        raw = DatasetService._class_label_of(image, label_index, layout)
+        if str(image) in class_overrides:
+            # 手工覆盖优先；显式置空 = 无标签（与图库 / 标注页口径一致）
+            return str(class_overrides[str(image)] or "") or UNLABELED_LABEL
+        if raw.isdigit() and 0 <= int(raw) < len(class_names):
+            return str(class_names[int(raw)])
+        return raw
+
+    @staticmethod
     def preview_split(
         source_dir: str | Path,
         split: tuple[float, float, float] = (0.7, 0.2, 0.1),
@@ -1014,12 +1055,20 @@ class DatasetService:
         label_index: dict | None = None,
         kinds: dict | None = None,
         counts: dict | None = None,
+        overrides: dict | None = None,
+        class_overrides: dict | None = None,
+        class_names: list | None = None,
     ) -> dict:
         """**不落盘**地计算划分结果，供界面预览（拆分页的饼图与类别分布）。
 
         Args:
             images: 待划分的图片清单；为 None 时扫描 `source_dir`。
             label_index: 「图片主干 → 标签」索引；为 None 时按 `source_dir` 配对。
+            overrides: 手工拆分映射（``str(图片)`` → "T" / "V" / "E"），
+                优先于比例 / 分层分配（与图库 / 标注页的映射口径一致）。
+            class_overrides: 手工类别覆盖（``str(图片)`` → 类别名，
+                "" = 无标签），优先于标签 / 目录派生（与图库 / 标注页一致）。
+            class_names: 类别 id → 名称表（标签里的数字 id 显示为名称）。
 
         Returns:
             {
@@ -1047,14 +1096,18 @@ class DatasetService:
         buckets = DatasetService.split_members(
             images, label_index, split=split, seed=seed,
             stratified=stratified, layout=layout,
-            kinds=kinds, counts=counts,
+            kinds=kinds, counts=counts, overrides=overrides,
         )
 
+        names = [str(name) for name in (class_names or [])]
+        class_overrides = class_overrides or {}
         per_class: dict[str, dict] = {}
         for sub in SPLIT_SUBDIRS:
             counts: dict[str, int] = {}
             for image in buckets[sub]:
-                name = DatasetService._class_label_of(image, label_index, layout)
+                name = DatasetService._display_class_of(
+                    image, label_index, layout, class_overrides, names
+                )
                 counts[name] = counts.get(name, 0) + 1
                 entry = per_class.setdefault(
                     name, {"total": 0, "train": 0, "val": 0, "test": 0}

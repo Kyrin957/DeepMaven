@@ -11,6 +11,8 @@ JSON 事件流回传，可随时强制终止。本 ViewModel 负责：
 from __future__ import annotations
 
 import csv
+import os
+import shutil
 import time
 from pathlib import Path
 
@@ -21,7 +23,11 @@ from src.services.backends import resolve as resolve_backend
 from src.services.dataset_service import DatasetService
 from src.services.project_service import ProjectService
 from src.services.train_service import TrainService
-from src.utils.constants import DATA_DIR
+from src.utils.constants import (
+    DATA_DIR,
+    TASK_MODEL_SUFFIX,
+    base_variant_key,
+)
 from src.utils.image_ops import build_param_preview
 from src.utils.logger import get_logger
 from src.utils.tasks import task_metrics, task_of
@@ -31,6 +37,25 @@ logger = get_logger("train_vm")
 
 # 训练参数预览图的存放目录（临时可视化，不进项目）
 _PREVIEW_DIR = DATA_DIR / "preview"
+
+
+def normalize_model_key(key, task: str) -> str:
+    """把模型 key 与任务的权重后缀对齐（得到**精确的权重名**）。
+
+    YOLO 后端的权重名带任务后缀（分类 ``yolo11n-cls`` / 分割 ``-seg`` /
+    旋转框 ``-obb``，检测无后缀）；其余后端（anomalib / unet / ocr）的 key
+    原样保留。旧项目可能把 key 存成基础名（如分类项目里的 ``yolo11n``），
+    卡片规格行与下拉都按 key 显示——必须规范成精确权重名，避免与检测变体
+    混淆（历史故障：分类项目显示 ``YOLO11n``）。
+    """
+    text = str(key or "")
+    if not text:
+        return ""
+    if resolve_backend(task).key != "yolo":
+        return text
+    base = base_variant_key(text)
+    suffix = TASK_MODEL_SUFFIX.get(str(task or ""), "")
+    return f"{base}{suffix}"
 
 
 def _pick(metrics: dict, keys: tuple) -> float:
@@ -74,6 +99,7 @@ class TrainViewModel(QObject):
     logAppended = Signal(str)            # 训练日志行
     artifactsReady = Signal(dict)        # 训练产物 {save_dir, best, last, results}
     historyChanged = Signal(list)        # 训练记录列表
+    modelsChanged = Signal(list)         # 训练模型列表（卡片刷新）
     message = Signal(str, str)           # level, text
 
     def __init__(
@@ -107,17 +133,26 @@ class TrainViewModel(QObject):
         """
         self._config = project.training if project is not None else TrainingConfig()
         if project is not None:
-            self._config.task_type = task_of(project.model_type)
-            # 训练产物落在项目文件夹里（旧项目未设置保存目录时补齐默认值）
-            path = str(project.params.get("path") or "")
-            if path and not str(self._config.project_dir or "").strip():
-                self._config.project_dir = str(
-                    ProjectService.project_dir(path) / "runs"
-                )
+            task = task_of(project.model_type)
+            self._config.task_type = task
+            # 模型 key 与任务后缀对齐（分类 → yolo11n-cls；检测无后缀）：
+            # 旧项目可能存着基础名，卡片与下拉显示不精确（历史故障）
+            self._normalize_project_model_keys(project, task)
+            # 训练模型：迁移旧数据（训练设置 / 单配置），把活动模型的参数
+            # 载入当前配置、产物目录指向其 model/<模型名>/（互不干扰）
+            active = self.active_model()
+            for key, value in self._model_payload(active).items():
+                setattr(self._config, key, value)
+            # 任务类型由项目决定：模型快照里的旧值（如创建于检测项目）不得
+            # 覆盖它——否则分类项目里下拉会变回检测模型列表（历史故障）
+            self._config.task_type = task
+            if active:
+                self._apply_model_dir(active)
         self.configChanged.emit(self._config)
         self.statusChanged.emit(self._config.status)
         self.progressChanged.emit(self._config.progress)
         self.historyChanged.emit(self.history())
+        self.modelsChanged.emit(self.models())
         # 重启后仍能看到上次训练的最后状态
         if self._config.current_epoch:
             self.metricsChanged.emit(self._summary_row())
@@ -125,6 +160,26 @@ class TrainViewModel(QObject):
     # -----------------------------------------------------------
     # 查询
     # -----------------------------------------------------------
+    def _normalize_project_model_keys(self, project, task: str) -> None:
+        """把项目内所有训练模型的 model_key 与项目任务对齐（打开时迁移）。
+
+        仅在确有变化时回写并 `touch`（标记项目待保存 + 触发自动备份）。
+        """
+        raw = list(project.params.get("training_models") or [])
+        changed = False
+        for item in raw:
+            config = dict(item.get("config") or {})
+            current = str(config.get("model_key") or "")
+            fixed = normalize_model_key(current, task)
+            if fixed and fixed != current:
+                config["model_key"] = fixed
+                item["config"] = config
+                changed = True
+        if not changed:
+            return
+        project.params["training_models"] = raw
+        project.touch()
+
     @property
     def config(self) -> TrainingConfig:
         return self._config
@@ -169,125 +224,418 @@ class TrainViewModel(QObject):
             project.touch()
 
     # -----------------------------------------------------------
-    # 训练设置（setup）：命名保存多套训练参数，一键切换对比
+    # 训练模型：一个项目可建多个模型（参数 + 拆分 + 产物 + 指标）
     # -----------------------------------------------------------
-    def setups(self) -> list[dict]:
-        """项目里的训练设置列表（首次调用时自动建立一套）。"""
+    def models(self) -> list[dict]:
+        """项目里的训练模型列表。
+
+        存储于 ``project.params["training_models"]``（键不存在时按旧数据
+        迁移：训练设置 / 单配置 → 模型；显式空列表表示用户删光了模型，
+        不回填）。
+        """
         project = self._project_vm.project if self._project_vm else None
         if project is None:
             return []
-        raw = project.params.get("training_setups")
-        if not isinstance(raw, list) or not raw:
-            raw = self._create_default_setup(project)
-        return [dict(item) for item in raw]
+        raw = project.params.get("training_models")
+        if isinstance(raw, list):
+            return [dict(item) for item in raw]
+        return self._migrate_models(project)
 
-    def active_setup_id(self) -> int:
+    def has_model(self) -> bool:
+        return bool(self.models())
+
+    def active_model_id(self) -> int:
         project = self._project_vm.project if self._project_vm else None
         if project is None:
             return 0
-        self.setups()      # 保证至少有一套
-        return int(project.params.get("active_setup_id", 0) or 0)
+        models = self.models()
+        stored = int(project.params.get("active_model_id", 0) or 0)
+        if any(int(item.get("model_id", -1)) == stored for item in models):
+            return stored
+        return int(models[0].get("model_id", 0)) if models else 0
 
-    def active_setup(self) -> dict:
-        target = self.active_setup_id()
+    def active_model(self) -> dict:
+        target = self.active_model_id()
         return next(
-            (item for item in self.setups()
-             if int(item.get("setup_id", -1)) == target),
+            (dict(item) for item in self.models()
+             if int(item.get("model_id", -1)) == target),
             {},
         )
 
-    def create_setup(self, name: str = "", copy_current: bool = True) -> int:
-        """新建训练设置（默认以当前配置为起点）。"""
+    def create_model(self, name: str = "", copy_current: bool = True) -> int:
+        """新建训练模型（默认以当前参数为起点）——左侧模型管理的入口。"""
         project = self._project_vm.project if self._project_vm else None
         if project is None:
             self.message.emit("warning", "请先创建或打开项目")
             return 0
-        raw = list(project.params.get("training_setups") or [])
         self._store_active()
-        setup_id = max(
-            [int(item.get("setup_id", 0) or 0) for item in raw] or [0]
+        raw = list(project.params.get("training_models") or [])
+        model_id = max(
+            [int(item.get("model_id", 0) or 0) for item in raw] or [0]
         ) + 1
-        raw.append({
-            "setup_id": setup_id,
-            "name": str(name).strip() or f"设置 {setup_id}",
-            "note": "",
-            "split_id": int(self._config.split_id or 0),
-            "config": self._snapshot() if copy_current else {},
-        })
-        project.params["training_setups"] = raw
-        project.params["active_setup_id"] = setup_id
-        self._commit_setups(f"已新建训练设置「{raw[-1]['name']}」")
-        return setup_id
+        raw.append(self._make_model(
+            model_id,
+            str(name).strip() or f"模型 {model_id}",
+            config=self._snapshot() if copy_current else {},
+            split_id=int(self._config.split_id or 0),
+        ))
+        project.params["training_models"] = raw
+        project.params["active_model_id"] = model_id
+        self._commit_models(f"已新建训练模型「{raw[-1]['name']}」")
+        return model_id
 
-    def duplicate_setup(self, setup_id: int) -> int:
-        """复制某一套训练设置（含参数）。"""
+    def duplicate_model(self, model_id: int) -> int:
+        """复制一个训练模型（含参数；不复制产物与指标）。"""
+        project = self._project_vm.project if self._project_vm else None
         source = next(
-            (item for item in self.setups()
-             if int(item.get("setup_id", -1)) == int(setup_id)),
+            (item for item in self.models()
+             if int(item.get("model_id", -1)) == int(model_id)),
             None,
         )
-        if source is None:
+        if project is None or source is None:
             return 0
-        return self.create_setup(f"{source.get('name') or '设置'} 副本")
+        self._store_active()
+        raw = list(project.params.get("training_models") or [])
+        new_id = max(
+            [int(item.get("model_id", 0) or 0) for item in raw] or [0]
+        ) + 1
+        copy = self._make_model(
+            new_id,
+            f"{source.get('name') or '模型'} 副本",
+            config=dict(source.get("config") or {}),
+            split_id=int(source.get("split_id", 0) or 0),
+        )
+        raw.append(copy)
+        project.params["training_models"] = raw
+        project.params["active_model_id"] = new_id
+        self._commit_models(f"已复制训练模型「{copy['name']}」")
+        return new_id
 
-    def rename_setup(self, setup_id: int, name: str = "", note: str = "") -> bool:
-        """重命名训练设置 / 修改备注。"""
+    def rename_model(self, model_id: int, name: str) -> bool:
+        """重命名训练模型：磁盘产物目录随名字移动，路径引用同步。"""
         project = self._project_vm.project if self._project_vm else None
         if project is None:
             return False
-        raw = list(project.params.get("training_setups") or [])
-        for item in raw:
-            if int(item.get("setup_id", -1)) != int(setup_id):
-                continue
-            if str(name).strip():
-                item["name"] = str(name).strip()
-            item["note"] = str(note)
-            project.params["training_setups"] = raw
-            self._commit_setups("训练设置已更新")
-            return True
-        return False
-
-    def delete_setup(self, setup_id: int) -> bool:
-        """删除某一套训练设置（至少保留一套）。"""
-        project = self._project_vm.project if self._project_vm else None
-        if project is None:
+        new_name = str(name).strip()
+        if not new_name:
             return False
-        raw = list(project.params.get("training_setups") or [])
-        if len(raw) <= 1:
-            self.message.emit("warning", "至少保留一套训练设置")
+        raw = list(project.params.get("training_models") or [])
+        model = next(
+            (item for item in raw
+             if int(item.get("model_id", -1)) == int(model_id)),
+            None,
+        )
+        if model is None or new_name == model.get("name"):
             return False
-        remain = [
-            item for item in raw if int(item.get("setup_id", -1)) != int(setup_id)
-        ]
-        if len(remain) == len(raw):
+        if any(
+            item is not model and str(item.get("name")) == new_name
+            for item in raw
+        ):
+            self.message.emit("warning", f"已存在同名模型「{new_name}」")
             return False
-        project.params["training_setups"] = remain
-        if int(project.params.get("active_setup_id", 0) or 0) == int(setup_id):
-            project.params["active_setup_id"] = int(remain[0]["setup_id"])
-            self.update_config(**self._payload(remain[0]))
-        self._commit_setups("训练设置已删除")
+        old_name = str(model.get("name") or "")
+        # 磁盘目录随名字：<项目>/model/<旧名>/ → <项目>/model/<新名>/
+        path_text = str(project.params.get("path") or "").strip()
+        if path_text:
+            old_dir = ProjectService.model_dir(path_text) / old_name
+            new_dir = ProjectService.model_dir(path_text) / new_name
+            if old_dir.is_dir() and not new_dir.exists():
+                try:
+                    shutil.move(str(old_dir), str(new_dir))
+                except OSError as exc:
+                    logger.warning("训练模型目录改名失败 %s: %s", old_dir, exc)
+                else:
+                    model["config"] = self._retarget(
+                        model.get("config") or {},
+                        str(old_dir), str(new_dir),
+                    )
+                    model["run_dir"] = self._retarget_text(
+                        str(model.get("run_dir") or ""),
+                        str(old_dir), str(new_dir),
+                    )
+                    if int(model.get("model_id", -1)) == self.active_model_id():
+                        # 活动模型：活配置与历史同步改写
+                        for name_, value in list(
+                            self._config.to_dict().items()
+                        ):
+                            if not isinstance(value, str) or not value:
+                                continue
+                            updated = self._retarget_text(
+                                value, str(old_dir), str(new_dir)
+                            )
+                            if updated != value:
+                                setattr(self._config, name_, updated)
+                        for record in self._config.history or []:
+                            if not isinstance(record, dict):
+                                continue
+                            for key, value in list(record.items()):
+                                if isinstance(value, str):
+                                    record[key] = self._retarget_text(
+                                        value, str(old_dir), str(new_dir)
+                                    )
+        model["name"] = new_name
+        project.params["training_models"] = raw
+        self._commit_models("训练模型已重命名")
         return True
 
-    def apply_setup(self, setup_id: int) -> bool:
-        """切换训练设置：先保存当前配置，再载入目标设置。"""
+    def select_model(self, model_id: int) -> bool:
+        """切换训练模型：先保存当前参数，再载入目标模型的参数。"""
         project = self._project_vm.project if self._project_vm else None
         if project is None:
             return False
         target = next(
-            (item for item in self.setups()
-             if int(item.get("setup_id", -1)) == int(setup_id)),
+            (item for item in self.models()
+             if int(item.get("model_id", -1)) == int(model_id)),
             None,
         )
-        if target is None or int(setup_id) == self.active_setup_id():
+        if target is None or int(model_id) == self.active_model_id():
             return False
         self._store_active()
-        project.params["active_setup_id"] = int(setup_id)
-        self.update_config(**self._payload(target))
-        self._commit_setups(f"已切换到训练设置「{target.get('name')}」")
+        project.params["active_model_id"] = int(model_id)
+        payload = self._model_payload(target)
+        self.update_config(**payload)
+        self._apply_model_dir(target)
+        self._commit_models(f"已切换到训练模型「{target.get('name')}」")
         return True
 
+    def remove_model(self, model_id: int) -> bool:
+        """删除训练模型：连同其磁盘产物目录（来源数据与历史记录不动）。"""
+        project = self._project_vm.project if self._project_vm else None
+        if project is None:
+            return False
+        raw = list(project.params.get("training_models") or [])
+        model = next(
+            (item for item in raw
+             if int(item.get("model_id", -1)) == int(model_id)),
+            None,
+        )
+        if model is None or self.is_running() and int(model_id) == self.active_model_id():
+            if model is None:
+                return False
+            self.message.emit("warning", "该模型正在训练中，请先停止训练")
+            return False
+        removed_dir = self._remove_model_dir(project, model)
+        remain = [
+            item for item in raw
+            if int(item.get("model_id", -1)) != int(model_id)
+        ]
+        project.params["training_models"] = remain
+        if int(project.params.get("active_model_id", 0) or 0) == int(model_id):
+            fallback = remain[0] if remain else None
+            project.params["active_model_id"] = (
+                int(fallback.get("model_id", 0)) if fallback else 0
+            )
+            if fallback is not None:
+                self.update_config(**self._model_payload(fallback))
+                self._apply_model_dir(fallback)
+        detail = "（已清理产物目录）" if removed_dir else ""
+        self._commit_models(f"已删除训练模型「{model.get('name')}」{detail}")
+        return True
+
+    def open_model_dir(self, model_id: int) -> str:
+        """返回「在文件资源管理器中打开训练」的目标目录（无则空串）。"""
+        project = self._project_vm.project if self._project_vm else None
+        model = next(
+            (item for item in self.models()
+             if int(item.get("model_id", -1)) == int(model_id)),
+            None,
+        )
+        if project is None or model is None:
+            return ""
+        run_dir = str(model.get("run_dir") or "")
+        if run_dir and Path(run_dir).is_dir():
+            return run_dir
+        path_text = str(project.params.get("path") or "").strip()
+        if not path_text:
+            return ""
+        folder = ProjectService.model_dir(path_text) / str(model.get("name") or "")
+        return str(folder) if folder.is_dir() else str(folder.parent)
+
     # -----------------------------------------------------------
-    # 训练设置内部工具
+    # 训练模型内部工具
+    # -----------------------------------------------------------
+    def _make_model(
+        self, model_id: int, name: str, config: dict | None = None,
+        split_id: int = 0,
+    ) -> dict:
+        from datetime import datetime
+
+        return {
+            "model_id": int(model_id),
+            "name": str(name),
+            "note": "",
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "split_id": int(split_id),
+            "config": dict(config or {}),
+            "status": "",
+            "metric_label": "",
+            "metric_value": 0.0,
+            "metric_epoch": 0,
+            "run_dir": "",
+        }
+
+    def _model_payload(self, model: dict) -> dict:
+        """模型里的参数 → `update_config` 可用的字段。"""
+        known = set(self._config.to_dict())
+        return {
+            key: value for key, value in (model.get("config") or {}).items()
+            if key in known and key not in self._RUNTIME_KEYS
+        }
+
+    def _migrate_models(self, project) -> list[dict]:
+        """旧数据迁移：训练设置 / 单配置 → 训练模型列表。
+
+        每套训练设置转为一个模型，指标从历史记录里按 setup_id 匹配最近
+        一条；没有训练设置的老项目则整体转为「模型 1」。
+        """
+        setups = project.params.get("training_setups")
+        records = list(getattr(self._config, "history", []) or [])
+        models: list[dict] = []
+        active = 0
+        if isinstance(setups, list) and setups:
+            for item in setups:
+                setup_id = int(item.get("setup_id", 0) or 0)
+                record = next(
+                    (
+                        row for row in reversed(records)
+                        if int(row.get("setup_id", -1) or -1) == setup_id
+                    ),
+                    None,
+                )
+                model = self._make_model(
+                    setup_id or (len(models) + 1),
+                    str(item.get("name") or f"模型 {len(models) + 1}"),
+                    config=item.get("config") or {},
+                    split_id=int(item.get("split_id", 0) or 0),
+                )
+                self._apply_record(model, record)
+                models.append(model)
+            active = int(project.params.get("active_setup_id", 0) or 0)
+        if not models:
+            model = self._make_model(
+                1, "模型 1", config=self._snapshot(),
+                split_id=int(self._config.split_id or 0),
+            )
+            self._apply_record(model, records[-1] if records else None)
+            models = [model]
+            active = 1
+        project.params["training_models"] = models
+        project.params["active_model_id"] = active or int(models[0]["model_id"])
+        project.params.pop("training_setups", None)
+        project.params.pop("active_setup_id", None)
+        project.touch()
+        self.message.emit(
+            "info", "训练设置已升级为训练模型（保存项目以写入改动）"
+        )
+        return [dict(item) for item in models]
+
+    @staticmethod
+    def _apply_record(model: dict, record: dict | None) -> None:
+        """把一条训练历史记录的指标写入模型卡片字段。"""
+        if not record:
+            return
+        model["status"] = "finished"
+        model["metric_label"] = str(record.get("best_label") or "")
+        model["metric_value"] = float(record.get("best_value") or 0.0)
+        model["metric_epoch"] = int(record.get("best_epoch") or 0)
+        model["run_dir"] = str(record.get("save_dir") or "")
+
+    @staticmethod
+    def _retarget_text(value: str, old: str, new: str) -> str:
+        """把指向旧目录的路径改写为新目录前缀（带分隔符边界检查）。"""
+        if not value or not old:
+            return value
+        if value == old:
+            return new
+        if value.startswith(old + os.sep) or value.startswith(old + "/"):
+            return new + value[len(old):]
+        return value
+
+    @classmethod
+    def _retarget(cls, value, old: str, new: str):
+        """递归改写 dict / list / str 里的旧目录前缀。"""
+        if isinstance(value, str):
+            return cls._retarget_text(value, old, new)
+        if isinstance(value, list):
+            return [cls._retarget(item, old, new) for item in value]
+        if isinstance(value, dict):
+            return {
+                key: cls._retarget(item, old, new)
+                for key, item in value.items()
+            }
+        return value
+
+    def _apply_model_dir(self, model: dict) -> None:
+        """把活动模型的产物目录设为其自己的 `model/<模型名>/`。"""
+        project = self._project_vm.project if self._project_vm else None
+        if project is None or not model:
+            return
+        path_text = str(project.params.get("path") or "").strip()
+        if not path_text:
+            return
+        self._config.project_dir = str(
+            ProjectService.model_dir(path_text) / str(model.get("name") or "")
+        )
+
+    def _remove_model_dir(self, project, model: dict) -> bool:
+        """删除模型的磁盘产物目录（来源数据与项目文件夹其余内容不动）。"""
+        path_text = str(project.params.get("path") or "").strip()
+        if not path_text:
+            return False
+        folder = ProjectService.model_dir(path_text) / str(model.get("name") or "")
+        if not folder.is_dir():
+            return False
+        try:
+            shutil.rmtree(folder)
+        except OSError as exc:
+            logger.warning("删除训练模型目录失败 %s: %s", folder, exc)
+            return False
+        return True
+
+    def _store_active(self) -> None:
+        """把当前配置写回「活动模型」的参数快照。"""
+        project = self._project_vm.project if self._project_vm else None
+        if project is None:
+            return
+        raw = list(project.params.get("training_models") or [])
+        active = self.active_model_id()
+        for item in raw:
+            if int(item.get("model_id", -1)) == active:
+                item["config"] = self._snapshot()
+                item["split_id"] = int(self._config.split_id or 0)
+                return
+
+    def _commit_models(self, text: str = "") -> None:
+        """训练模型变更后登记未保存改动并通知界面（随项目统一保存）。"""
+        project = self._project_vm.project if self._project_vm else None
+        if project is None:
+            return
+        project.touch()
+        self._project_vm.notify_changed()
+        self.configChanged.emit(self._config)
+        self.modelsChanged.emit(self.models())
+        if text:
+            self.message.emit("success", text)
+
+    def _set_model_status(self, status: str, **extra) -> None:
+        """更新活动模型的训练状态 / 指标（卡片显示）并通知界面。"""
+        project = self._project_vm.project if self._project_vm else None
+        if project is None:
+            return
+        raw = list(project.params.get("training_models") or [])
+        active = self.active_model_id()
+        for item in raw:
+            if int(item.get("model_id", -1)) != active:
+                continue
+            item["status"] = str(status)
+            item.update(extra)
+            project.params["training_models"] = raw
+            project.touch()
+            self.modelsChanged.emit(self.models())
+            return
+
+    # -----------------------------------------------------------
+    # 快照工具（默认模型的参数来源）
     # -----------------------------------------------------------
     _RUNTIME_KEYS = frozenset({
         "status", "progress", "current_epoch", "iteration", "iterations",
@@ -296,61 +644,18 @@ class TrainViewModel(QObject):
     })
 
     def _snapshot(self) -> dict:
-        """当前训练配置中**属于设置**的部分（去掉运行状态与历史）。"""
-        return {
+        """当前训练配置中**属于设置**的部分（去掉运行状态与历史）。
+
+        排除 `task_type`：任务类型由项目类型决定（打开项目时绑定），
+        快照里存了它会在加载时覆盖项目任务（曾导致分类项目的模型下拉
+        变回检测列表）。
+        """
+        payload = {
             key: value for key, value in self._config.to_dict().items()
             if key not in self._RUNTIME_KEYS
         }
-
-    def _payload(self, setup: dict) -> dict:
-        """设置里的参数 → `update_config` 可用的字段。"""
-        known = set(self._config.to_dict())
-        return {
-            key: value for key, value in (setup.get("config") or {}).items()
-            if key in known and key not in self._RUNTIME_KEYS
-        }
-
-    def _create_default_setup(self, project) -> list:
-        """首次使用时建立一套「默认设置」并落盘。"""
-        raw = [{
-            "setup_id": 1,
-            "name": "默认设置",
-            "note": "",
-            "split_id": int(self._config.split_id or 0),
-            "config": self._snapshot(),
-        }]
-        project.params["training_setups"] = raw
-        project.params["active_setup_id"] = 1
-        return raw
-
-    def _store_active(self) -> None:
-        """把当前配置写回「当前设置」。"""
-        project = self._project_vm.project if self._project_vm else None
-        if project is None:
-            return
-        raw = list(project.params.get("training_setups") or [])
-        active = int(project.params.get("active_setup_id", 0) or 0)
-        for item in raw:
-            if int(item.get("setup_id", -1)) == active:
-                item["config"] = self._snapshot()
-                item["split_id"] = int(self._config.split_id or 0)
-                return
-
-    def _commit_setups(self, text: str = "") -> None:
-        """训练设置变更后落盘并通知界面。"""
-        project = self._project_vm.project if self._project_vm else None
-        if project is None:
-            return
-        project.touch()
-        try:
-            self._project_vm.service.save(project)
-        except (OSError, ValueError) as exc:
-            logger.warning("保存训练设置失败: %s", exc)
-            return
-        self._project_vm.notify_changed()
-        self.configChanged.emit(self._config)
-        if text:
-            self.message.emit("success", text)
+        payload.pop("task_type", None)
+        return payload
 
     # -----------------------------------------------------------
     # 训练参数预览（letterbox + 在线增强示意）
@@ -522,6 +827,12 @@ class TrainViewModel(QObject):
         if self.is_running():
             self.message.emit("warning", "训练已在运行中")
             return
+        if not self.has_model():
+            self.message.emit("warning", "请先在左侧新建训练模型")
+            return
+        # 参数与产物目录绑定到当前模型（产物落 model/<模型名>/）
+        self._store_active()
+        self._apply_model_dir(self.active_model())
         # 启动条件由任务对应的后端决定（检测 / 分类看 data.yaml，异常看数据目录）
         problem = resolve_backend(self._config).validate(self._config)
         if problem is not None:
@@ -533,6 +844,7 @@ class TrainViewModel(QObject):
             self._project_vm.save_project()
 
         self._reset_runtime()
+        self._set_model_status("running")
         self.logAppended.emit("=== 启动训练 ===")
         self._set_status("running")
         if not self._service.start(self._config):
@@ -564,37 +876,6 @@ class TrainViewModel(QObject):
         self._service.resume()
         self._set_status("running")
         self.logAppended.emit("=== 已继续训练 ===")
-
-    def continue_training(self, extra_epochs: int = 50) -> None:
-        """在最近一次训练的基础上追加轮数继续（同一次运行的断点续训）。
-
-        依赖 Ultralytics 的 `resume=True`：需要上次运行的 `weights/last.pt`，
-        因此这里把权重指向该文件，并把总轮数改为「已完成 + 追加」。
-        """
-        if self.is_running():
-            self.message.emit("warning", "训练进行中，请先暂停或终止")
-            return
-        records = self._config.history or []
-        if not records:
-            self.message.emit("warning", "还没有可继续的训练记录")
-            return
-        record = records[-1]
-        results = Path(str(record.get("results") or ""))
-        last = results.parent / "weights" / "last.pt"
-        if not last.is_file():
-            self.message.emit("warning", "找不到上次训练的 last.pt，无法继续训练")
-            return
-        done = int(record.get("total") or record.get("epochs") or 0)
-        extra = max(1, int(extra_epochs))
-        self.update_config(
-            epochs=max(1, done + extra),
-            resume=True,
-            weights_path=str(last),
-        )
-        self.logAppended.emit(
-            f"=== 继续训练：在已完成 {done} 轮的基础上追加 {extra} 轮 ==="
-        )
-        self.start()
 
     def stop(self) -> None:
         if not self.is_running():
@@ -856,6 +1137,7 @@ class TrainViewModel(QObject):
         self._run_cache.clear()
         if len(self._config.history) > _HISTORY_LIMIT:
             del self._config.history[:-_HISTORY_LIMIT]
+        self._mark_dirty()      # 训练记录随项目保存
         self.historyChanged.emit(self.history())
 
     def load_run(self, index: int) -> bool:
@@ -969,6 +1251,7 @@ class TrainViewModel(QObject):
     def clear_history(self) -> None:
         """清空训练记录（不影响磁盘上的产物）。"""
         self._config.history = []
+        self._mark_dirty()
         self.historyChanged.emit([])
 
     def delete_history(self, index: int) -> None:
@@ -981,6 +1264,7 @@ class TrainViewModel(QObject):
             item for item in self._config.history if item is not target
             and item.get("results") != target.get("results")
         ]
+        self._mark_dirty()
         self.historyChanged.emit(self.history())
 
     # -----------------------------------------------------------
@@ -1010,14 +1294,14 @@ class TrainViewModel(QObject):
         if split is not None:
             split.locked = True
 
-        setup = self.active_setup()
+        model = self.active_model()
         self.add_history({
             "name": _now_text(),
             "task": config.task_type,
             "model": config.model_key,
-            # 训练设置归属：多套参数横向比较时据此区分
-            "setup_id": int(setup.get("setup_id") or 0),
-            "setup_name": str(setup.get("name") or ""),
+            # 训练模型归属：多模型横向对比时据此区分
+            "model_id": int(model.get("model_id") or 0),
+            "model_name": str(model.get("name") or ""),
             "split_id": int(config.split_id),
             "split_name": str(
                 config.split_name or (split.name if split is not None else "")
@@ -1032,6 +1316,14 @@ class TrainViewModel(QObject):
             "results": str(summary.get("results") or ""),
             "best_weights": best,
         })
+        # 模型卡片同步指标与产物目录（左侧模型管理据显示状态与能力）
+        self._set_model_status(
+            "finished",
+            metric_label=self.main_label(),
+            metric_value=round(config.best_value, 4),
+            metric_epoch=int(config.best_epoch or 0),
+            run_dir=str(config.save_dir or ""),
+        )
         self.artifactsReady.emit(summary)
         self._register_artifacts(summary)
 
@@ -1040,6 +1332,7 @@ class TrainViewModel(QObject):
         self.message.emit("error", text)
         if self._config.status == "running":
             self._set_status("error")
+        self._set_model_status("error")
 
     def _register_artifacts(self, summary: dict) -> None:
         """把后端产物（best / last 权重 + results.csv）归档进当前项目。"""
@@ -1052,7 +1345,8 @@ class TrainViewModel(QObject):
         )
         if self._config.history:
             # 记录归档目录，便于回溯该次训练的产物位置
-            self._config.history[-1]["archive_folder"] = f"runs/{run_folder}"
+            # （归档内虚拟路径；旧记录为 runs/ 前缀，读取端按记录值兼容）
+            self._config.history[-1]["archive_folder"] = f"model/{run_folder}"
         items: list[tuple[str, str, bytes]] = []
         for artifact in resolve_backend(self._config).artifacts(summary):
             try:
@@ -1062,7 +1356,7 @@ class TrainViewModel(QObject):
                 continue
             items.append((
                 artifact.kind,
-                f"runs/{run_folder}/{artifact.path.name}",
+                f"model/{run_folder}/{artifact.path.name}",
                 payload,
             ))
         if not items:
@@ -1136,7 +1430,8 @@ def _run_folder_name(summary: dict, config, history: list | None = None) -> str:
     """归档目录名 = 后端保存目录名（或模型名）+ 时间戳。
 
     异常检测与语义分割的输出目录由配置固定，多次训练会互相覆盖；
-    加上时间戳后每次训练各有独立归档（虚拟路径 `runs/<目录>/...`）。
+    加上时间戳后每次训练各有独立归档（虚拟路径 `model/<目录>/...`，
+    旧记录为 `runs/…` 前缀）。
     少数情况下（同一秒内完成两次）时间戳会重复，此时后缀递增序号。
     """
     from datetime import datetime

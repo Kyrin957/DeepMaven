@@ -1,9 +1,15 @@
 """图像标注页：单张图片标注工作台。
 
 界面结构参照 Halcon DLT 的标注视图：
-    中间：绘制工具条 + 预标注工具条 + 标注画布（画布条内置翻页图标）
-    右侧：导航器、标注对象列表、编辑、备注
+    左侧：图像（名称 / 状态 / 翻页 / 导航器）/ 标签类别 / 数据集拆分 / 图像标记
+    中间：页面操作条（类别 / 存取 / 导出）+ 预标注工具条 + 画布卡
+          （画布卡内：顶部工具栏[左标注工具 / 右显示缩放] + 画布 + 状态栏）
+    右侧：标注对象列表、编辑选中（框选类任务专用）
     窗口最右：显示调试栏（亮度 / 对比度）
+
+按深度学习方法区分 UI：整图任务（分类 / 异常检测）没有「标注对象」与
+「编辑选中」概念——右栏整栏隐藏、绘制工具 / 页面操作条隐藏，只保留
+左栏（含导航器）与画布区。
 """
 
 from __future__ import annotations
@@ -19,7 +25,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QListWidget,
     QListWidgetItem,
-    QPlainTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -78,13 +83,13 @@ _FALLBACK_CHIP = "#66CCFF"
 _IMAGE_FILTER = "图片 (*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp)"
 # 标注方式 → 可用绘制工具（标注框类型互不混用，参照 DLT）
 _TOOLS_BY_ANNOTATION: dict[str, list[tuple[str, str]]] = {
-    "none": [(MODE_BROWSE, "浏览")],
-    "box": [(MODE_BROWSE, "浏览"), (MODE_BOX, "矩形")],
-    "obb": [(MODE_BROWSE, "浏览"), (MODE_BOX, "矩形")],
+    "none": [(MODE_BROWSE, "选择")],
+    "box": [(MODE_BROWSE, "选择"), (MODE_BOX, "矩形")],
+    "obb": [(MODE_BROWSE, "选择"), (MODE_BOX, "矩形")],
     "polygon": [
-        (MODE_BROWSE, "浏览"), (MODE_POLYGON, "多边形"), (MODE_MASK, "掩码"),
+        (MODE_BROWSE, "选择"), (MODE_POLYGON, "多边形"), (MODE_MASK, "掩码"),
     ],
-    "text": [(MODE_BROWSE, "浏览"), (MODE_TEXT, "文本")],
+    "text": [(MODE_BROWSE, "选择"), (MODE_TEXT, "文本")],
 }
 
 
@@ -169,6 +174,7 @@ class AnnotateTab(QWidget):
         分组整体折到下一行，因此任意窗口宽度 / 缩放比例下都不会重叠。
         """
         card = CardWidget(self)
+        self.toolbar_card = card     # 整图任务下内部全隐藏 → 整卡隐藏
         # FlowContainer 只通过 sizeHint / minimumSizeHint 表达折行高度，
         # 不写显式最小尺寸，因此不会击穿页面的 Ignored 策略（见 §4.4）
         outer = QVBoxLayout(card)
@@ -181,63 +187,18 @@ class AnnotateTab(QWidget):
         outer.addWidget(container)
         flow = container.flow()
 
-        # ① 绘制工具（由项目标注方式决定：整图 / 矩形 / 旋转矩形 / 多边形 / 文本）
-        self.mode_seg = SegmentedWidget(card)
-        self._reload_tools("box")
-        self.mode_seg.setCurrentItem(MODE_BOX)
-        flow.addWidget(ToolGroup(self.mode_seg, parent=card))
+        # 绘制工具 / 旋转 / 掩码 / 孔洞已迁到**图像窗口顶部工具栏**
+        # （见 _build_canvas_toolbar）：左侧标注工具、右侧显示缩放。
 
-        # ② 类别选择
+        # ① 类别选择（新画对象的类别；整图任务在左栏「标签类别」设置，本组隐藏）
         self.class_combo = ComboBox(card)
         self.class_combo.setMinimumWidth(140)
-        flow.addWidget(
-            ToolGroup(BodyLabel("类别", card), self.class_combo, parent=card)
+        self.class_group = ToolGroup(
+            BodyLabel("类别", card), self.class_combo, parent=card
         )
+        flow.addWidget(self.class_group)
 
-        # ③ 旋转角微调（仅「对象检测·旋转框」，整组显隐）
-        self.rotate_spin = SafeDoubleSpinBox(card)
-        self.rotate_spin.setRange(-180.0, 180.0)
-        self.rotate_spin.setDecimals(1)
-        self.rotate_spin.setSingleStep(5.0)
-        self.rotate_spin.setValue(0.0)
-        self.rotate_spin.setSuffix(" °")
-        self.rotate_spin.setFixedWidth(
-            T.field_width(self.rotate_spin, T.STEPPER_CHARS_NARROW)
-        )
-        self.rotate_btn = icon_button(FluentIcon.ROTATE, "按设定角度旋转选中", card)
-        self.rotate_group = ToolGroup(
-            BodyLabel("角度", card), self.rotate_spin, self.rotate_btn, parent=card
-        )
-        self.rotate_group.setVisible(False)
-        flow.addWidget(self.rotate_group)
-
-        # ④ 掩码工具（画笔 / 橡皮 / 生成轮廓，整组显隐）
-        self.brush_spin = SafeSpinBox(card)
-        self.brush_spin.setRange(2, 300)
-        self.brush_spin.setValue(24)
-        self.brush_spin.setSuffix(" px")
-        self.brush_spin.setFixedWidth(
-            T.field_width(self.brush_spin, T.STEPPER_CHARS_NARROW)
-        )
-        self.erase_check = CheckBox("橡皮", card)
-        self.brush_label = BodyLabel("笔刷", card)
-        self.outline_btn = icon_button(FluentIcon.PENCIL_INK, "由掩码生成轮廓", card)
-        self.mask_clear_btn = icon_button(FluentIcon.ERASE_TOOL, "清除掩码", card)
-        self.mask_group = ToolGroup(
-            self.brush_label, self.brush_spin, self.erase_check,
-            self.outline_btn, self.mask_clear_btn, parent=card,
-        )
-        self.mask_group.setVisible(False)
-        flow.addWidget(self.mask_group)
-
-        # ⑤ 孔洞（多边形模式下的子工具，整组显隐）
-        self.hole_check = CheckBox("孔洞", card)
-        self.hole_check.setToolTip("画出的多边形从选中实例中挖掉")
-        self.hole_group = ToolGroup(self.hole_check, parent=card)
-        self.hole_group.setVisible(False)
-        flow.addWidget(self.hole_group)
-
-        # ⑥ 标注存取（保存 / 清空 / 导入）——整图任务没有标注文件，整组隐藏
+        # ② 标注存取（保存 / 清空 / 导入）——整图任务没有标注文件，整组隐藏
         self.save_btn = icon_button(FluentIcon.SAVE, "保存标注", card, primary=True)
         self.clear_btn = icon_button(FluentIcon.BROOM, "清空当前图标注", card)
         self.import_btn = icon_button(FluentIcon.DOWNLOAD, "导入标注文件", card)
@@ -246,7 +207,7 @@ class AnnotateTab(QWidget):
         )
         flow.addWidget(self.transfer_group)
 
-        # ⑦ 导出标注（格式 + 按钮）。与 ⑥ 分开成两组：五件套合起来近 500px，
+        # ③ 导出标注（格式 + 按钮）。与 ② 分开成两组：五件套合起来近 500px，
         # 最窄窗口下比工具条还宽，整组折行也放不下（会横向溢出被裁）。
         self.export_combo = ComboBox(card)
         for key, text in (
@@ -339,6 +300,10 @@ class AnnotateTab(QWidget):
         layout.setSpacing(T.SPACE_SM)
         layout.addWidget(StrongBodyLabel("图像", card))
 
+        # 导航器：整图总览 + 当前视口框，紧贴「图像」标题之下
+        self.navigator = Navigator(card)
+        layout.addWidget(self.navigator)
+
         self.strip_name = CaptionLabel("未加载图片", card)
         self.strip_name.setWordWrap(True)
         self.strip_state = CaptionLabel("未标注", card)
@@ -387,35 +352,121 @@ class AnnotateTab(QWidget):
         return card
 
     # --------------------------------------------------- 中间
+    def _build_canvas_toolbar(self, parent) -> QWidget:
+        """图像窗口顶部工具栏：左侧标注工具、右侧图像显示缩放。
+
+        参照 Halcon DLT 的标注工具栏布局（左工具 / 右显示）：显示按钮原为
+        画布右上角 HUD，迁到本栏；光标信息则移到画布下方状态栏。
+        """
+        bar = QWidget(parent)
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(T.SPACE_MD)
+
+        # 左侧：工具组（FlowContainer：窄窗口下整组折行，不互相覆盖）
+        tools = FlowContainer(bar, spacing=T.SPACE_MD, margins=(0, 0, 0, 0))
+        flow = tools.flow()
+
+        # ① 绘制工具（由项目标注方式决定：选择 / 矩形 / 旋转矩形 / 多边形 / 文本）
+        self.mode_seg = SegmentedWidget(tools)
+        self._reload_tools("box")
+        self.mode_seg.setCurrentItem(MODE_BOX)
+        self.mode_group = ToolGroup(self.mode_seg, parent=tools)
+        flow.addWidget(self.mode_group)
+
+        # ② 旋转角微调（仅「对象检测·旋转框」，整组显隐）
+        self.rotate_spin = SafeDoubleSpinBox(tools)
+        self.rotate_spin.setRange(-180.0, 180.0)
+        self.rotate_spin.setDecimals(1)
+        self.rotate_spin.setSingleStep(5.0)
+        self.rotate_spin.setValue(0.0)
+        self.rotate_spin.setSuffix(" °")
+        self.rotate_spin.setFixedWidth(
+            T.field_width(self.rotate_spin, T.STEPPER_CHARS_NARROW)
+        )
+        self.rotate_btn = icon_button(FluentIcon.ROTATE, "按设定角度旋转选中", tools)
+        self.rotate_group = ToolGroup(
+            BodyLabel("角度", tools), self.rotate_spin, self.rotate_btn, parent=tools
+        )
+        self.rotate_group.setVisible(False)
+        flow.addWidget(self.rotate_group)
+
+        # ③ 掩码工具（画笔 / 橡皮 / 生成轮廓，整组显隐）
+        self.brush_spin = SafeSpinBox(tools)
+        self.brush_spin.setRange(2, 300)
+        self.brush_spin.setValue(24)
+        self.brush_spin.setSuffix(" px")
+        self.brush_spin.setFixedWidth(
+            T.field_width(self.brush_spin, T.STEPPER_CHARS_NARROW)
+        )
+        self.erase_check = CheckBox("橡皮", tools)
+        self.brush_label = BodyLabel("笔刷", tools)
+        self.outline_btn = icon_button(FluentIcon.PENCIL_INK, "由掩码生成轮廓", tools)
+        self.mask_clear_btn = icon_button(FluentIcon.ERASE_TOOL, "清除掩码", tools)
+        self.mask_group = ToolGroup(
+            self.brush_label, self.brush_spin, self.erase_check,
+            self.outline_btn, self.mask_clear_btn, parent=tools,
+        )
+        self.mask_group.setVisible(False)
+        flow.addWidget(self.mask_group)
+
+        # ④ 孔洞（多边形模式下的子工具，整组显隐）
+        self.hole_check = CheckBox("孔洞", tools)
+        self.hole_check.setToolTip("画出的多边形从选中实例中挖掉")
+        self.hole_group = ToolGroup(self.hole_check, parent=tools)
+        self.hole_group.setVisible(False)
+        flow.addWidget(self.hole_group)
+
+        row.addWidget(tools, 1)
+
+        # 右侧：显示缩放（放大 / 缩小 / 适应窗口 / 原始大小）
+        self.view_buttons: dict[str, object] = {}
+        for name, tip, slot in (
+            ("zoom-out", "缩小", self.canvas.zoom_out),
+            ("zoom-in", "放大", self.canvas.zoom_in),
+            ("fit", "适应窗口", self.canvas.fit_to_view),
+            ("actual-size", "原始大小", self.canvas.actual_size),
+        ):
+            button = icon_button(icon(name), tip, bar)
+            bind_icon(button, name)          # 明暗主题切换时自动重绘
+            button.clicked.connect(slot)
+            row.addWidget(button)
+            self.view_buttons[name] = button
+        return bar
+
     def _build_canvas_card(self) -> CardWidget:
         card = CardWidget(self)
         layout = QVBoxLayout(card)
         layout.setContentsMargins(T.SPACE_LG, T.SPACE_ML, T.SPACE_LG, T.SPACE_ML)
         layout.setSpacing(T.SPACE_MD)
 
-        # 翻页 / 名称已迁到左侧「图像」卡片，画布条只留画布本体
+        # 画布先建：顶部工具栏的显示按钮直接连画布的缩放方法
         self.canvas = AnnotationCanvas(card)
         self.canvas.setMinimumHeight(360)
+
+        # 工具栏（图像窗口顶部）：左标注工具 / 右显示缩放
+        layout.addWidget(self._build_canvas_toolbar(card))
         layout.addWidget(self.canvas, 1)
 
+        # 状态栏：左侧已标注进度、右侧光标信息（坐标 / 像素值 / 缩放）
         footer = QHBoxLayout()
-        footer.addStretch(1)
         self.footer_status = CaptionLabel("已标注 0 / 0", card)
         footer.addWidget(self.footer_status)
+        footer.addStretch(1)
+        self.cursor_label = CaptionLabel("", card)
+        footer.addWidget(self.cursor_label)
         layout.addLayout(footer)
         return card
 
     # --------------------------------------------------- 右栏
     def _build_right_column(self) -> QWidget:
-        navigator_card = CardWidget(self)
-        layout = QVBoxLayout(navigator_card)
-        layout.setContentsMargins(T.CARD_PAD_H, T.CARD_PAD_V, T.CARD_PAD_H, T.CARD_PAD_V)
-        layout.setSpacing(T.SPACE_SM)
-        layout.addWidget(StrongBodyLabel("导航器", navigator_card))
-        self.navigator = Navigator(navigator_card)
-        layout.addWidget(self.navigator)
+        """右栏：标注对象 + 编辑选中（框选类任务专用）。
 
+        导航器已迁入左栏「图像」卡——整图任务（分类 / 异常检测）下本栏
+        整栏隐藏（见 `apply_project_type`），导航器仍在左栏可用。
+        """
         item_card = CardWidget(self)
+        self.item_card = item_card        # 整图任务隐藏（分类 / 异常没有对象）
         item_layout = QVBoxLayout(item_card)
         item_layout.setContentsMargins(T.CARD_PAD_H, T.CARD_PAD_V, T.CARD_PAD_H, T.CARD_PAD_V)
         item_layout.setSpacing(T.SPACE_SM)
@@ -490,22 +541,11 @@ class AnnotateTab(QWidget):
         edit_row.addWidget(self.apply_angle_btn)
         edit_layout.addLayout(edit_row)
 
-        note_card = CardWidget(self)
-        note_layout = QVBoxLayout(note_card)
-        note_layout.setContentsMargins(T.CARD_PAD_H, T.CARD_PAD_V, T.CARD_PAD_H, T.CARD_PAD_V)
-        note_layout.setSpacing(T.SPACE_SM)
-        note_layout.addWidget(StrongBodyLabel("备注", note_card))
-        self.note_edit = QPlainTextEdit(note_card)
-        self.note_edit.setPlaceholderText("为该图像填写备注…")
-        self.note_edit.setFixedHeight(96)
-        note_layout.addWidget(self.note_edit)
-        self.note_btn = icon_button(FluentIcon.SAVE, "保存备注", note_card)
-        note_layout.addWidget(self.note_btn)
-
-        return side_column(
-            navigator_card, item_card, self.edit_card, note_card,
+        self.right_side = side_column(
+            item_card, self.edit_card,
             width=T.SIDE_W,
         )
+        return self.right_side
 
     # -----------------------------------------------------------
     # 绑定
@@ -515,7 +555,6 @@ class AnnotateTab(QWidget):
         vm.imageListChanged.connect(self._on_images)
         vm.imageChanged.connect(self._on_image_changed)
         vm.annotationLoaded.connect(self._on_annotation_loaded)
-        vm.noteLoaded.connect(self._on_note_loaded)
         vm.statusChanged.connect(self._on_status)
         vm.taskStarted.connect(self._on_task_started)
         vm.taskProgress.connect(self._on_task_progress)
@@ -569,7 +608,8 @@ class AnnotateTab(QWidget):
         self.sam_btn.clicked.connect(self._on_sam)
 
         self.display_dock.changed.connect(self._apply_display)
-        self.note_btn.clicked.connect(self._on_save_note)
+        # 状态栏光标信息（坐标 / 像素值 / 缩放），由画布上报
+        self.canvas.cursorInfoChanged.connect(self.cursor_label.setText)
         # 画布右键菜单：另存图像 / 打开所在位置
         self.canvas.saveImageRequested.connect(self._on_save_image)
         self.canvas.openImageFolderRequested.connect(self._on_open_image_folder)
@@ -622,8 +662,9 @@ class AnnotateTab(QWidget):
     def _reload_tools(self, annotation: str) -> None:
         """按标注方式重建工具条。
 
-        整图任务（分类 / 异常检测）只保留「浏览」；水平框与旋转框只保留
-        「矩形」；实例 / 语义分割为「多边形 + 掩码」；OCR 为「文本」。
+        整图任务（分类 / 异常检测）只保留「选择」（且整组隐藏）；水平框与
+        旋转框只保留「矩形」；实例 / 语义分割为「多边形 + 掩码」；OCR 为
+        「文本」。「选择」= 点选 / 多选 / 拖动调整已有对象，不绘制新对象。
         """
         tools = _TOOLS_BY_ANNOTATION.get(annotation, _TOOLS_BY_ANNOTATION["box"])
         signature = "|".join(key for key, _text in tools)
@@ -807,8 +848,20 @@ class AnnotateTab(QWidget):
         self.preannotate_card.setVisible(annotation in ("box", "obb", "polygon"))
         self.sam_btn.setVisible(annotation == "polygon")
         has_files = annotation != "none"
+        # 整图任务（分类 / 异常检测）按深度学习方法的差异精简 UI：
+        # 没有「标注对象」与「编辑选中」概念，绘制工具（只剩「选择」一项）
+        # 也没有意义——相关区块全部隐藏
+        self.mode_group.setVisible(has_files)
+        self.item_card.setVisible(has_files)
+        self.edit_card.setVisible(has_files)
+        # 类别在左栏「标签类别」设置，工具条类别框只影响新画对象——整组隐藏
+        self.class_group.setVisible(has_files)
         self.transfer_group.setVisible(has_files)
         self.export_group.setVisible(has_files)
+        # 页面操作条（类别 / 存取 / 导出）在整图任务下内部全隐藏 → 整卡隐藏
+        self.toolbar_card.setVisible(has_files)
+        # 右栏（标注对象 / 编辑选中）整栏隐藏——导航器已在左栏「图像」卡
+        self.right_side.setVisible(has_files)
 
     def _on_rotate(self) -> None:
         delta = self.rotate_spin.value()
@@ -876,19 +929,38 @@ class AnnotateTab(QWidget):
         return [str(path)] if path is not None else []
 
     def _class_counts(self) -> dict:
-        """各类别的实际图片数；检测任务额外统计未标注张数（与图库页一致）。"""
+        """各类别的实际图片数 + 「无标签」行数量（未标注张数，与图库页一致）。"""
         vm = self._dataset_vm
         if vm is None:
             return {}
         counts = vm.class_distribution()
-        if vm.split_layout() != "classify":
-            flags = vm.annotated_flags()
-            counts["未标注"] = sum(1 for flag in flags if not flag)
+        flags = vm.annotated_flags()
+        counts[""] = sum(1 for flag in flags if not flag)
         return counts
+
+    def _sync_image_class_tag(self) -> None:
+        """整图任务（分类 / 异常检测）：把当前图的类别同步给画布左上角标签。
+
+        框选类任务的「标注」是对象个体，整图类别标签没有意义，不显示。
+        """
+        path = self._vm.current_path()
+        vm = self._dataset_vm
+        if path is None or vm is None or self._vm.annotation_mode() != "none":
+            self.canvas.set_image_class("", "")
+            return
+        name = str(vm.image_class(path) or "")
+        color = ""
+        if name and self._category_vm is not None:
+            for cls in self._category_vm.classes:
+                if str(cls.name) == name:
+                    color = str(getattr(cls, "color", "") or "")
+                    break
+        self.canvas.set_image_class(name or "无标签", color)
 
     def _refresh_side(self) -> None:
         """刷新左侧「标签类别 / 拆分映射 / 图像标记」卡片状态。"""
         vm = self._dataset_vm
+        self._sync_image_class_tag()        # 画布左上角类别标签（整图任务）
         if vm is None or vm.dataset is None:
             return
         if self.class_card is not None and self._category_vm is not None:
@@ -928,8 +1000,13 @@ class AnnotateTab(QWidget):
         vm = self._dataset_vm
         if vm is None:
             return
-        if vm.split_locked():
-            self._vm.message.emit("warning", "该拆分已用于训练，无法更改")
+        reason = vm.split_lock_reason()
+        if reason:
+            self._vm.message.emit(
+                "warning",
+                "该拆分正在训练中，无法更改" if reason == "running"
+                else "该拆分已用于训练，无法更改",
+            )
             return
         paths = self._current_paths()
         if paths:
@@ -1015,16 +1092,8 @@ class AnnotateTab(QWidget):
         return self._vm.has_unsaved()
 
     def flush_pending(self) -> None:
-        """立即保存当前图片的未保存标注。"""
+        """立即保存未保存的标注。"""
         self._vm.flush_pending()
-
-    def _on_save_note(self) -> None:
-        path = self._vm.current_path()
-        if path is None:
-            self._vm.notify("请先选择一张图片", "warning")
-            return
-        self._vm.save_note(path, self.note_edit.toPlainText())
-        self.status_message("备注已保存")
 
     def status_message(self, text: str) -> None:
         """页面级反馈：同时写入工具条提示与全局通知，避免「点了没反应」。"""
@@ -1056,9 +1125,6 @@ class AnnotateTab(QWidget):
         self.canvas.set_annotations(annotation.items if annotation else [])
         self._rebuild_item_list(annotation)
         self._update_strip()
-
-    def _on_note_loaded(self, text: str) -> None:
-        self.note_edit.setPlainText(text or "")
 
     def _on_status(self, done: int, total: int) -> None:
         self._done, self._total = done, total
@@ -1245,10 +1311,12 @@ class AnnotateTab(QWidget):
             self.strip_state.setText("未标注")
             return
         self.strip_name.setText(str(path.name))
-        label_dir = self._vm.label_dir()
-        annotated = False
-        if label_dir is not None:
-            from src.services.annotation_service import AnnotationService
-
-            annotated = AnnotationService.label_path_for(path, label_dir).is_file()
-        self.strip_state.setText("已标注" if annotated else "未标注")
+        vm = self._dataset_vm
+        annotated = bool(vm is not None and vm.is_annotated(path))
+        text = "已标注" if annotated else "未标注"
+        if self._vm.annotation_mode() == "none":
+            # 整图任务（分类 / 异常检测）：标注类型就是整个图像的类别，附上类别名
+            name = str(vm.image_class(path) or "") if vm is not None else ""
+            if name:
+                text += f"（{name}）"
+        self.strip_state.setText(text)

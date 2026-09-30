@@ -49,6 +49,11 @@ _NAMES: dict[str, str] = {
     "actual-size": "mdi.numeric-1-box-outline",  # 原始大小（100%）
     "save-as": "mdi.content-save-outline",    # 另存为
     "reveal": "mdi.folder-open-outline",      # 打开所在位置
+    "locked": "mdi.lock",                     # 锁定（被训练引用的拆分等）
+    "play": "mdi.play",                       # 开始 / 继续训练
+    "pause": "mdi.pause",                     # 暂停训练
+    "stop": "mdi.stop",                       # 停止训练
+    "reset": "mdi.refresh",                   # 复位 / 重来
 }
 
 # 已登记「主题切换重绘」的按钮（弱引用，控件销毁后自动出列）

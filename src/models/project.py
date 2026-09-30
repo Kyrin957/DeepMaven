@@ -76,6 +76,9 @@ class Project:
     params: dict = field(default_factory=dict)
     files: list[ProjectFile] = field(default_factory=list)
 
+    # 内存态：改动代际（touch 时 +1；自动备份据此判断「哪一代」已写入）
+    revision: int = field(default=0, compare=False, repr=False)
+
     # 内存态：是否有未保存的变更（不参与序列化）
     _dirty: bool = field(default=False, compare=False, repr=False)
 
@@ -151,10 +154,23 @@ class Project:
         )
 
     def ensure_splits(self, layout: str = "") -> Split:
-        """确保项目至少有一套拆分；旧项目按 Dataset 的划分字段迁移一套。"""
+        """确保项目至少有一套拆分；旧项目按 Dataset 的划分字段迁移一套。
+
+        迁移时按训练事实**一次性固化锁定**：训练已完成、且用的正是这套划分
+        的产物（``training.data_yaml`` 与拆分 ``data_yaml`` 相同）→
+        ``locked=True``——旧项目没有 `Split.locked` 字段，迁移后判据与新项目
+        一致（`DatasetViewModel.split_lock_reason`）。
+        """
         if not self.splits:
             dataset = self.dataset
             name = str(self.params.get("split_name") or "").strip() or DEFAULT_SPLIT_DIR
+            trained = str(getattr(self.training, "data_yaml", "") or "")
+            status = str(getattr(self.training, "status", "") or "")
+            locked = (
+                bool(trained)
+                and trained == str(dataset.data_yaml or "")
+                and status in ("finished", "success", "done")
+            )
             self.splits.append(Split(
                 split_id=0,
                 name=name,
@@ -168,16 +184,18 @@ class Project:
                 output_dir=str(dataset.output_path or ""),
                 data_yaml=str(dataset.data_yaml or ""),
                 classes=list(dataset.class_names or []),
+                locked=locked,
             ))
             self.active_split_id = self.splits[0].split_id
-        if self.split_by_id(self.active_split_id) is None:
+        if self.splits and self.split_by_id(self.active_split_id) is None:
             self.active_split_id = self.splits[0].split_id
         return self.active_split()
 
     def touch(self) -> None:
-        """标记项目已修改。"""
+        """标记项目已修改（改动代际 +1，供自动备份跟踪）。"""
         self.updated_at = _now_iso()
         self._dirty = True
+        self.revision += 1
 
     def mark_saved(self) -> None:
         """标记已保存（清除未保存变更标记）。"""
@@ -230,8 +248,18 @@ class Project:
             params=data.get("params", {}),
             files=[ProjectFile.from_dict(f) for f in data.get("files", [])],
         )
-        # 旧项目（没有 splits 字段）按 Dataset 的划分字段迁移出一套拆分
-        project.ensure_splits()
+        # 旧格式项目（没有 splits 字段）且**做过划分**（留有产物痕迹）时，
+        # 按 Dataset 的划分字段迁移出一套拆分；新格式（含空列表）保持原样
+        # ——新建项目默认没有拆分，拆分页从空开始（历史行为：自动补一套）
+        if "splits" not in data:
+            dataset = project.dataset
+            had_split = bool(
+                str(dataset.output_path or "").strip()
+                or str(dataset.data_yaml or "").strip()
+                or str(project.training.data_yaml or "").strip()
+            )
+            if had_split:
+                project.ensure_splits()
         return project
 
     # 兼容旧接口：保留 path 属性（指向 .mprj 文件）

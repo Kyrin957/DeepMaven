@@ -1,20 +1,20 @@
-"""轻量图表组件：环形占比图、水平分布条与实时折线图（QPainter 自绘，深色主题）。
+"""轻量图表组件：环形占比图、水平分布条与实时折线图（QPainter 自绘）。
 
 用于「数据拆分」页展示划分比例与类别分布、「模型训练」页展示实时训练曲线，
 避免引入 Matplotlib 的重依赖和风格不一致问题。
+
+自绘控件不经过 QFluentWidgets 的样式表，颜色必须**随明暗主题**显式切换
+（`_palette()`）：浅色主题下用深字 / 浅轨道，否则「浅灰白文字 + 白底」
+会看不清（历史故障）。
 """
 
 from __future__ import annotations
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import QToolTip, QWidget
 
-_COLOR_TEXT = "#E8E8E8"
-_COLOR_TEXT_DIM = "#909090"
-_COLOR_TRACK = "#333333"
-_COLOR_EMPTY = "#5A5A5A"
-_COLOR_GRID = "#3A3A3A"
+from qfluentwidgets import isDarkTheme, qconfig
 
 # 分数直方图：按「异常样本占比」着色 + 三条参考阈值线
 _COLOR_HIST_NORMAL = "#0F6CBD"      # 以正常样本为主
@@ -24,10 +24,34 @@ _COLOR_HIST_MEDIAN = "#0F7B0F"      # 中位阈值
 _COLOR_HIST_BEST = "#E8A33D"        # 最优阈值（F1 最大）
 
 # 折线图配色（训练曲线用）
-_COLOR_PLOT_BG = "#1B1B1B"
-_COLOR_PLOT_GRID = "#333333"
-_COLOR_PLOT_AXIS = "#4A4A4A"
 _CHART_COLORS = ("#0F6CBD", "#0F7B0F", "#C42B1C", "#B16CEA", "#E8A33D")
+
+
+def _palette() -> dict[str, str]:
+    """按当前主题取自绘颜色（文字 / 中性轨道 / 图表底与网格）。"""
+    if isDarkTheme():
+        return {
+            "text": "#E8E8E8", "dim": "#909090", "track": "#333333",
+            "hole": "#202020", "grid": "#3A3A3A",
+            "plot_bg": "#1B1B1B", "plot_grid": "#333333",
+            "plot_axis": "#4A4A4A",
+        }
+    return {
+        "text": "#1A1A1A", "dim": "#5A5A5A", "track": "#E2E2E2",
+        "hole": "#FFFFFF", "grid": "#D9D9D9",
+        "plot_bg": "#F4F4F4", "plot_grid": "#E3E3E3",
+        "plot_axis": "#C6C6C6",
+    }
+
+
+def _c(key: str) -> QColor:
+    """当前主题下的自绘颜色（绘制代码里的快捷取色）。"""
+    return QColor(_palette()[key])
+
+
+def _follow_theme(widget: QWidget) -> None:
+    """主题切换后重绘自绘控件（颜色在 paintEvent 里按主题实时取）。"""
+    qconfig.themeChanged.connect(lambda _theme, w=widget: w.update())
 
 
 class PieChart(QWidget):
@@ -36,6 +60,7 @@ class PieChart(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumHeight(200)
+        _follow_theme(self)
         self._segments: list[tuple[str, float, str]] = []
         self._center_text = ""
 
@@ -58,7 +83,7 @@ class PieChart(QWidget):
         area = QRectF(self.rect()).adjusted(8, 8, -8, -8)
         size = min(area.width(), area.height() - 4)
         if size <= 20 or total <= 0:
-            painter.setPen(QColor(_COLOR_TEXT_DIM))
+            painter.setPen(QColor(_c("dim")))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "暂无数据")
             return
 
@@ -77,14 +102,14 @@ class PieChart(QWidget):
 
         # 中心镂空 + 合计文字
         inner = box.adjusted(size * 0.28, size * 0.28, -size * 0.28, -size * 0.28)
-        painter.setBrush(QColor("#202020"))
+        painter.setBrush(QColor(_c("hole")))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawEllipse(inner)
 
         font = QFont(self.font())
         font.setBold(True)
         painter.setFont(font)
-        painter.setPen(QColor(_COLOR_TEXT))
+        painter.setPen(QColor(_c("text")))
         painter.drawText(inner, Qt.AlignmentFlag.AlignCenter, self._center_text)
 
 
@@ -97,6 +122,7 @@ class BarChart(QWidget):
         super().__init__(parent)
         self._rows: list[tuple[str, float, float, str]] = []
         self.setMinimumHeight(self.ROW_HEIGHT * 3)
+        _follow_theme(self)
 
     def set_data(self, rows: list[tuple[str, float, float, str]]) -> None:
         """rows 为 (名称, 数值, 参考总量, 颜色) 列表。"""
@@ -109,7 +135,7 @@ class BarChart(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
         if not self._rows:
-            painter.setPen(QColor(_COLOR_TEXT_DIM))
+            painter.setPen(QColor(_c("dim")))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "暂无数据")
             return
 
@@ -128,7 +154,7 @@ class BarChart(QWidget):
             top = index * self.ROW_HEIGHT + 3
             bar_height = self.ROW_HEIGHT - 10
 
-            painter.setPen(QColor(_COLOR_TEXT))
+            painter.setPen(QColor(_c("text")))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawText(
                 QRectF(4, top, label_width - 8, bar_height),
@@ -137,7 +163,7 @@ class BarChart(QWidget):
             )
 
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(_COLOR_TRACK))
+            painter.setBrush(QColor(_c("track")))
             painter.drawRoundedRect(QRectF(left, top, track_width, bar_height), 3, 3)
 
             ratio = (value / reference) if reference > 0 else 0.0
@@ -146,12 +172,147 @@ class BarChart(QWidget):
                 painter.setBrush(QColor(color))
                 painter.drawRoundedRect(QRectF(left, top, width, bar_height), 3, 3)
 
-            painter.setPen(QColor(_COLOR_TEXT))
+            painter.setPen(QColor(_c("text")))
             painter.drawText(
                 QRectF(right + 6, top, value_width - 6, bar_height),
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
                 f"{int(value)}",
             )
+
+
+class StackedBarChart(QWidget):
+    """堆叠条图：每行一个类别，条按子集分段着色（训练 / 验证 / 测试）。
+
+    用于「数据拆分」页展示每个类别在本套拆分下的分布：条长为该类别图片数
+    相对**全体类别最大值**的比例（类别之间可比，如 100 与 200 的条长是
+    1:2），分段为该类别在训练 / 验证 / 测试中的数量；悬停分段 / 轨道会
+    显示对应的图像数量。
+    """
+
+    ROW_HEIGHT = 26
+    LABEL_WIDTH = 150
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._rows: list[tuple[str, float, list[tuple[str, float, str]]]] = []
+        self._segment_areas: list[tuple[QRectF, str]] = []
+        self._track_areas: list[tuple[QRectF, str]] = []
+        self.setMinimumHeight(self.ROW_HEIGHT * 3)
+        self.setMouseTracking(True)
+        _follow_theme(self)
+
+    def set_data(self, rows: list) -> None:
+        """rows 为 (名称, 总数, [(标签, 数值, 颜色), ...]) 列表。"""
+        self._rows = [
+            (
+                str(name),
+                max(0.0, float(total)),
+                [
+                    (str(label), max(0.0, float(value)), str(color))
+                    for label, value, color in segments
+                ],
+            )
+            for name, total, segments in (rows or [])
+        ]
+        self._segment_areas = []
+        self._track_areas = []
+        self.setMinimumHeight(
+            max(self.ROW_HEIGHT * 3, self.ROW_HEIGHT * len(self._rows))
+        )
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        self._segment_areas = []
+        self._track_areas = []
+        if not self._rows:
+            painter.setPen(QColor(_c("dim")))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "暂无数据")
+            return
+
+        font = QFont(self.font())
+        font.setPointSizeF(max(7.5, font.pointSizeF()))
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+
+        left = self.LABEL_WIDTH + 8.0
+        right = max(left + 40.0, self.width() - 8.0)
+        track_width = right - left
+        # 条长按全体类别的最大数量归一化：类别之间可比（100 的条长是 200 的
+        # 一半），而不是每行都占满轨道——历史缺陷：按类内占比画导致等长
+        reference = max(
+            (total for _name, total, _segments in self._rows), default=1.0
+        )
+        reference = max(reference, 1.0)
+
+        for index, (name, total, segments) in enumerate(self._rows):
+            top = index * self.ROW_HEIGHT + 3
+            bar_height = self.ROW_HEIGHT - 10
+
+            # 名称（左）+ 总数（标签区右对齐）
+            painter.setPen(QColor(_c("text")))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawText(
+                QRectF(4, top, self.LABEL_WIDTH - 52.0, bar_height),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                metrics.elidedText(
+                    name, Qt.TextElideMode.ElideRight, self.LABEL_WIDTH - 56
+                ),
+            )
+            painter.setPen(QColor(_c("dim")))
+            painter.drawText(
+                QRectF(self.LABEL_WIDTH - 48.0, top, 44.0, bar_height),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
+                f"{int(round(total))}",
+            )
+
+            # 条：圆角底板 + 分段（按最大值归一化、裁剪保圆角）+ 描边
+            track = QRectF(left, top, track_width, bar_height)
+            self._track_areas.append(
+                (track, f"{name}：{int(round(total))} 张")
+            )
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(_c("track")))
+            painter.drawRoundedRect(track, 3, 3)
+            if total > 0:
+                clip = QPainterPath()
+                clip.addRoundedRect(track, 3, 3)
+                painter.save()
+                painter.setClipPath(clip)
+                start = left
+                for label, value, color in segments:
+                    if value <= 0:
+                        continue
+                    width = track_width * min(1.0, value / reference)
+                    segment_rect = QRectF(start, top, width, bar_height)
+                    painter.setBrush(QColor(color))
+                    painter.drawRect(segment_rect)
+                    self._segment_areas.append(
+                        (segment_rect, f"{label}：{int(round(value))} 张")
+                    )
+                    start += width
+                painter.restore()
+            painter.setPen(QPen(QColor(_c("grid")), 1))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(track.adjusted(0.5, 0.5, -0.5, -0.5), 3, 3)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        """悬停分段显示子集数量；悬停轨道空白显示类别总数。"""
+        pos = event.position()
+        for rect, text in self._segment_areas:
+            if rect.contains(pos):
+                QToolTip.showText(event.globalPosition().toPoint(), text, self)
+                return
+        for rect, text in self._track_areas:
+            if rect.contains(pos):
+                QToolTip.showText(event.globalPosition().toPoint(), text, self)
+                return
+        QToolTip.hideText()
+
+    def leaveEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        QToolTip.hideText()
 
 
 class LegendList(QWidget):
@@ -163,6 +324,7 @@ class LegendList(QWidget):
         super().__init__(parent)
         self._rows: list[tuple[str, str, str]] = []
         self.setMinimumHeight(self.ROW_HEIGHT * 3)
+        _follow_theme(self)
 
     def set_data(self, rows: list[tuple[str, str, str]]) -> None:
         """rows 为 (颜色, 名称, 数值文本) 列表。"""
@@ -174,7 +336,7 @@ class LegendList(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         if not self._rows:
-            painter.setPen(QColor(_COLOR_TEXT_DIM))
+            painter.setPen(QColor(_c("dim")))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "暂无数据")
             return
 
@@ -186,13 +348,13 @@ class LegendList(QWidget):
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor(color))
             painter.drawRoundedRect(QRectF(4, top + 3, 12, 12), 2, 2)
-            painter.setPen(QColor(_COLOR_TEXT))
+            painter.setPen(QColor(_c("text")))
             painter.drawText(
                 QRectF(24, top, self.width() - 84, 18),
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                 metrics.elidedText(name, Qt.TextElideMode.ElideRight, max(20, self.width() - 90)),
             )
-            painter.setPen(QColor(_COLOR_TEXT_DIM))
+            painter.setPen(QColor(_c("dim")))
             painter.drawText(
                 QRectF(self.width() - 62, top, 58, 18),
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
@@ -218,6 +380,7 @@ class ConfusionMatrixView(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumHeight(self.MIN_HEIGHT)
+        _follow_theme(self)
         self._matrix: list[list[int]] = []
         self._names: list[str] = []
         self._colors: list[str] = []
@@ -265,7 +428,7 @@ class ConfusionMatrixView(QWidget):
         matrix = self._matrix
         self._boxes = []
         if not matrix or not matrix[0]:
-            painter.setPen(QColor(_COLOR_TEXT_DIM))
+            painter.setPen(QColor(_c("dim")))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "暂无数据")
             return
 
@@ -278,7 +441,7 @@ class ConfusionMatrixView(QWidget):
         top = area.top() + self._HEADER_H
 
         # 列标题（预测类别）
-        painter.setPen(QColor(_COLOR_TEXT_DIM))
+        painter.setPen(QColor(_c("dim")))
         painter.drawText(
             QRectF(area.left(), area.top() + 2, self._LABEL_W, 14),
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
@@ -318,14 +481,14 @@ class ConfusionMatrixView(QWidget):
                     base = QColor(196, 43, 28, 40 + int(120 * value / total))
                 painter.fillRect(box.adjusted(1, 1, -1, -1), base)
                 if self._selected == (row, col):
-                    painter.setPen(QPen(QColor(_COLOR_TEXT), 2))
+                    painter.setPen(QPen(QColor(_c("text")), 2))
                     painter.drawRect(box.adjusted(1.5, 1.5, -1.5, -1.5))
 
-                painter.setPen(QColor(_COLOR_TEXT) if value else QColor(_COLOR_TEXT_DIM))
+                painter.setPen(QColor(_c("text")) if value else QColor(_c("dim")))
                 painter.drawText(box, Qt.AlignmentFlag.AlignCenter, str(value))
 
         # 底部说明
-        painter.setPen(QColor(_COLOR_TEXT_DIM))
+        painter.setPen(QColor(_c("dim")))
         painter.drawText(
             QRectF(area.left(), top + rows * cell_h + 4, area.width(), 16),
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
@@ -362,6 +525,7 @@ class HistogramView(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumHeight(self.MIN_HEIGHT)
+        _follow_theme(self)
         self._scores: list[dict] = []
         self._threshold = 0.0
         self._median = 0.0
@@ -417,12 +581,12 @@ class HistogramView(QWidget):
             max(20.0, area.width() - self._PAD_LEFT - self._PAD_RIGHT),
             max(20.0, area.height() - self._PAD_TOP - self._PAD_BOTTOM),
         )
-        painter.setPen(QPen(QColor(_COLOR_GRID), 1))
+        painter.setPen(QPen(QColor(_c("grid")), 1))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRect(plot)
 
         if not self._scores:
-            painter.setPen(QColor(_COLOR_TEXT_DIM))
+            painter.setPen(QColor(_c("dim")))
             painter.drawText(area, Qt.AlignmentFlag.AlignCenter, "暂无数据")
             return
 
@@ -462,7 +626,7 @@ class HistogramView(QWidget):
         for value, color, dashed, label in (
             (self._median, _COLOR_HIST_MEDIAN, True, "中位"),
             (self._best, _COLOR_HIST_BEST, True, "最优"),
-            (self._threshold, _COLOR_TEXT, False, ""),
+            (self._threshold, _c("text"), False, ""),
         ):
             if not value:
                 continue
@@ -480,7 +644,7 @@ class HistogramView(QWidget):
                     Qt.AlignmentFlag.AlignCenter, label,
                 )
 
-        painter.setPen(QColor(_COLOR_TEXT_DIM))
+        painter.setPen(QColor(_c("dim")))
         painter.drawText(
             QRectF(plot.left(), plot.bottom() + 2.0, plot.width() / 2, 16.0),
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
@@ -555,6 +719,7 @@ class LineChart(QWidget):
         super().__init__(parent)
         self.setMinimumHeight(self.MIN_HEIGHT)
         self.setMouseTracking(True)
+        _follow_theme(self)
         self._series: list[tuple[str, str, list[tuple[float, float]]]] = []
         self._x_label = x_label
         self._y_label = y_label
@@ -626,7 +791,7 @@ class LineChart(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         area = QRectF(self.rect())
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(_COLOR_PLOT_BG))
+        painter.setBrush(QColor(_c("plot_bg")))
         painter.drawRoundedRect(area.adjusted(0.5, 0.5, -0.5, -0.5), 6, 6)
 
         font = QFont(self.font())
@@ -636,7 +801,7 @@ class LineChart(QWidget):
 
         if not self.has_data():
             self._layout = None
-            painter.setPen(QColor(_COLOR_TEXT_DIM))
+            painter.setPen(QColor(_c("dim")))
             painter.drawText(area, Qt.AlignmentFlag.AlignCenter, "暂无数据")
             return
 
@@ -666,15 +831,15 @@ class LineChart(QWidget):
             return box.bottom() - (value - y_min) / (y_max - y_min) * box.height()
 
         # 网格 + Y 轴刻度
-        grid_pen = QPen(QColor(_COLOR_PLOT_GRID), 1)
-        axis_pen = QPen(QColor(_COLOR_PLOT_AXIS), 1)
+        grid_pen = QPen(QColor(_c("plot_grid")), 1)
+        axis_pen = QPen(QColor(_c("plot_axis")), 1)
         ticks = 4
         for index in range(ticks + 1):
             value = y_min + (y_max - y_min) * index / ticks
             y = py_of(value)
             painter.setPen(axis_pen if index == 0 else grid_pen)
             painter.drawLine(QPointF(box.left(), y), QPointF(box.right(), y))
-            painter.setPen(QColor(_COLOR_TEXT_DIM))
+            painter.setPen(QColor(_c("dim")))
             painter.drawText(
                 QRectF(area.left() + 2, y - 8, 50, 16),
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
@@ -685,13 +850,13 @@ class LineChart(QWidget):
         x_ticks = min(6, max(2, int(round(x_max - x_min))))
         for index in range(x_ticks + 1):
             value = x_min + (x_max - x_min) * index / x_ticks
-            painter.setPen(QColor(_COLOR_TEXT_DIM))
+            painter.setPen(QColor(_c("dim")))
             painter.drawText(
                 QRectF(px_of(value) - 20, box.bottom() + 2, 40, 15),
                 Qt.AlignmentFlag.AlignCenter,
                 f"{value:.0f}",
             )
-        painter.setPen(QColor(_COLOR_TEXT_DIM))
+        painter.setPen(QColor(_c("dim")))
         painter.drawText(
             QRectF(box.right() - 80, box.bottom() + 18, 80, 15),
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
@@ -717,7 +882,7 @@ class LineChart(QWidget):
             painter.drawLine(
                 QPointF(left, center_y), QPointF(left + 14, center_y)
             )
-            painter.setPen(QColor(_COLOR_TEXT))
+            painter.setPen(QColor(_c("text")))
             painter.drawText(
                 QRectF(left + 18, area.top() + 3, text_width + 6, legend_height),
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,

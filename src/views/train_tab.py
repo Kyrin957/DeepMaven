@@ -13,31 +13,40 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QPoint, Qt, QUrl, Signal
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QFileDialog,
+    QFrame,
     QGridLayout,
     QHBoxLayout,
+    QLabel,
     QStackedWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 from qfluentwidgets import (
+    Action,
     BodyLabel,
     CaptionLabel,
+    setCustomStyleSheet,
     CardWidget,
     CheckBox,
     ComboBox,
+    FluentIcon,
     LineEdit,
+    MessageBox,
     PrimaryPushButton,
     ProgressBar,
     PushButton,
+    RoundMenu,
     ScrollArea,
     SegmentedWidget,
     StrongBodyLabel,
     TableWidget,
     TextEdit,
+    TransparentToolButton,
 )
 
 from src.services.backends import for_task as backend_for_task
@@ -56,7 +65,8 @@ from src.views.data_widgets import side_column
 from src.views.dialogs import ImagePreviewDialog
 from src.views.ui import ParamGroup, SafeDoubleSpinBox, SafeSpinBox
 from src.views.ui import tokens as T
-from src.views.widgets import LegendList, LineChart, PieChart
+from src.views.ui.icons import icon
+from src.views.widgets import LineChart, PieChart
 
 # ---------------------------------------------------------------
 # 参数表：(键, 标签, 最小值, 最大值, 默认值, 步长, 后缀)
@@ -109,6 +119,208 @@ def _duration(seconds: float) -> str:
     return f"{total // 3600:02d}:{total % 3600 // 60:02d}:{total % 60:02d}"
 
 
+# 模型卡片控制按钮的追加样式（`setCustomStyleSheet`，**不得**整体替换 qf
+# 样式——替换会丢失 qf 的 text-align:center 与 :disabled 规则，历史故障：
+# 图标偏左、禁用态几乎看不出）。内容：
+# - min-width 收紧（qf 默认 106px，三枚并排会撑宽卡片，见 UI 规则 §24）；
+# - 图标 + 文字水平居中；
+# - 禁用态高对比（背景 / 文字 / 边框同时变淡）。
+_CARD_BTN_QSS = (
+    "PushButton { min-width: 0px; padding-left: 6px; padding-right: 6px;"
+    " text-align: center; }"
+    "PushButton:disabled { background-color: rgba(140, 140, 140, 0.10);"
+    " color: rgba(140, 140, 140, 0.60);"
+    " border-color: rgba(140, 140, 140, 0.22); }"
+)
+
+
+class _ModelCard(QFrame):
+    """训练模型卡片：名称（行内编辑）/ 规格 / 状态指标 + 训练控制 + 菜单。
+
+    参照 Halcon DLT 的模型卡：点击选中；名称直接在卡片上改（回车 / 失焦
+    提交，不再弹窗）；「⋯」菜单含 重命名 / 复制 / 删除 / 在文件资源管理器
+    中打开训练；底部三个等分按钮为 复位 / 开始（暂停 → 继续）/ 停止。
+    """
+
+    selected = Signal(int)
+    toggleRequested = Signal(int)     # 开始 / 暂停 / 继续（按状态切换）
+    stopRequested = Signal(int)
+    resetRequested = Signal(int)
+    renamed = Signal(int, str)        # 名称行内编辑提交（model_id, 新名称）
+    duplicateRequested = Signal(int)
+    deleteRequested = Signal(int)
+    openDirRequested = Signal(int)
+
+    def __init__(
+        self,
+        model: dict,
+        variant_label: str,
+        active: bool,
+        running: bool,
+        paused: bool,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.model_id = int(model.get("model_id", 0))
+        self._original_name = str(model.get("name") or "模型")
+        self._active = bool(active)
+        self.setObjectName("ModelCard")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(T.SPACE_LG, T.SPACE_MD, T.SPACE_LG, T.SPACE_MD)
+        layout.setSpacing(T.SPACE_XS)
+
+        head = QHBoxLayout()
+        head.setSpacing(T.SPACE_SM)
+        # 名称行内编辑：点击位置直接改，回车 / 失焦提交（不再弹输入框）
+        self.name_edit = LineEdit(self)
+        self.name_edit.setText(self._original_name)
+        self.name_edit.setToolTip("点击修改模型名称，回车确认")
+        # 追加（不替换）透明标题式样式，保留 qf 输入的焦点 / 悬停行为
+        setCustomStyleSheet(
+            self.name_edit,
+            "LineEdit { border: none; background: transparent;"
+            " padding: 1px 2px; }",
+            "LineEdit { border: none; background: transparent;"
+            " padding: 1px 2px; }",
+        )
+        self.name_edit.editingFinished.connect(self._on_name_edited)
+        head.addWidget(self.name_edit, 1)
+        self.menu_btn = TransparentToolButton(self)
+        self.menu_btn.setIcon(FluentIcon.MORE)
+        self.menu_btn.setFixedSize(T.ICON_BTN_MD, T.ICON_BTN_MD)
+        self.menu_btn.setToolTip("模型操作")
+        self.menu_btn.clicked.connect(self._show_menu)
+        head.addWidget(self.menu_btn)
+        layout.addLayout(head)
+
+        layout.addWidget(CaptionLabel(variant_label or "—", self))
+        state = self._state_text(model, running, paused)
+        self.state_label = BodyLabel(state, self)
+        self.state_label.setToolTip(state)
+        layout.addWidget(self.state_label)
+
+        # 控制按钮：图标 + 文字、等分拉伸占满卡片宽度，点击面积大、禁用态明显。
+        # 复位仅在**训练过**（暂停 / 停止 / 完成 / 失败）且非「运行中」时可用；
+        # 未训练的模型不可复位（历史：未训练也能点，语义不明）。
+        status = str(model.get("status") or "")
+        attempted = bool(
+            status in ("finished", "error", "stopped", "paused")
+            or str(model.get("metric_label") or "").strip()
+            or str(model.get("run_dir") or "").strip()
+        )
+        row = QHBoxLayout()
+        row.setSpacing(T.SPACE_SM)
+        self.reset_btn = self._tool(
+            "reset", "复位", "复位训练状态", self.resetRequested,
+            enabled=attempted and not (running and not paused),
+        )
+        row.addWidget(self.reset_btn, 1)
+        if running and not paused:
+            self.toggle_btn = self._tool(
+                "pause", "暂停", "暂停训练（本轮结束后生效）", self.toggleRequested
+            )
+        else:
+            self.toggle_btn = self._tool(
+                "play",
+                "继续" if paused else "开始",
+                "继续训练" if paused else "开始训练",
+                self.toggleRequested,
+            )
+        row.addWidget(self.toggle_btn, 1)
+        self.stop_btn = self._tool(
+            "stop", "停止", "停止训练", self.stopRequested, enabled=running
+        )
+        row.addWidget(self.stop_btn, 1)
+        layout.addLayout(row)
+
+        if not self._active:
+            for widget in (self.reset_btn, self.toggle_btn, self.stop_btn):
+                widget.setEnabled(False)
+        self._restyle()
+
+    def _on_name_edited(self) -> None:
+        """名称行内编辑提交（回车 / 失焦）：有变化才发信号。"""
+        text = self.name_edit.text().strip()
+        if text and text != self._original_name:
+            self.renamed.emit(self.model_id, text)
+
+    @staticmethod
+    def _state_text(model: dict, running: bool, paused: bool) -> str:
+        """卡片状态行：训练态 / 指标（最佳主指标 + 轮次）/ 未训练。"""
+        if running:
+            return "训练中（已暂停，可继续）" if paused else "训练中"
+        if str(model.get("status") or "") == "error":
+            return "上次训练失败"
+        label = str(model.get("metric_label") or "")
+        if label:
+            epoch = int(model.get("metric_epoch") or 0)
+            suffix = f"（第 {epoch} 轮）" if epoch else ""
+            return (
+                f"{label} {float(model.get('metric_value') or 0):.4f}{suffix}"
+            )
+        return "未训练"
+
+    def _tool(
+        self, name: str, text: str, tip: str, signal, enabled: bool = True
+    ):
+        """卡片内的控制按钮（图标 + 文字；等分拉伸、禁用态明显）。
+
+        用 `setCustomStyleSheet` **追加**样式（见 `_CARD_BTN_QSS`）：直接
+        `setStyleSheet` 会整体替换 qf 按钮样式——丢失 `text-align: center`
+        （图标偏左）与 `:disabled` 规则（禁用态几乎看不出），均为历史故障。
+        收紧 min-width 防三枚并排撑宽卡片（UI 规则 §24）。
+        """
+        button = PushButton(self)
+        button.setText(text)
+        button.setIcon(icon(name))
+        button.setToolTip(tip)
+        button.setFixedHeight(32)
+        setCustomStyleSheet(button, _CARD_BTN_QSS, _CARD_BTN_QSS)
+        button.setEnabled(enabled)
+        button.clicked.connect(lambda: signal.emit(self.model_id))
+        return button
+
+    def _restyle(self) -> None:
+        border = "#0F6CBD" if self._active else T.GROUP_BORDER
+        background = "rgba(15, 108, 189, 0.10)" if self._active else "transparent"
+        self.setStyleSheet(
+            "#ModelCard { border: 1px solid " + border + "; border-radius: 6px;"
+            " background: " + background + "; }"
+        )
+
+    def _show_menu(self) -> None:
+        menu = RoundMenu(parent=self)
+        menu.addAction(Action(
+            "重命名",
+            triggered=lambda: (
+                self.name_edit.setFocus(),
+                self.name_edit.selectAll(),
+            ),
+        ))
+        menu.addAction(Action(
+            "复制", triggered=lambda: self.duplicateRequested.emit(self.model_id)
+        ))
+        menu.addAction(Action(
+            "删除", triggered=lambda: self.deleteRequested.emit(self.model_id)
+        ))
+        menu.addSeparator()
+        menu.addAction(Action(
+            "在文件资源管理器中打开训练",
+            triggered=lambda: self.openDirRequested.emit(self.model_id),
+        ))
+        position = self.menu_btn.mapToGlobal(
+            QPoint(0, self.menu_btn.height())
+        )
+        menu.exec(position)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.selected.emit(self.model_id)
+        super().mousePressEvent(event)
+
+
 class TrainTab(QWidget):
     """模型训练页：参数设置、训练执行、实时曲线与结果。
 
@@ -157,61 +369,134 @@ class TrainTab(QWidget):
             layout.addWidget(StrongBodyLabel(title, card))
         return card, layout
 
-    # --------------------------------------------------- 左侧
+    # --------------------------------------------------- 左侧（训练模型管理）
     def _build_side(self) -> QWidget:
-        project_card, project_layout = self._card("项目")
-        self.project_name = BodyLabel("—", project_card)
-        self.project_name.setWordWrap(True)
-        project_layout.addWidget(self.project_name)
-        self.project_meta = CaptionLabel("", project_card)
-        project_layout.addWidget(self.project_meta)
+        models_card, models_layout = self._card("训练模型")
+        self.new_model_btn = PushButton("新建模型", models_card)
+        self.new_model_btn.clicked.connect(self._on_model_create)
+        models_layout.addWidget(self.new_model_btn)
+        self.models_hint = CaptionLabel("", models_card)
+        self.models_hint.setWordWrap(True)
+        models_layout.addWidget(self.models_hint)
+        self.models_holder = QVBoxLayout()
+        self.models_holder.setContentsMargins(0, 0, 0, 0)
+        self.models_holder.setSpacing(T.SPACE_SM)
+        models_layout.addLayout(self.models_holder)
+        models_layout.addStretch(1)
 
-        train_card, train_layout = self._card("模型训练")
-        variant_row = QHBoxLayout()
-        variant_row.addWidget(CaptionLabel("模型", train_card))
-        self.variant_combo = ComboBox(train_card)
-        for variant in YOLO_MODEL_VARIANTS:
-            self.variant_combo.addItem(variant["label"], userData=variant["key"])
-        variant_row.addWidget(self.variant_combo, 1)
-        train_layout.addLayout(variant_row)
+        return side_column(models_card, width=T.SIDE_W_WIDE)
 
-        self.variant_desc = CaptionLabel("", train_card)
-        train_layout.addWidget(self.variant_desc)
-
-        button_row = QHBoxLayout()
-        self.start_btn = PrimaryPushButton("开始训练", train_card)
-        self.pause_btn = PushButton("暂停", train_card)
-        self.pause_btn.setToolTip("在当前轮结束后暂停，随时可继续（不丢失进度）")
-        self.stop_btn = PushButton("停止", train_card)
-        button_row.addWidget(self.start_btn, 1)
-        button_row.addWidget(self.pause_btn)
-        button_row.addWidget(self.stop_btn)
-        train_layout.addLayout(button_row)
-
-        reset_row = QHBoxLayout()
-        self.reset_btn = PushButton("重置状态", train_card)
-        reset_row.addWidget(self.reset_btn)
-        self.continue_btn = PushButton("继续训练 (+50 轮)", train_card)
-        self.continue_btn.setToolTip(
-            "在最近一次训练的基础上追加 50 轮继续训练（断点续训，需保留 last.pt）"
+    def _rebuild_models(self) -> None:
+        """重建左侧模型卡片（活动高亮 / 训练状态 / 指标）。"""
+        while self.models_holder.count():
+            item = self.models_holder.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        models = self._vm.models()
+        active_id = self._vm.active_model_id()
+        status = str(self._vm.config.status)
+        alive = status in ("running", "paused")
+        paused = status == "paused"
+        for model in models:
+            model_id = int(model.get("model_id", 0))
+            is_active = model_id == active_id
+            card = _ModelCard(
+                model,
+                variant_label=self._variant_label_for(model),
+                active=is_active,
+                running=alive and is_active,
+                paused=paused and is_active,
+                parent=self,
+            )
+            card.selected.connect(self._on_model_selected)
+            card.toggleRequested.connect(self._on_model_toggle)
+            card.stopRequested.connect(lambda _id: self._vm.stop())
+            card.resetRequested.connect(lambda _id: self._vm.reset())
+            card.renamed.connect(self._on_model_renamed)
+            card.duplicateRequested.connect(self._on_model_duplicate)
+            card.deleteRequested.connect(self._on_model_delete)
+            card.openDirRequested.connect(self._on_model_open_dir)
+            self.models_holder.addWidget(card)
+        self.models_hint.setText(
+            "" if models else "暂无训练模型：点击「新建模型」创建"
         )
-        reset_row.addWidget(self.continue_btn)
-        reset_row.addStretch(1)
-        train_layout.addLayout(reset_row)
 
-        train_layout.addWidget(StrongBodyLabel("训练记录", train_card))
-        self.history_list = TableWidget(train_card)
-        self.history_list.setColumnCount(2)
-        self.history_list.setHorizontalHeaderLabels(["时间", "最佳"])
-        self.history_list.verticalHeader().setVisible(False)
-        self.history_list.setFixedHeight(180)
-        self.history_list.setEditTriggers(TableWidget.EditTrigger.NoEditTriggers)
-        self.history_list.setSelectionBehavior(
-            TableWidget.SelectionBehavior.SelectRows
+    @staticmethod
+    def _variant_label_for(model: dict) -> str:
+        """模型卡片规格行：变体**全名**（含任务后缀）+ 输入尺寸。
+
+        分类 / 分割 / 旋转框的权重名带任务后缀（如 ``yolo11n-cls``），
+        规格行必须显示 ``YOLO11n-cls`` 全名，避免与检测变体混淆。
+        """
+        key = str((model.get("config") or {}).get("model_key") or "")
+        base = base_variant_key(key)
+        variant = next(
+            (v for v in YOLO_MODEL_VARIANTS if v["key"] == base), None
         )
-        train_layout.addWidget(self.history_list)
+        if variant is None:
+            return key or "—"
+        suffix = key[len(base):] if key.startswith(base) else ""
+        size = int(variant.get("imgsz") or 0)
+        name = f"{variant['label']}{suffix}"
+        return f"{name} ({size}x{size})" if size else name
 
-        return side_column(project_card, train_card, width=T.SIDE_W_WIDE)
+    # --------------------------------------------------- 模型管理交互
+    def _on_model_selected(self, model_id: int) -> None:
+        if int(model_id) == self._vm.active_model_id():
+            return
+        self._vm.select_model(int(model_id))
+
+    def _on_model_toggle(self, model_id: int) -> None:
+        """卡片主按钮：开始训练 / 暂停 / 继续（按当前状态切换）。"""
+        if int(model_id) != self._vm.active_model_id():
+            self._vm.select_model(int(model_id))
+            self._sync_widgets(self._vm.config)
+            self._refresh_split()
+        status = str(self._vm.config.status)
+        if status == "running":
+            self._vm.pause()
+        elif status == "paused":
+            self._vm.resume()
+        else:
+            self._on_start()
+
+    def _on_model_create(self) -> None:
+        self._vm.create_model()
+        self._sync_widgets(self._vm.config)
+        self._refresh_split()
+
+    def _on_model_renamed(self, model_id: int, name: str) -> None:
+        """名称行内编辑提交：改名失败（同名 / 空）时重建卡片回滚显示。"""
+        if not self._vm.rename_model(int(model_id), name):
+            self._rebuild_models()
+
+    def _on_model_duplicate(self, model_id: int) -> None:
+        self._vm.duplicate_model(int(model_id))
+
+    def _on_model_delete(self, model_id: int) -> None:
+        model = next(
+            (item for item in self._vm.models()
+             if int(item.get("model_id", 0)) == int(model_id)),
+            None,
+        )
+        if model is None:
+            return
+        box = MessageBox(
+            "删除训练模型",
+            f"确定删除模型「{model.get('name')}」吗？\n\n"
+            "其训练产物目录将一并清理（训练记录保留）。",
+            self,
+        )
+        box.yesButton.setText("删除")
+        box.cancelButton.setText("取消")
+        if box.exec():
+            self._vm.remove_model(int(model_id))
+
+    def _on_model_open_dir(self, model_id: int) -> None:
+        folder = self._vm.open_model_dir(int(model_id))
+        if folder:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
 
     # --------------------------------------------------- 中央
     def _build_main(self) -> QVBoxLayout:
@@ -255,130 +540,36 @@ class TrainTab(QWidget):
         area.setWidgetResizable(True)
         area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         body = QWidget()
-        layout = QVBoxLayout(body)
-        layout.setContentsMargins(T.SPACE_XXS, T.SPACE_XXS, T.SPACE_XXS, T.SPACE_XXS)
-        layout.setSpacing(T.SPACE_ML)
-        layout.addWidget(self._build_setup_card())
-        layout.addWidget(self._build_split_card())
-        layout.addWidget(self._build_model_card())
-        layout.addWidget(self._build_param_card())
-        layout.addWidget(self._build_aug_card())
-        layout.addWidget(self._build_weight_card())
-        layout.addStretch(1)
+        # 无训练模型时整体禁用（参数属于所选模型，见 _refresh）
+        self.settings_body = body
+        # 两列紧凑排布（参照 Halcon DLT）：左列 数据 / 模型，右列 参数 / 增强；
+        # 卡片按内容自适应高度、控件按参数字符宽度收紧，不再一律纵向占满整行
+        columns = QHBoxLayout(body)
+        columns.setContentsMargins(T.SPACE_XXS, T.SPACE_XXS, T.SPACE_XXS, T.SPACE_XXS)
+        columns.setSpacing(T.SPACE_ML)
+        left = QVBoxLayout()
+        left.setSpacing(T.SPACE_ML)
+        right = QVBoxLayout()
+        right.setSpacing(T.SPACE_ML)
+        left.addWidget(self._build_split_card())
+        left.addWidget(self._build_model_card())
+        left.addWidget(self._build_weight_card())
+        left.addStretch(1)
+        right.addWidget(self._build_param_card())
+        right.addWidget(self._build_aug_card())
+        right.addStretch(1)
+        columns.addLayout(left, 1)
+        columns.addLayout(right, 1)
         area.setWidget(body)
         return area
 
-    def _build_setup_card(self) -> CardWidget:
-        """训练设置（setup）：命名保存多套训练参数，一键切换对比。"""
-        self._syncing_setup = False
-        card, layout = self._card("训练设置")
-
-        pick_row = QHBoxLayout()
-        self.setup_combo = ComboBox(card)
-        self.setup_combo.currentIndexChanged.connect(self._on_setup_picked)
-        pick_row.addWidget(self.setup_combo, 1)
-        for text, slot, tip in (
-            ("新建", self._on_setup_create, "以当前参数新建一套训练设置"),
-            ("复制", self._on_setup_duplicate, "复制当前设置（含参数）"),
-            ("删除", self._on_setup_delete, "删除当前设置（至少保留一套）"),
-        ):
-            button = PushButton(text, card)
-            button.setToolTip(tip)
-            button.clicked.connect(slot)
-            pick_row.addWidget(button)
-        layout.addLayout(pick_row)
-
-        name_row = QHBoxLayout()
-        name_row.addWidget(CaptionLabel("名称", card))
-        self.setup_name = LineEdit(card)
-        self.setup_name.setPlaceholderText("设置名称")
-        self.setup_name.editingFinished.connect(self._on_setup_renamed)
-        name_row.addWidget(self.setup_name, 1)
-        layout.addLayout(name_row)
-
-        note_row = QHBoxLayout()
-        note_row.addWidget(CaptionLabel("备注", card))
-        self.setup_note = LineEdit(card)
-        self.setup_note.setPlaceholderText("这套参数想验证什么（可选）")
-        self.setup_note.editingFinished.connect(self._on_setup_renamed)
-        note_row.addWidget(self.setup_note, 1)
-        layout.addLayout(note_row)
-
-        self.setup_hint = CaptionLabel(
-            "切换设置会先保存当前参数，再载入所选设置（随项目保存）", card
-        )
-        self.setup_hint.setWordWrap(True)
-        layout.addWidget(self.setup_hint)
-        return card
-
-    def _fill_setups(self) -> None:
-        """刷新训练设置卡片（下拉 + 名称 / 备注）。"""
-        setups = self._vm.setups()
-        active = self._vm.active_setup_id()
-        self._syncing_setup = True
-        try:
-            self.setup_combo.clear()
-            for item in setups:
-                label = str(item.get("name") or "设置")
-                note = str(item.get("note") or "")
-                self.setup_combo.addItem(
-                    f"{label} · {note}" if note else label,
-                    userData=int(item.get("setup_id", 0)),
-                )
-            if setups:
-                index = next(
-                    (
-                        position for position, item in enumerate(setups)
-                        if int(item.get("setup_id", 0)) == active
-                    ),
-                    0,
-                )
-                self.setup_combo.setCurrentIndex(index)
-            current = self._vm.active_setup()
-            self.setup_name.setText(str(current.get("name") or ""))
-            self.setup_note.setText(str(current.get("note") or ""))
-            for widget in (self.setup_combo, self.setup_name, self.setup_note):
-                widget.setEnabled(bool(setups))
-        finally:
-            self._syncing_setup = False
-
-    def _on_setup_picked(self, index: int) -> None:
-        """切换训练设置：应用参数并同步界面。"""
-        if self._syncing_setup or index < 0:
-            return
-        setup_id = int(self.setup_combo.itemData(index) or 0)
-        if self._vm.apply_setup(setup_id):
-            self._sync_widgets(self._vm.config)
-            self._refresh_split()
-            self._fill_setups()
-
-    def _on_setup_create(self) -> None:
-        self._vm.create_setup()
-        self._sync_widgets(self._vm.config)
-        self._fill_setups()
-
-    def _on_setup_duplicate(self) -> None:
-        self._vm.duplicate_setup(self._vm.active_setup_id())
-        self._sync_widgets(self._vm.config)
-        self._fill_setups()
-
-    def _on_setup_delete(self) -> None:
-        self._vm.delete_setup(self._vm.active_setup_id())
-        self._sync_widgets(self._vm.config)
-        self._refresh_split()
-        self._fill_setups()
-
-    def _on_setup_renamed(self) -> None:
-        if self._syncing_setup:
-            return
-        self._vm.rename_setup(
-            self._vm.active_setup_id(),
-            self.setup_name.text().strip(),
-            self.setup_note.text().strip(),
-        )
-        self._fill_setups()
-
     def _build_split_card(self) -> CardWidget:
+        """数据集拆分：下拉选择 + 概览（环形图 + 汇总表）。
+
+        概览部分与「数据拆分页 → 拆分概览」**逐元素一致**（环形图固定宽 +
+        右侧汇总表：色块 / 名称 / 图像数 / 百分比 + 分隔线 + 合计行）；
+        刷新由数据集 / 拆分信号自动驱动，不设「刷新」按钮。
+        """
         card, layout = self._card("数据集拆分")
         # 一个项目可以有多套拆分：训练前选择用哪一套
         pick_row = QHBoxLayout()
@@ -386,27 +577,96 @@ class TrainTab(QWidget):
         self.split_combo = ComboBox(card)
         self.split_combo.currentIndexChanged.connect(self._on_split_picked)
         pick_row.addWidget(self.split_combo, 1)
-        refresh_btn = PushButton("刷新", card)
-        refresh_btn.clicked.connect(self._refresh_split)
-        pick_row.addWidget(refresh_btn)
         layout.addLayout(pick_row)
 
-        self.data_label = BodyLabel("—", card)
-        self.data_label.setWordWrap(True)
-        layout.addWidget(self.data_label)
-
-        chart_row = QHBoxLayout()
-        chart_row.setSpacing(T.SPACE_LG)
+        body = QHBoxLayout()
+        body.setSpacing(T.SPACE_XL)
         self.pie = PieChart(card)
-        self.pie.setFixedHeight(160)
-        chart_row.addWidget(self.pie, 1)
-        self.legend = LegendList(card)
-        chart_row.addWidget(self.legend, 1)
-        layout.addLayout(chart_row)
+        self.pie.setFixedWidth(T.CTRL_W_XL)
+        body.addWidget(self.pie)
+
+        table = QGridLayout()
+        table.setHorizontalSpacing(T.SPACE_MD)
+        table.setVerticalSpacing(T.SPACE_SM)
+        table.setColumnMinimumWidth(1, T.LABEL_MIN_W)
+
+        dataset_head = CaptionLabel("数据集", card)
+        table.addWidget(dataset_head, 0, 0, 1, 2)
+        count_head = CaptionLabel("图像", card)
+        count_head.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        table.addWidget(count_head, 0, 2)
+        percent_head = CaptionLabel("百分比", card)
+        percent_head.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        table.addWidget(percent_head, 0, 3)
+
+        self.summary_rows: dict[str, dict[str, QLabel]] = {}
+        for row_index, key in enumerate(("train", "val", "test"), start=1):
+            chip = QLabel(card)
+            chip.setFixedSize(12, 12)
+            chip.setStyleSheet(
+                f"background: {SPLIT_COLORS[key]}; border-radius: 2px;"
+            )
+            name = BodyLabel(SPLIT_LABELS[key], card)
+            count = CaptionLabel("0", card)
+            count.setAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
+            percent = CaptionLabel("0 %", card)
+            percent.setAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
+            table.addWidget(chip, row_index, 0)
+            table.addWidget(name, row_index, 1)
+            table.addWidget(count, row_index, 2)
+            table.addWidget(percent, row_index, 3)
+            self.summary_rows[key] = {"count": count, "percent": percent}
+
+        divider = QWidget(card)
+        divider.setFixedHeight(1)
+        divider.setStyleSheet(f"background: {T.GROUP_BORDER};")
+        table.addWidget(divider, 4, 0, 1, 4)
+
+        total_name = StrongBodyLabel("拆分中的图像", card)
+        self.summary_total = CaptionLabel("0", card)
+        self.summary_total.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.summary_percent = CaptionLabel("0 %", card)
+        self.summary_percent.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        table.addWidget(total_name, 5, 0, 1, 2)
+        table.addWidget(self.summary_total, 5, 2)
+        table.addWidget(self.summary_percent, 5, 3)
+
+        body.addLayout(table)
+        body.addStretch(1)          # 内容靠左：不随卡片宽度铺散
+        layout.addLayout(body)
         return card
 
     def _build_model_card(self) -> CardWidget:
+        """模型与权重：变体全名（含任务后缀）+ 自定义权重（紧凑排布）。"""
         card, layout = self._card("模型与权重")
+        # 变体（模型规格）选择：属于所选训练模型的参数（参照 DLT 的「神经网络」）
+        variant_row = QHBoxLayout()
+        variant_row.addWidget(CaptionLabel("模型", card))
+        self.variant_combo = ComboBox(card)
+        # 显示名带任务后缀（分类的 yolo11n-cls → YOLO11n-cls），避免与
+        # 检测变体混淆；下拉宽度按内容收紧，不占满整行
+        task = str(self._vm.config.task_type or "detect")
+        for candidate in backend_for_task(task).candidates(task):
+            self.variant_combo.addItem(candidate["label"], userData=candidate["key"])
+        self.variant_combo.setMinimumWidth(170)
+        variant_row.addWidget(self.variant_combo)
+        variant_row.addStretch(1)
+        layout.addLayout(variant_row)
+        self.variant_desc = CaptionLabel("", card)
+        layout.addWidget(self.variant_desc)
+
         weights_row = QHBoxLayout()
         self.weights_edit = LineEdit(card)
         self.weights_edit.setPlaceholderText("自定义权重 (.pt)")
@@ -662,10 +922,26 @@ class TrainTab(QWidget):
         layout.addWidget(self._build_progress_card())
         layout.addWidget(self._build_curve_card())
         layout.addWidget(self._build_compare_card())
+        layout.addWidget(self._build_history_card())
         layout.addWidget(self._build_log_card())
         layout.addStretch(1)
         area.setWidget(body)
         return area
+
+    def _build_history_card(self) -> CardWidget:
+        """训练记录（历次运行的完成时间与最佳指标，点击回看曲线）。"""
+        card, layout = self._card("训练记录")
+        self.history_list = TableWidget(card)
+        self.history_list.setColumnCount(2)
+        self.history_list.setHorizontalHeaderLabels(["时间", "最佳"])
+        self.history_list.verticalHeader().setVisible(False)
+        self.history_list.setFixedHeight(180)
+        self.history_list.setEditTriggers(TableWidget.EditTrigger.NoEditTriggers)
+        self.history_list.setSelectionBehavior(
+            TableWidget.SelectionBehavior.SelectRows
+        )
+        layout.addWidget(self.history_list)
+        return card
 
     def _build_progress_card(self) -> CardWidget:
         card, layout = self._card("训练进度")
@@ -742,7 +1018,7 @@ class TrainTab(QWidget):
         self.model_table = TableWidget(card)
         self.model_table.setColumnCount(5)
         self.model_table.setHorizontalHeaderLabels(
-            ["选择", "时间", "拆分", "设置", "最佳"]
+            ["选择", "时间", "拆分", "训练模型", "最佳"]
         )
         self.model_table.verticalHeader().setVisible(False)
         self.model_table.setEditTriggers(TableWidget.EditTrigger.NoEditTriggers)
@@ -764,7 +1040,7 @@ class TrainTab(QWidget):
         self.compare_models = TableWidget(card)
         self.compare_models.setColumnCount(7)
         self.compare_models.setHorizontalHeaderLabels(
-            ["时间", "拆分", "设置", "模型", "最佳指标", "最佳轮次", "最终 Loss"]
+            ["时间", "拆分", "训练模型", "变体", "最佳指标", "最佳轮次", "最终 Loss"]
         )
         self.compare_models.verticalHeader().setVisible(False)
         self.compare_models.setEditTriggers(TableWidget.EditTrigger.NoEditTriggers)
@@ -777,14 +1053,10 @@ class TrainTab(QWidget):
     # 交互
     # -----------------------------------------------------------
     def _bind(self) -> None:
-        self.start_btn.clicked.connect(self._on_start)
-        self.pause_btn.clicked.connect(self._on_pause_toggle)
-        self.continue_btn.clicked.connect(self._on_continue_training)
-        self.stop_btn.clicked.connect(self._vm.stop)
-        self.reset_btn.clicked.connect(self._vm.reset)
         self.variant_combo.currentIndexChanged.connect(self._on_variant_changed)
 
         self._vm.statusChanged.connect(self._on_status)
+        self._vm.modelsChanged.connect(lambda _models: self._rebuild_models())
         self._vm.progressChanged.connect(self._on_progress)
         self._vm.metricsChanged.connect(self._on_metrics)
         self._vm.curvesChanged.connect(self._on_curves)
@@ -849,6 +1121,18 @@ class TrainTab(QWidget):
         self.variant_desc.setText(
             f"{variant['desc']} · {variant['imgsz']}px" if variant is not None else ""
         )
+
+    def _variant_index(self, key: str) -> int:
+        """下拉里模型 key 的下标：先精确匹配，再按基础名（去任务后缀）兜底。"""
+        text = str(key or "")
+        index = self.variant_combo.findData(text)
+        if index >= 0 or not text:
+            return index
+        base = base_variant_key(text)
+        for i in range(self.variant_combo.count()):
+            if base_variant_key(str(self.variant_combo.itemData(i) or "")) == base:
+                return i
+        return -1
 
     def _on_device_changed(self, _index: int = 0) -> None:
         self._update_device_hint()
@@ -941,7 +1225,7 @@ class TrainTab(QWidget):
             # 任务类型由项目类型决定：只切模型列表，不让用户改
             task = str(getattr(config, "task_type", "detect"))
             self._reload_variants(task)
-            key_index = self.variant_combo.findData(str(getattr(config, "model_key", "")))
+            key_index = self._variant_index(str(getattr(config, "model_key", "")))
             if key_index >= 0:
                 self.variant_combo.setCurrentIndex(key_index)
             self._update_variant_desc(str(getattr(config, "model_key", "")))
@@ -968,26 +1252,21 @@ class TrainTab(QWidget):
         self.variant_combo.setCurrentIndex(max(0, index))
 
     def _refresh(self) -> None:
-        """刷新项目信息、数据集拆分图与训练记录。"""
-        project = self._vm.project
+        """刷新变体描述、数据集拆分图、模型卡片与训练记录。"""
         config = self._vm.config
-        if project is not None:
-            self.project_name.setText(project.name)
-            self.project_meta.setText(
-                f"{_type_label(project.model_type)} · {config.model_key}"
-            )
-        else:
-            self.project_name.setText("—")
-            self.project_meta.setText("")
         if not self.variant_desc.text():
+            base = base_variant_key(str(config.model_key or ""))
             variant = next(
-                (v for v in YOLO_MODEL_VARIANTS if v["key"] == config.model_key), None
+                (v for v in YOLO_MODEL_VARIANTS if v["key"] == base), None
             )
             if variant is not None:
                 self.variant_desc.setText(
                     f"{variant['desc']} · {variant['imgsz']}px"
                 )
+        # 参数属于所选模型：无模型时设置页整体禁用（提示见状态栏）
+        self.settings_body.setEnabled(self._vm.has_model())
         self._refresh_split()
+        self._rebuild_models()
         self._on_history(self._vm.history())
 
     def _refresh_split(self) -> None:
@@ -1024,22 +1303,13 @@ class TrainTab(QWidget):
         if config.task_type == "anomaly":
             # 数据目录跟随当前拆分（拆分切换 / 重新划分后同步显示）
             self.anomaly_edit.setText(str(config.anomaly_root or ""))
-            self.data_label.setText(config.anomaly_root or "未选择")
-            self.pie.set_data([], "")
-            self.legend.set_data([])
+            self._set_split_summary({}, 0)
             return
 
         counts = (row or {}).get("counts") or {}
         total = int((row or {}).get("total") or 0)
         if total:
-            segments, legend = [], []
-            for name in ("train", "val", "test"):
-                count = int(counts.get(name, 0))
-                segments.append((SPLIT_LABELS[name], count, SPLIT_COLORS[name]))
-                legend.append((SPLIT_COLORS[name], SPLIT_LABELS[name], f"{count}"))
-            self.data_label.setText(f"{row['name']} · {total} 张")
-            self.pie.set_data(segments, str(total))
-            self.legend.set_data(legend)
+            self._set_split_summary(counts, total)
             return
 
         # 未生成：用当前拆分参数的预览值
@@ -1047,19 +1317,28 @@ class TrainTab(QWidget):
             self._dataset_vm.preview_split() if self._dataset_vm is not None else {}
         ) or {}
         subsets = preview.get("subsets") or {}
-        preview_total = int(preview.get("total", 0) or 0)
-        segments, legend = [], []
-        for name in ("train", "val", "test"):
-            count = int((subsets.get(name) or {}).get("count", 0))
-            segments.append((SPLIT_LABELS[name], count, SPLIT_COLORS[name]))
-            legend.append((SPLIT_COLORS[name], SPLIT_LABELS[name], f"{count}"))
-        self.pie.set_data(segments, str(preview_total) if preview_total else "")
-        self.legend.set_data(legend if preview_total else [])
-        self.data_label.setText(
-            f"{row['name']} · 未生成" if row else "未选择拆分"
+        preview_counts = {
+            name: int((subsets.get(name) or {}).get("count", 0))
+            for name in ("train", "val", "test")
+        }
+        self._set_split_summary(
+            preview_counts, int(preview.get("total", 0) or 0)
         )
         self._fill_weights()
-        self._fill_setups()
+
+    def _set_split_summary(self, counts: dict, total: int) -> None:
+        """更新拆分概览（环形图 + 汇总表；与数据拆分页概览卡同一结构）。"""
+        segments = []
+        for key in ("train", "val", "test"):
+            count = int(counts.get(key, 0) or 0)
+            segments.append((SPLIT_LABELS[key], count, SPLIT_COLORS[key]))
+            self.summary_rows[key]["count"].setText(str(count))
+            self.summary_rows[key]["percent"].setText(
+                f"{count * 100 / total:.0f} %" if total else "0 %"
+            )
+        self.pie.set_data(segments if total else [], str(total) if total else "")
+        self.summary_total.setText(str(total))
+        self.summary_percent.setText("100 %" if total else "0 %")
 
     def _on_split_picked(self, _index: int = 0) -> None:
         """在训练页切换拆分：同步项目当前拆分与训练配置。"""
@@ -1097,13 +1376,16 @@ class TrainTab(QWidget):
 
     def _on_history(self, records: list) -> None:
         """刷新左侧训练记录与「对比」页的模型列表。"""
-        # 只有多套训练设置时才在记录里标注归属，单套设置下不增加噪音
-        multi_setup = len(self._vm.setups()) > 1
+        # 只有多个训练模型时才在记录里标注归属，单模型下不增加噪音
+        multi_setup = len(self._vm.models()) > 1
         self.history_list.setRowCount(len(records))
         for row, record in enumerate(records):
             name = str(record.get("name", ""))
-            if multi_setup and record.get("setup_name"):
-                name = f"{name} · {record['setup_name']}"
+            owner = str(
+                record.get("model_name") or record.get("setup_name") or ""
+            )
+            if multi_setup and owner:
+                name = f"{name} · {owner}"
             best = record.get("best_value") or 0.0
             label = str(record.get("best_label") or "")
             self.history_list.setItem(row, 0, QTableWidgetItem(name))
@@ -1138,7 +1420,10 @@ class TrainTab(QWidget):
                 )
                 self.model_table.setItem(
                     row, 3,
-                    QTableWidgetItem(str(record.get("setup_name") or "—")),
+                    QTableWidgetItem(str(
+                        record.get("model_name")
+                        or record.get("setup_name") or "—"
+                    )),
                 )
                 self.model_table.setItem(row, 4, QTableWidgetItem(
                     f"{record.get('best_label') or ''} "
@@ -1170,15 +1455,18 @@ class TrainTab(QWidget):
         """按勾选的训练记录重建对比曲线与指标表。"""
         records = self._vm.history()
         loss_series, metric_series, rows = [], [], []
-        multi_setup = len(self._vm.setups()) > 1
+        multi_setup = len(self._vm.models()) > 1
         for index, record in enumerate(records):
             if not self._model_checked(index):
                 continue
             curves = self._vm.run_curves(index)
             color = _METRIC_COLORS[len(rows) % len(_METRIC_COLORS)]
             label = str(record.get("name") or f"#{index + 1}")
-            if multi_setup and record.get("setup_name"):
-                label = f"{label} · {record['setup_name']}"
+            owner = str(
+                record.get("model_name") or record.get("setup_name") or ""
+            )
+            if multi_setup and owner:
+                label = f"{label} · {owner}"
             loss = curves.get("loss")
             if loss:
                 loss_series.append((label, color, loss[1]))
@@ -1199,7 +1487,10 @@ class TrainTab(QWidget):
             values = [
                 str(record.get("name", "")),
                 str(record.get("split_name") or "—"),
-                str(record.get("setup_name") or "—"),
+                str(
+                    record.get("model_name")
+                    or record.get("setup_name") or "—"
+                ),
                 str(record.get("model") or "—"),
                 f"{best_label} {best_value:.4f}".strip(),
                 str(record.get("best_epoch") or "—"),
@@ -1233,29 +1524,13 @@ class TrainTab(QWidget):
         self.model_info.setText(text)
 
     def _on_status(self, status: str) -> None:
-        alive = status in ("running", "paused")
-        paused = status == "paused"
-        self.start_btn.setEnabled(not alive)
-        self.stop_btn.setEnabled(alive)
-        self.pause_btn.setEnabled(alive)
-        self.pause_btn.setText("继续" if paused else "暂停")
-        self.continue_btn.setEnabled(not alive and bool(self._vm.history()))
+        """状态变化：更新状态标签并刷新模型卡片按钮（开始 / 暂停 / 停止）。"""
         text = {
             "idle": "", "running": "训练中", "paused": "已暂停（轮边界）",
             "finished": "已完成", "error": "失败",
         }.get(status, status)
         self.state_label.setText(text)
-
-    def _on_pause_toggle(self) -> None:
-        """暂停 / 继续：按当前状态二选一。"""
-        if self._vm.is_paused():
-            self._vm.resume()
-        else:
-            self._vm.pause()
-
-    def _on_continue_training(self) -> None:
-        """在最近一次训练基础上追加轮数继续训练。"""
-        self._vm.continue_training(50)
+        self._rebuild_models()
 
     def _on_progress(self, value: float) -> None:
         self.progress_bar.setValue(int(round(value * 100)))
@@ -1356,7 +1631,4 @@ def _cell(value) -> str:
         return str(value)
 
 
-def _type_label(model_type: str) -> str:
-    from src.utils.constants import project_type
 
-    return str(project_type(model_type).get("label") or model_type)

@@ -158,6 +158,13 @@ class ClassRow(QWidget):
             layout.addWidget(
                 self._tool(FluentIcon.DELETE, "删除该类别", self.deleteRequested)
             )
+        else:
+            # 不可编辑行（「无标签」）：以同宽占位替下两个工具按钮，
+            # 保证数量与类别行的数量**右对齐**（见 RULE §17）
+            for _ in range(2):
+                holder = QWidget(self)
+                holder.setFixedSize(T.ICON_BTN_SM, T.ICON_BTN_SM)
+                layout.addWidget(holder)
 
     def _tool(self, icon, tip: str, signal) -> TransparentToolButton:
         button = TransparentToolButton(self)
@@ -254,8 +261,9 @@ class ClassCard(CardWidget):
         self.list.blockSignals(True)
         self.list.clear()
         self._items = {}
-        # 首行「无标签」（无色）：表示不给图像指定任何类别
-        self._add_row("", "", None, editable=False)
+        # 首行「无标签」（无色）：不给图像指定任何类别；数量取 counts[""]
+        # （各页面传入未标注张数，与类别行数量同样式显示）
+        self._add_row("", "", self._counts.get(""), editable=False)
         for cls in self._classes:
             self._add_row(
                 cls.name, cls.color, self._counts.get(cls.name), cls_id=cls.cls_id
@@ -396,44 +404,6 @@ class ClassCard(CardWidget):
             self._vm.move_class(int(cls_id), delta)
             self.changed.emit()
 
-
-class FilterCard(CardWidget):
-    """浏览筛选：全部 / 已标注 / 未标注。"""
-
-    filterChanged = Signal(str)      # all / annotated / unannotated
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(T.CARD_PAD_H, T.CARD_PAD_V, T.CARD_PAD_H, T.CARD_PAD_V)
-        layout.setSpacing(T.SPACE_SM)
-        layout.addWidget(StrongBodyLabel("浏览筛选", self))
-
-        self.segment = SegmentedWidget(self)
-        self._key = "all"
-        for key, text in (("all", "全部"), ("annotated", "已标注"),
-                          ("unannotated", "未标注")):
-            self.segment.addItem(key, text, onClick=lambda k=key: self._on_filter(k))
-        layout.addWidget(self.segment)
-        self.segment.setCurrentItem("all")
-
-        self.summary = CaptionLabel("共 0 张", self)
-        self.summary.setToolTip("图像总数与已标注数")
-        layout.addWidget(self.summary)
-
-    def _on_filter(self, key: str) -> None:
-        self._key = key
-        self.filterChanged.emit(key)
-
-    def set_summary(self, total: int, annotated: int) -> None:
-        self.summary.setText(f"共 {total} 张 · 已标注 {annotated} 张")
-
-    def set_filter(self, key: str) -> None:
-        self._key = key
-        self.segment.setCurrentItem(key)
-
-    def filter_key(self) -> str:
-        return self._key
 
 class SectionLabel(CaptionLabel):
     """小节标题（用于侧栏分隔）。"""

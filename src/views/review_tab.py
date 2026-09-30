@@ -2,7 +2,9 @@
 
 布局参照 Halcon DLT 的检查视图：
     左侧：已选择图像详情 / 对象实例 / 标签类别 / 质检结果
-    右侧：大卡片缩略图网格（已标注项带彩色角标与描边）
+    右侧：大卡片缩略图网格（已标注项带彩色角标与描边）——
+          顶部不放筛选容器，筛选完全由左侧「标签类别」点击驱动
+          （「无标签」行 = 未标注图片，再点当前行取消筛选）
 
 任务差异：
     * 整图任务（分类 / 异常检测）没有对象实例，按整图类别核对；
@@ -44,17 +46,10 @@ from qfluentwidgets import (
 from src.services.annotation_service import AnnotationService
 from src.viewmodels.category_vm import CategoryViewModel
 from src.viewmodels.dataset_vm import DatasetViewModel
-from src.views.data_widgets import ClassCard, FilterCard, side_column
+from src.views.data_widgets import ClassCard, side_column
 from src.views.ui import DisplayDock
 from src.views.ui import tokens as T
-from src.views.widgets import (
-    THUMB_LARGE,
-    THUMB_MEDIUM,
-    THUMB_XLARGE,
-    ThumbnailGrid,
-)
-
-_THUMB_STEPS = (THUMB_MEDIUM, THUMB_LARGE, THUMB_XLARGE)
+from src.views.widgets import THUMB_MEDIUM, THUMB_STEPS, ThumbnailGrid
 # 整图任务的数据布局（无对象实例）
 _WHOLE_IMAGE_LAYOUTS = ("classify", "anomaly_folder")
 # 对象实例的裁剪预览边长（装饰性尺寸）
@@ -67,7 +62,7 @@ _FALLBACK_COLOR = "#66CCFF"
 class ReviewTab(QWidget):
     """标注检查页。"""
 
-    requestAnnotate = Signal(str, int)     # 双击对象实例 → 标注页定位（图路径, 实例序号）
+    requestAnnotate = Signal(str, int)     # 跳转标注页（图路径, 实例序号；-1 = 不定位对象）
 
     def __init__(
         self,
@@ -78,8 +73,8 @@ class ReviewTab(QWidget):
         super().__init__(parent)
         self._vm = dataset_vm
         self._category_vm = category_vm
-        self._filter = "all"
-        self._class_filter = ""
+        # 当前筛选的类别行：None = 全部；"" = 「无标签」（未标注）；其余 = 类别名
+        self._class_filter: str | None = None
         # 页面不可见时只记录待渲染的图片，切回本页再画
         self._pending_pairs: list = []
         self._stale = True
@@ -97,9 +92,9 @@ class ReviewTab(QWidget):
         root.setContentsMargins(T.SPACE_XL, T.SPACE_LG, T.SPACE_XL, T.SPACE_LG)
         root.setSpacing(T.SPACE_LG)
 
-        # 显示调试栏：窗口右侧竖直图标（亮度 / 对比度 / 类别名 / 缩略图尺寸）
+        # 显示调试栏：窗口右侧竖直图标（亮度 / 对比度 / 缩略图尺寸；与图库页一致）
         self.display_dock = DisplayDock(self, with_size=True)
-        self.display_dock.set_thumb_steps(_THUMB_STEPS)
+        self.display_dock.set_thumb_steps(THUMB_STEPS)
 
         root.addWidget(self._build_side())
         root.addLayout(self._build_main(), 1)
@@ -161,28 +156,17 @@ class ReviewTab(QWidget):
         )
 
     def _build_main(self) -> QVBoxLayout:
+        """缩略图窗口：顶部不再放容器，筛选完全由左侧「标签类别」点击驱动。"""
         column = QVBoxLayout()
         column.setSpacing(T.SPACE_ML)
 
-        card = CardWidget(self)
-        layout = QHBoxLayout(card)
-        layout.setContentsMargins(T.SPACE_XL, T.SPACE_ML, T.SPACE_XL, T.SPACE_ML)
-        layout.setSpacing(T.SPACE_ML)
-        self.title = StrongBodyLabel("标注检查", card)
-        layout.addWidget(self.title)
-        layout.addStretch(1)
-        self.count_label = CaptionLabel("", card)
-        layout.addWidget(self.count_label)
-        column.addWidget(card)
-
-        self.filter_card = FilterCard(parent=self)
-        column.addWidget(self.filter_card)
-
         self.grid = ThumbnailGrid(self)
-        self.grid.set_thumb_steps(_THUMB_STEPS)   # 档位与调试栏滑杆一一对应
-        self.grid.set_thumb_size(THUMB_LARGE)
+        self.grid.set_thumb_steps(THUMB_STEPS)   # 档位与图库页 / 调试栏滑杆一一对应
+        self.grid.set_thumb_size(THUMB_MEDIUM)   # 默认档与图库页保持一致
         self.grid.set_wheel_zoom(True)      # Ctrl + 滚轮缩放缩略图
         column.addWidget(self.grid, 1)
+        # 档位初始值对齐网格当前尺寸（否则面板打开时读数与实际缩略图不符）
+        self.display_dock.set_thumb_size(self.grid.thumb_size())
         self._apply_display()
         return column
 
@@ -190,11 +174,12 @@ class ReviewTab(QWidget):
     # 绑定
     # -----------------------------------------------------------
     def _bind(self) -> None:
-        self.filter_card.filterChanged.connect(self._on_filter)
         self.display_dock.thumbSizeChanged.connect(self._on_thumb_size)
         self.display_dock.changed.connect(self._apply_display)
         self.grid.thumbSizeChanged.connect(self._on_grid_thumb_size)
         self.grid.imageActivated.connect(self._on_selected)
+        # 双击缩略图 → 在标注页打开该图（与图库页一致，不定位对象）
+        self.grid.imageDoubleClicked.connect(self._on_grid_double_click)
         self.class_card.classClicked.connect(self._on_class_clicked)
         self.class_card.changed.connect(self.refresh)
         self.quality_btn.clicked.connect(self._vm.run_quality_check)
@@ -211,40 +196,33 @@ class ReviewTab(QWidget):
     # -----------------------------------------------------------
     def refresh(self) -> None:
         counts = self._vm.class_distribution()
-        if self._vm.split_layout() != "classify":
-            flags = self._vm.annotated_flags()
-            counts["未标注"] = sum(1 for flag in flags if not flag)
+        flags = self._vm.annotated_flags()
+        # 「无标签」行数量 = 未标注张数（分类 / 检测统一口径，与图库 / 标注页一致）
+        counts[""] = sum(1 for flag in flags if not flag)
         if self._category_vm is not None:
             self.class_card.set_counts(counts)
             self.class_card.set_classes(list(self._category_vm.classes), counts)
 
-        pairs = self._vm.filtered_images(self._filter, self._class_filter)
+        pairs = self._filtered_pairs()
         self._pending_pairs = pairs
         # 本页不可见时不渲染缩略图，切回本页再画（避免打开项目就重建几百张图）
         if self.isVisible():
             self._render_grid()
         else:
             self._stale = True
-        total = len(self._vm.images())
-        annotated = self._vm.annotated_count()
-        self.filter_card.set_summary(total, annotated)
-        self.count_label.setText(f"显示 {len(pairs)} / {total} 张")
-
-        condition = {
-            "all": "全部", "annotated": "已标注", "unannotated": "未标注",
-        }.get(self._filter, "全部")
-        if self._class_filter:
-            condition += f" · 类别「{self._class_filter}」"
-
-        dataset = self._vm.dataset
-        self.title.setText(f"标注检查 · {dataset.name}" if dataset else "标注检查")
-        # 筛选条件与标注率走悬停提示，界面上不堆说明文字
-        self.count_label.setToolTip(
-            f"筛选：{condition} · 已标注 {annotated} 张"
-            f"（{0 if not total else round(annotated * 100 / total)}%）"
-        )
         if self.isVisible():
             self._on_selected(self.grid.current_index())
+
+    def _filtered_pairs(self) -> list:
+        """按左侧类别行的当前选择取图片。
+
+        ``None`` = 全部；``""``（「无标签」行）= 未标注图片；其余 = 该类别。
+        """
+        if self._class_filter is None:
+            return self._vm.filtered_images("all", "")
+        if self._class_filter == "":
+            return self._vm.filtered_images("unannotated", "")
+        return self._vm.filtered_images("all", self._class_filter)
 
     def _apply_display(self) -> None:
         """把显示增强参数下发给缩略图网格（只影响显示）。"""
@@ -271,7 +249,7 @@ class ReviewTab(QWidget):
 
     def refresh_marks(self) -> None:
         """只刷新「已标注」角标（切回本页时调用）。"""
-        pairs = self._vm.filtered_images(self._filter, self._class_filter)
+        pairs = self._filtered_pairs()
         if self.grid.count() != len(pairs):
             self._pending_pairs = pairs
             self._render_grid()
@@ -281,9 +259,6 @@ class ReviewTab(QWidget):
             [flag for _, flag in pairs], colors,
             classnames=self._vm.class_names_for([path for path, _ in pairs]),
         )
-        self.filter_card.set_summary(
-            len(self._vm.images()), self._vm.annotated_count()
-        )
 
     def showEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         super().showEvent(event)
@@ -292,25 +267,24 @@ class ReviewTab(QWidget):
         else:
             self.refresh_marks()
 
-    def _on_filter(self, key: str) -> None:
-        self._filter = key
-        self._class_filter = ""
-        self.refresh()
-
     def _on_class_clicked(self, name: str) -> None:
-        """点击类别行 → 只看该类别；「全部类别」清除筛选显示全图。
+        """点击类别行筛选：「无标签」= 未标注图片；再点当前行取消筛选。
 
-        选中类别时重置状态筛选，避免两个条件取交集后结果为空。
+        页面上没有独立「全部」入口——顶部筛选容器已删除，筛选完全由
+        本列表驱动（再次点击当前行即显示全部）。
         """
-        self._class_filter = name
-        if name:
-            self._filter = "all"
-            self.filter_card.set_filter("all")
+        self._class_filter = None if self._class_filter == name else name
         self.refresh()
 
     def _on_thumb_size(self, step: int) -> None:
-        index = max(0, min(len(_THUMB_STEPS) - 1, int(step)))
-        self.grid.set_thumb_size(_THUMB_STEPS[index])
+        index = max(0, min(len(THUMB_STEPS) - 1, int(step)))
+        self.grid.set_thumb_size(THUMB_STEPS[index])
+
+    def _on_grid_double_click(self, index: int) -> None:
+        """双击缩略图 → 在标注页打开该图（与图库页一致，不定位对象）。"""
+        path = self.grid.path_at(index)
+        if path:
+            self.requestAnnotate.emit(path, -1)
 
     def select_all(self) -> None:
         """全选当前筛选出的图像（Ctrl + A）。"""
@@ -478,11 +452,17 @@ class ReviewTab(QWidget):
             f"重复图片：{len(duplicates)} 组",
             f"模糊图片：{len(blurry)} 张",
             f"曝光异常：{len(exposure)} 张",
-            f"空标签：{len(labels.get('empty', []) or [])}",
-            f"越界/非法：{len(labels.get('out_of_range', []) or [])}",
-            f"缺失标签：{len(labels.get('missing', []) or [])}",
-            f"孤立标签：{len(labels.get('orphan_label', []) or [])}",
         ]
+        if labels.get("skipped"):
+            # 分类 / 异常检测：类别由目录 / 用户标记决定，没有每图标签文件
+            rows.append("标签校验：该任务无 YOLO 标签（已跳过）")
+        else:
+            rows += [
+                f"空标签：{len(labels.get('empty', []) or [])}",
+                f"越界/非法：{len(labels.get('out_of_range', []) or [])}",
+                f"缺失标签：{len(labels.get('missing_label', []) or [])}",
+                f"孤立标签：{len(labels.get('orphan_label', []) or [])}",
+            ]
         for text in rows:
             self.quality_list.addItem(QListWidgetItem(text))
 

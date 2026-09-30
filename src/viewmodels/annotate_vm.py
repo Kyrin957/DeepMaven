@@ -36,13 +36,13 @@ class AnnotateViewModel(QObject):
     imageListChanged = Signal(list)      # list[Path]
     imageChanged = Signal(int)           # 当前图片索引
     annotationLoaded = Signal(object)    # ImageAnnotation（无图片时为 None）
-    noteLoaded = Signal(str)             # 当前图片的备注文本
     statusChanged = Signal(int, int)     # 已标注张数, 总张数
     taskStarted = Signal(str)            # 后台任务开始（任务名）
     taskProgress = Signal(int, str)      # 百分比, 描述
     taskFinished = Signal(str)           # 完成描述
     taskFailed = Signal(str)             # 失败描述
     message = Signal(str, str)           # level, text
+    dirtyChanged = Signal(bool)          # 未保存标注状态变化（标题提示用）
 
     def __init__(
         self,
@@ -57,10 +57,16 @@ class AnnotateViewModel(QObject):
         self._index = -1
         self._current: ImageAnnotation | None = None
         self._dirty = False
+        # 未保存的标注改动（{图片绝对路径: ImageAnnotation}）——留在内存，
+        # 退出 / 保存项目时统一落盘；选「不保存」即丢弃（回退到修改前）
+        self._pending: dict[str, ImageAnnotation] = {}
+        self._project_path = ""
+        self._last_dirty_state = False
         self._worker: FunctionWorker | None = None
         # 数据集变化（导入 / 重新划分）后自动重建图片列表
         if dataset_vm is not None:
             dataset_vm.datasetChanged.connect(self._on_dataset_changed)
+        self._project_path = self._current_project_path()
 
     @property
     def dataset_vm(self):
@@ -68,7 +74,14 @@ class AnnotateViewModel(QObject):
         return self._dataset_vm
 
     def _on_dataset_changed(self, _dataset) -> None:
-        # 数据集已切换，旧的未保存改动不再回写（避免写错目录）
+        # 项目已切换：旧项目的未保存改动不再保留（避免写错目录）；
+        # 同一项目内的数据变化（导入 / 划分 / 元信息提交）不影响 pending
+        path = self._current_project_path()
+        if path != self._project_path:
+            self._project_path = path
+            self._pending.clear()
+            self._sync_pending_flags()
+            self._emit_dirty_state()
         self._dirty = False
         self.refresh()
 
@@ -92,6 +105,32 @@ class AnnotateViewModel(QObject):
             return self._images[self._index]
         return None
 
+    def pending_count(self) -> int:
+        """内存中未落盘的标注改动张数。"""
+        return len(self._pending)
+
+    def _current_project_path(self) -> str:
+        """当前项目文件路径（识别项目切换用）。"""
+        project = self._project_vm.project if self._project_vm else None
+        if project is None:
+            return ""
+        return str(project.params.get("path", "") or "")
+
+    def _sync_pending_flags(self) -> None:
+        """把未落盘标注的「已标注 / 未标注」状态推给数据集层（角标 / 统计用）。"""
+        if self._dataset_vm is None:
+            return
+        self._dataset_vm.set_pending_annotations(
+            {raw: bool(annotation.items) for raw, annotation in self._pending.items()}
+        )
+
+    def _emit_dirty_state(self) -> None:
+        """未保存状态变化时通知界面（标题 ● 提示）。"""
+        state = bool(self._pending)
+        if state != self._last_dirty_state:
+            self._last_dirty_state = state
+            self.dirtyChanged.emit(state)
+
     def label_dir(self) -> Path | None:
         """标签输出目录：<数据集来源>/labels（源目录缺失时用归档恢复目录）。"""
         if self._dataset_vm is None:
@@ -102,50 +141,6 @@ class AnnotateViewModel(QObject):
         """当前项目的缺陷类别定义。"""
         project = self._project_vm.project if self._project_vm else None
         return list(project.classes) if project is not None else []
-
-    # -----------------------------------------------------------
-    # 备注（以 sidecar 文本落盘，避免每次编辑都重打包项目）
-    # -----------------------------------------------------------
-    def notes_dir(self) -> Path | None:
-        """备注目录：项目文件同级的 `notes/`。
-
-        不放在数据集来源目录里 —— 否则 `.txt` 备注会被数据集扫描当成
-        YOLO 标签文件，污染类别列表与标注判定。
-        """
-        project = self._project_vm.project if self._project_vm else None
-        if project is None:
-            return None
-        path = str(project.params.get("path", "") or "")
-        if not path:
-            return None
-        return Path(path).parent / "notes"
-
-    def load_note(self, image_path) -> str:
-        """读取某张图片的备注。"""
-        notes = self.notes_dir()
-        if notes is None or image_path is None:
-            return ""
-        file = notes / f"{Path(image_path).stem}.txt"
-        try:
-            return file.read_text(encoding="utf-8") if file.is_file() else ""
-        except OSError as exc:
-            logger.warning("读取备注失败: %s", exc)
-            return ""
-
-    def save_note(self, image_path, text: str) -> None:
-        """保存某张图片的备注（空内容则删除文件）。"""
-        notes = self.notes_dir()
-        if notes is None or image_path is None:
-            return
-        file = notes / f"{Path(image_path).stem}.txt"
-        try:
-            if text.strip():
-                notes.mkdir(parents=True, exist_ok=True)
-                file.write_text(text, encoding="utf-8")
-            elif file.is_file():
-                file.unlink()
-        except OSError as exc:
-            logger.warning("保存备注失败: %s", exc)
 
     def annotated_count(self) -> int:
         """已标注张数（与图库 / 检查页共用同一判定口径）。"""
@@ -187,8 +182,18 @@ class AnnotateViewModel(QObject):
         return PROJECT_ANNOTATION.get(project.model_type, "box")
 
     def mark_dirty(self) -> None:
-        """画布等外部修改了标注内容后标记为待保存。"""
+        """画布等外部修改了标注内容后标记为待保存（信号直连入口）。"""
+        self._mark_dirty()
+
+    def _mark_dirty(self) -> None:
+        """登记当前图片的标注改动（留在内存，退出 / 保存时统一落盘）。"""
         self._dirty = True
+        path = self.current_path()
+        if path is None or self._current is None:
+            return
+        self._pending[str(path)] = self._current
+        self._sync_pending_flags()
+        self._emit_dirty_state()
 
     # -----------------------------------------------------------
     # 命令
@@ -232,29 +237,32 @@ class AnnotateViewModel(QObject):
         return -1
 
     def set_current(self, index: int) -> None:
-        """切换当前图片（自动保存上一张的未保存改动）。"""
+        """切换当前图片（未保存改动留在内存，退出 / 保存时统一落盘）。"""
         if index < 0 or index >= len(self._images):
             return
-        self._autosave()
         self._index = index
         path = self._images[index]
-        width, height = AnnotationService.image_size(path)
-
-        annotation = ImageAnnotation(name=path.name, width=width, height=height)
-        label_dir = self.label_dir()
-        if label_dir is not None:
-            label_path = AnnotationService.label_path_for(path, label_dir)
-            if label_path.is_file():
-                annotation = AnnotationService.load_yolo(label_path, width, height)
-                annotation.name = path.name
-                annotation.width = annotation.width or width
-                annotation.height = annotation.height or height
+        key = str(path)
+        cached = self._pending.get(key)
+        if cached is not None:
+            # 该图有未保存改动：直接用内存版本，不从磁盘重新加载
+            annotation = cached
+        else:
+            width, height = AnnotationService.image_size(path)
+            annotation = ImageAnnotation(name=path.name, width=width, height=height)
+            label_dir = self.label_dir()
+            if label_dir is not None:
+                label_path = AnnotationService.label_path_for(path, label_dir)
+                if label_path.is_file():
+                    annotation = AnnotationService.load_yolo(label_path, width, height)
+                    annotation.name = path.name
+                    annotation.width = annotation.width or width
+                    annotation.height = annotation.height or height
 
         self._current = annotation
-        self._dirty = False
+        self._dirty = cached is not None
         self.imageChanged.emit(index)
         self.annotationLoaded.emit(annotation)
-        self.noteLoaded.emit(self.load_note(path))
         self._emit_status()
 
     def next_image(self) -> None:
@@ -274,7 +282,7 @@ class AnnotateViewModel(QObject):
         self._current.items.append(
             Annotation(cls_id=cls_id, kind=kind, points=list(points))
         )
-        self._dirty = True
+        self._mark_dirty()
         self.annotationLoaded.emit(self._current)
         self.push_undo("添加标注", before)
 
@@ -284,7 +292,7 @@ class AnnotateViewModel(QObject):
             return
         before = self.snapshot_items()
         self._current.items.pop(index)
-        self._dirty = True
+        self._mark_dirty()
         self.annotationLoaded.emit(self._current)
         self.push_undo("删除标注", before)
 
@@ -299,7 +307,7 @@ class AnnotateViewModel(QObject):
         before = self.snapshot_items()
         for index in valid:
             self._current.items.pop(index)
-        self._dirty = True
+        self._mark_dirty()
         self.annotationLoaded.emit(self._current)
         self.push_undo("删除标注", before)
         return len(valid)
@@ -309,7 +317,7 @@ class AnnotateViewModel(QObject):
             return
         before = self.snapshot_items()
         self._current.items.clear()
-        self._dirty = True
+        self._mark_dirty()
         self.annotationLoaded.emit(self._current)
         self.push_undo("清空标注", before)
 
@@ -323,7 +331,7 @@ class AnnotateViewModel(QObject):
         before = self.snapshot_items()
         for index in valid:
             self._current.items[index].cls_id = int(cls_id)
-        self._dirty = True
+        self._mark_dirty()
         self.annotationLoaded.emit(self._current)
         self.push_undo("修改类别", before)
         return len(valid)
@@ -347,7 +355,7 @@ class AnnotateViewModel(QObject):
         item.points = moved
         if item.is_box:
             item.points = [(moved[0][0], moved[0][1]), (moved[-1][0], moved[-1][1])]
-        self._dirty = True
+        self._mark_dirty()
         self.annotationLoaded.emit(self._current)
         self.push_undo("修改标注", before, key=f"geom:{self._index}:{index}")
         return True
@@ -361,7 +369,7 @@ class AnnotateViewModel(QObject):
             return False
         before = self.snapshot_items()
         item.text = str(text or "")
-        self._dirty = True
+        self._mark_dirty()
         self.annotationLoaded.emit(self._current)
         self.push_undo("修改文本", before, key=f"text:{self._index}:{index}")
         return True
@@ -402,9 +410,8 @@ class AnnotateViewModel(QObject):
         if self._current is None:
             return
         self._current.items = [Annotation.from_dict(data) for data in snapshot]
-        self._dirty = True
+        self._mark_dirty()
         self.annotationLoaded.emit(self._current)
-        self._autosave()
 
     def save(self) -> None:
         """保存当前图片的标注。"""
@@ -421,17 +428,39 @@ class AnnotateViewModel(QObject):
             self._current,
             AnnotationService.label_path_for(path, label_dir),
         )
+        self._pending.pop(str(path), None)
         self._dirty = False
+        self._sync_pending_flags()
+        self._emit_dirty_state()
         self._emit_status()
         self.message.emit("success", f"标注已保存：{path.name}")
 
     def has_unsaved(self) -> bool:
-        """当前图片是否有未保存的标注改动（关闭 / 切换项目前的检查入口）。"""
-        return bool(self._dirty and self._current is not None)
+        """是否有未保存的标注改动（关闭 / 切换项目前的检查入口）。"""
+        return bool(self._pending)
 
     def flush_pending(self) -> None:
-        """立即保存当前图片的未保存标注（关闭 / 切换项目前的冲刷入口）。"""
-        self._autosave()
+        """把所有未保存的标注落盘（退出 / 关闭项目选「保存」时）。
+
+        写盘失败的图片保留在 pending 中，下次仍会询问。
+        """
+        label_dir = self.label_dir()
+        if label_dir is None:
+            return
+        pending, self._pending = self._pending, {}
+        for raw, annotation in pending.items():
+            try:
+                AnnotationService.save_yolo(
+                    annotation,
+                    AnnotationService.label_path_for(Path(raw), label_dir),
+                )
+            except OSError as exc:
+                logger.warning("保存标注失败（%s）: %s", raw, exc)
+                self._pending[raw] = annotation
+        self._dirty = bool(self._pending)
+        self._sync_pending_flags()
+        self._emit_dirty_state()
+        self._emit_status()
 
     # -----------------------------------------------------------
     # 半自动预标注
@@ -472,7 +501,7 @@ class AnnotateViewModel(QObject):
             self.message.emit("warning", "没有需要预标注的图片")
             return
 
-        self._autosave()
+        self.flush_pending()     # 预标注前先把未保存改动落盘（避免被批量结果覆盖）
 
         def job(progress, is_cancelled):
             detected = AutoLabelService.detect(
@@ -578,7 +607,7 @@ class AnnotateViewModel(QObject):
         if label_dir is None:
             self.message.emit("warning", "请先导入数据集")
             return
-        self._autosave()
+        self.flush_pending()     # 导出前先把未保存改动落盘（保证导出与所见一致）
 
         classes = [c.name for c in self.class_items()]
         try:
@@ -640,19 +669,6 @@ class AnnotateViewModel(QObject):
             written += 1
         return written
 
-    def _autosave(self) -> None:
-        if not self._dirty or self._current is None:
-            return
-        path = self.current_path()
-        label_dir = self.label_dir()
-        if path is None or label_dir is None:
-            return
-        AnnotationService.save_yolo(
-            self._current,
-            AnnotationService.label_path_for(path, label_dir),
-        )
-        self._dirty = False
-
     def _reload_current(self) -> None:
         if self._index >= 0:
             index = self._index
@@ -709,5 +725,4 @@ class AnnotateViewModel(QObject):
                 index + offset,
                 Annotation(cls_id=cls_id, kind=POLYGON, points=points),
             )
-        self._dirty = True
-        self.save()
+        self._mark_dirty()

@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 from qfluentwidgets import (
@@ -61,7 +61,10 @@ class TagEditDialog(MessageBoxBase):
         self.applyButton = PushButton(self.buttonGroup)
         self.applyButton.setText("应用")
         self.applyButton.setToolTip("应用但不关闭")
-        self.buttonLayout.addWidget(self.applyButton)
+        # 与 yes / cancel 同样 stretch=1：三按钮等大（见 unsaved_dialog）
+        self.buttonLayout.addWidget(
+            self.applyButton, 1, Qt.AlignmentFlag.AlignVCenter
+        )
 
         # 接管确认按钮：先校验再关闭
         try:

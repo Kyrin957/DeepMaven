@@ -118,12 +118,21 @@ class ExportViewModel(QObject):
             else ExportConfig(output_dir="runs/export")
         )
         if project is not None:
-            # 导出件落在项目文件夹里（旧项目仍是旧默认值时补齐）
+            # 导出件落在项目文件夹的 model/export 子目录（旧默认值无产物时升级）
             path = str(project.params.get("path") or "")
-            if path and str(self._config.output_dir or "").strip() in ("", "runs/export"):
-                self._config.output_dir = str(
-                    ProjectService.project_dir(path) / "export"
-                )
+            current = str(self._config.output_dir or "").strip()
+            if path:
+                legacy = {
+                    "",
+                    "runs/export",
+                    str(ProjectService.project_dir(path) / "export"),
+                }
+                if current in legacy and not (
+                    current and Path(current).is_dir()
+                ):
+                    self._config.output_dir = str(
+                        ProjectService.model_dir(path) / "export"
+                    )
         self.configChanged.emit(self._config)
         self.selectionChanged.emit(self.selection())
         self.historyChanged.emit(self.export_history())

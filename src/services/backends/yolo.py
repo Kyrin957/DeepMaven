@@ -114,9 +114,14 @@ class YoloBackend(BackendAdapter):
         return args
 
     def candidates(self, task: str) -> list[dict]:
+        # 显示名带任务后缀（分类 yolo11n-cls → YOLO11n-cls）：与权重名一致，
+        # 避免和检测同名变体混淆（历史：下拉只显示 YOLO11n，看不出任务）
         suffix = TASK_MODEL_SUFFIX.get(task, "")
         return [
-            {"key": f"{variant['key']}{suffix}", "label": variant["label"]}
+            {
+                "key": f"{variant['key']}{suffix}",
+                "label": f"{variant['label']}{suffix}",
+            }
             for variant in YOLO_MODEL_VARIANTS
         ]
 

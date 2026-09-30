@@ -53,6 +53,7 @@ PAGE_PAD_V = 16
 SIDE_W_NARROW = 240        # 标注页左栏（缩略图为主）
 SIDE_W = 268               # 通用信息/参数侧栏
 SIDE_W_WIDE = 290          # 训练页左栏（含模型选择与训练记录）
+SIDE_W_WIDER = 320         # 数据拆分页左栏（比例 / 图像数双列输入）
 
 # ---------------------------------------------------------------------------
 # 数值输入（步进器）宽度策略
@@ -179,7 +180,7 @@ __all__ = [
     "SPACE_XXS", "SPACE_XS", "SPACE_SM", "SPACE_MD", "SPACE_ML", "SPACE_LG",
     "SPACE_XL", "SPACE_2XL", "SPACE_XXL",
     "CARD_PAD_H", "CARD_PAD_V", "PAGE_PAD_H", "PAGE_PAD_V",
-    "SIDE_W_NARROW", "SIDE_W", "SIDE_W_WIDE",
+    "SIDE_W_NARROW", "SIDE_W", "SIDE_W_WIDE", "SIDE_W_WIDER",
     "STEPPER_CHARS_NARROW", "STEPPER_CHARS", "STEPPER_CHARS_WIDE",
     "STEPPER_MIN_W", "LABEL_MIN_W", "ROW_H",
     "STEPPER_CHROME_W_INLINE", "STEPPER_CHROME_W_COMPACT", "STEPPER_CHROME_W_PLAIN",

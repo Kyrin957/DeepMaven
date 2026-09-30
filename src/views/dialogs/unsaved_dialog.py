@@ -17,8 +17,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QPushButton
-from qfluentwidgets import BodyLabel, MessageBoxBase, SubtitleLabel
+from qfluentwidgets import BodyLabel, MessageBoxBase, PushButton, SubtitleLabel
 
 SAVE = "save"
 DISCARD = "discard"
@@ -39,16 +38,22 @@ class UnsavedChangesDialog(MessageBoxBase):
         self.bodyLabel.setWordWrap(True)
         self.viewLayout.addWidget(self.titleLabel)
         self.viewLayout.addWidget(self.bodyLabel)
+        # 与其余弹窗一致的最小宽度：三按钮有足够空间平分（不设时
+        # show 阶段宽度被内容压小、按钮挤成一团）
+        self.widget.setMinimumWidth(460)
 
         # 按钮行（左 → 右）：保存 / 不保存 / 取消
         # 右上角 ✕ 与 Esc 走 cancelButton 的 reject，即「取消」
         self.yesButton.setText("保存")
         self.cancelButton.setText("取消")
-        self.discardButton = QPushButton("不保存", self.buttonGroup)
-        self.discardButton.setAttribute(
-            Qt.WidgetAttribute.WA_LayoutUsesWidgetRect, True
+        # 用 qf 的 PushButton（原生 QPushButton 不在 DIALOG 样式内，
+        # 高度比同类按钮矮一截——历史问题：按钮显小）
+        self.discardButton = PushButton("不保存", self.buttonGroup)
+        # 与 yes / cancel 同样 stretch=1：三按钮等大（无 stretch 时只有
+        # 文字自然宽、明显偏小——MessageBoxBase 的按钮靠平分剩余宽度）
+        self.buttonLayout.insertWidget(
+            1, self.discardButton, 1, Qt.AlignmentFlag.AlignVCenter
         )
-        self.buttonLayout.insertWidget(1, self.discardButton)
 
         self.yesButton.clicked.connect(self._on_save)
         self.discardButton.clicked.connect(self._on_discard)

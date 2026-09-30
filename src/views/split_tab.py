@@ -1,23 +1,24 @@
 """数据拆分页：划分比例配置、拆分预览。
 
-布局参照 Halcon DLT 的拆分视图：
-    左侧：拆分设置 / 拆分概览（环形图 + 图例）
-    右侧：类别分布预览（条形图）、拆分产物
+布局参照 Halcon DLT 的拆分视图，按「管理 / 信息」分区、卡片式承载：
+    左侧：拆分管理——拆分列表（新建 / 复制 / 删除）+ 拆分设置 + 执行拆分
+    右侧：信息区——拆分概览（环形图 + 汇总表）/ 类别分布预览（堆叠条）
 
 数据增强只在训练页做（在线增强），本页不提供离线增强。
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QRect, Qt
 from PySide6.QtWidgets import (
-    QCheckBox,
+    QFrame,
     QGridLayout,
     QHBoxLayout,
+    QLabel,
     QListWidget,
     QListWidgetItem,
+    QScrollArea,
+    QStyledItemDelegate,
     QVBoxLayout,
     QWidget,
 )
@@ -25,9 +26,7 @@ from qfluentwidgets import (
     BodyLabel,
     CaptionLabel,
     CardWidget,
-    LineEdit,
     MessageBox,
-    PrimaryPushButton,
     PushButton,
     StrongBodyLabel,
 )
@@ -37,13 +36,42 @@ from src.utils.constants import SPLIT_COLORS, SPLIT_LABELS, UNLABELED_LABEL
 from src.viewmodels.category_vm import CategoryViewModel
 from src.viewmodels.dataset_vm import DatasetViewModel
 from src.views.data_widgets import side_column
-from src.views.ui import SafeCompactSpinBox, SafeSpinBox
+from src.views.dialogs import (
+    CREATE_APPLY,
+    MODE_CREATE,
+    MODE_EDIT,
+    SAVE_APPLY,
+    SplitEditDialog,
+)
+from src.views.ui import SafeCompactSpinBox
 from src.views.ui import tokens as T
-from src.views.widgets import BarChart, LegendList, PieChart
+from src.views.ui.icons import icon
+from src.views.widgets import PieChart, StackedBarChart
 
-_COLOR_UNLABELED = "#8A8A8A"
 # 异常检测的类别显示名（对应 ClassDef.kind）
 _KIND_LABELS = {"normal": "良好图像", "abnormal": "异常图像"}
+
+# 拆分列表行数据：锁定原因（"" / running / used）——被训练引用的拆分
+# 在行右端绘制锁图标（见 _SplitListDelegate），按钮同步禁用
+_LOCKED_ROLE = Qt.ItemDataRole.UserRole + 1
+
+
+class _SplitListDelegate(QStyledItemDelegate):
+    """拆分列表项：被训练引用的拆分在行右端追加锁图标。"""
+
+    ICON_SIZE = 16
+
+    def paint(self, painter, option, index) -> None:  # noqa: N802 - Qt 命名
+        super().paint(painter, option, index)
+        if not index.data(_LOCKED_ROLE):
+            return
+        rect = QRect(
+            option.rect.right() - self.ICON_SIZE - 6,
+            option.rect.center().y() - self.ICON_SIZE // 2,
+            self.ICON_SIZE,
+            self.ICON_SIZE,
+        )
+        icon("locked").paint(painter, rect)
 
 
 class SplitTab(QWidget):
@@ -71,11 +99,11 @@ class SplitTab(QWidget):
     # -----------------------------------------------------------
     def _build_ui(self) -> None:
         root = QHBoxLayout(self)
-        root.setContentsMargins(T.SPACE_XL, T.SPACE_LG, T.SPACE_XL, T.SPACE_LG)
+        root.setContentsMargins(T.PAGE_PAD_H, T.PAGE_PAD_V, T.PAGE_PAD_H, T.PAGE_PAD_V)
         root.setSpacing(T.SPACE_LG)
 
         root.addWidget(self._build_side())
-        root.addLayout(self._build_main(), 1)
+        root.addWidget(self._build_main(), 1)
 
     def _build_side(self) -> QWidget:
         # 拆分列表：一个项目可以有多套拆分（横向比较不同划分）
@@ -86,100 +114,43 @@ class SplitTab(QWidget):
         list_layout.addWidget(StrongBodyLabel("拆分列表", self.list_card))
         self.split_list = QListWidget(self.list_card)
         self.split_list.setMinimumHeight(120)
+        self.split_list.setItemDelegate(_SplitListDelegate(self.split_list))
         self.split_list.currentRowChanged.connect(self._on_split_selected)
         list_layout.addWidget(self.split_list)
 
         tools = QHBoxLayout()
         tools.setSpacing(T.SPACE_SM)
         self.add_split_btn = PushButton("新建", self.list_card)
+        self.edit_split_btn = PushButton("编辑", self.list_card)
         self.copy_split_btn = PushButton("复制", self.list_card)
         self.del_split_btn = PushButton("删除", self.list_card)
         self.add_split_btn.clicked.connect(self._on_add_split)
+        self.edit_split_btn.clicked.connect(self._on_edit_split)
         self.copy_split_btn.clicked.connect(self._on_duplicate_split)
         self.del_split_btn.clicked.connect(self._on_delete_split)
-        for button in (self.add_split_btn, self.copy_split_btn, self.del_split_btn):
+        for button in (
+            self.add_split_btn, self.edit_split_btn,
+            self.copy_split_btn, self.del_split_btn,
+        ):
             tools.addWidget(button)
         list_layout.addLayout(tools)
 
-        self.setting_card = CardWidget(self)
-        layout = QVBoxLayout(self.setting_card)
-        layout.setContentsMargins(T.CARD_PAD_H, T.CARD_PAD_V, T.CARD_PAD_H, T.CARD_PAD_V)
-        layout.setSpacing(T.SPACE_SM)
-        layout.addWidget(StrongBodyLabel("拆分设置", self.setting_card))
-
-        name_row = QHBoxLayout()
-        name_row.addWidget(CaptionLabel("拆分名称", self.setting_card))
-        self.name_edit = LineEdit(self.setting_card)
-        self.name_edit.setText("ExampleSplit")
-        name_row.addWidget(self.name_edit, 1)
-        layout.addLayout(name_row)
-
-        self.ratio_spins: dict[str, SafeSpinBox] = {}
-        self.ratio_rows: dict[str, QWidget] = {}
-        for key in ("train", "val", "test"):
-            row_widget = QWidget(self.setting_card)
-            row = QHBoxLayout(row_widget)
-            row.setContentsMargins(0, 0, 0, 0)
-            row.setSpacing(T.SPACE_MD)
-            row.addWidget(CaptionLabel(SPLIT_LABELS[key], row_widget))
-            spin = SafeSpinBox(row_widget)
-            spin.setRange(0, 100)
-            spin.setSuffix(" %")
-            spin.setValue({"train": 70, "val": 20, "test": 10}[key])
-            spin.setFixedWidth(
-                T.field_width(spin, T.STEPPER_CHARS_NARROW)
-            )
-            spin.valueChanged.connect(lambda _v: self._on_ratio_changed())
-            row.addWidget(spin)
-            row.addStretch(1)
-            layout.addWidget(row_widget)
-            self.ratio_spins[key] = spin
-            self.ratio_rows[key] = row_widget
-
-        seed_row = QHBoxLayout()
-        seed_row.setSpacing(T.SPACE_MD)
-        seed_row.addWidget(CaptionLabel("随机种子", self.setting_card))
-        self.seed_spin = SafeSpinBox(self.setting_card)
-        self.seed_spin.setRange(0, 99999)
-        self.seed_spin.setFixedWidth(
-            T.field_width(self.seed_spin, T.STEPPER_CHARS)
+        # 异常检测：按类别分配（良好 / 异常 × 训练 / 验证 / 测试）——
+        # 参数编辑自成一张卡、仅异常任务可见；拆分信息（名称 / 比例 / 张数）
+        # 都在列表行里，不再另设「当前拆分」信息卡
+        self.anomaly_card = CardWidget(self)
+        anomaly_layout = QVBoxLayout(self.anomaly_card)
+        anomaly_layout.setContentsMargins(
+            T.CARD_PAD_H, T.CARD_PAD_V, T.CARD_PAD_H, T.CARD_PAD_V
         )
-        self.seed_spin.valueChanged.connect(lambda _v: self._on_seed_changed())
-        seed_row.addWidget(self.seed_spin)
-        seed_row.addStretch(1)
-        layout.addLayout(seed_row)
+        anomaly_layout.setSpacing(T.SPACE_SM)
+        anomaly_layout.addWidget(StrongBodyLabel("类别分配", self.anomaly_card))
+        anomaly_layout.addWidget(self._build_anomaly_card())
 
-        self.stratified_check = QCheckBox("按类别分层抽样（推荐）", self.setting_card)
-        self.stratified_check.setChecked(True)
-        self.stratified_check.stateChanged.connect(
-            lambda _s: self._on_stratified_changed()
-        )
-        layout.addWidget(self.stratified_check)
-
-        # 异常检测：按类别分配（良好 / 异常 × 训练 / 验证 / 测试）
-        self.anomaly_card = self._build_anomaly_card()
-        layout.addWidget(self.anomaly_card)
-
-        button_row = QHBoxLayout()
-        button_row.setSpacing(T.SPACE_SM)
-        self.preview_btn = PushButton("刷新预览", self.setting_card)
-        self.apply_btn = PrimaryPushButton("执行拆分", self.setting_card)
-        button_row.addWidget(self.preview_btn)
-        button_row.addWidget(self.apply_btn, 1)
-        layout.addLayout(button_row)
-
-        self.overview_card = CardWidget(self)
-        overview_layout = QVBoxLayout(self.overview_card)
-        overview_layout.setContentsMargins(T.CARD_PAD_H, T.CARD_PAD_V, T.CARD_PAD_H, T.CARD_PAD_V)
-        overview_layout.setSpacing(T.SPACE_SM)
-        overview_layout.addWidget(StrongBodyLabel("拆分概览", self.overview_card))
-        self.pie = PieChart(self.overview_card)
-        overview_layout.addWidget(self.pie)
-        self.legend = LegendList(self.overview_card)
-        overview_layout.addWidget(self.legend)
-
+        # 左栏只做「拆分管理」：拆分列表（+ 异常任务的类别分配）；
+        # 拆分概览 / 类别分布等信息卡在右侧主区（见 _build_main）
         return side_column(
-            self.list_card, self.setting_card, self.overview_card, width=300
+            self.list_card, self.anomaly_card, width=T.SIDE_W_WIDER
         )
 
     # -----------------------------------------------------------
@@ -196,7 +167,7 @@ class SplitTab(QWidget):
         按类别分块竖排，数值框改用**紧凑步进器**（省 54px/个）并按字体度量
         定宽（``tokens.field_width()``），字体 / 缩放变化时数字仍然完整可见。
         """
-        holder = QWidget(self.setting_card)
+        holder = QWidget(self.anomaly_card)
         grid = QGridLayout(holder)
         grid.setContentsMargins(0, 0, 0, 0)
         grid.setHorizontalSpacing(T.SPACE_MD)
@@ -250,11 +221,8 @@ class SplitTab(QWidget):
         return holder
 
     def _refresh_anomaly_card(self) -> None:
-        """按任务显示：异常检测显示类别分配表，其余任务显示比例行。"""
+        """按任务显示：异常检测显示类别分配表，其余任务隐藏（参数在弹窗）。"""
         is_anomaly = self._vm.is_anomaly()
-        for row in self.ratio_rows.values():
-            row.setVisible(not is_anomaly)
-        self.stratified_check.setVisible(not is_anomaly)
         self.anomaly_card.setVisible(is_anomaly)
         if not is_anomaly:
             return
@@ -319,55 +287,139 @@ class SplitTab(QWidget):
         self._apply_anomaly_plan()
         self._vm.set_anomaly_allocation(self._anomaly_plan)
 
-    def _build_main(self) -> QVBoxLayout:
-        column = QVBoxLayout()
+    def _build_main(self) -> QWidget:
+        """右侧信息区（滚动 + 卡片式）：拆分概览 / 类别分布。
+
+        卡片顶对齐、统一内边距与间距，底部留白；内容超高时本区自身滚动——
+        页面尺寸策略为 Ignored，最小高度不得沿布局传导到窗口
+        （与 `data_widgets.side_column` 的同款处理，见 UI 规则 §5）。
+        """
+        content = QWidget()
+        column = QVBoxLayout(content)
+        column.setContentsMargins(0, 0, 0, 0)
         column.setSpacing(T.SPACE_ML)
 
-        card = CardWidget(self)
-        layout = QHBoxLayout(card)
-        layout.setContentsMargins(T.SPACE_XL, T.SPACE_ML, T.SPACE_XL, T.SPACE_ML)
-        layout.setSpacing(T.SPACE_ML)
-        self.title = StrongBodyLabel("数据拆分", card)
-        layout.addWidget(self.title)
-        layout.addStretch(1)
-        self.reload_btn = PushButton("刷新", card)
-        layout.addWidget(self.reload_btn)
-        column.addWidget(card)
+        column.addWidget(self._build_overview_card(content))
+        column.addWidget(self._build_class_card(content))
+        column.addStretch(1)
 
-        class_card = CardWidget(self)
-        class_layout = QVBoxLayout(class_card)
-        class_layout.setContentsMargins(T.SPACE_XL, T.SPACE_LG, T.SPACE_XL, T.SPACE_LG)
-        class_layout.setSpacing(T.SPACE_SM)
-        class_layout.addWidget(StrongBodyLabel("类别分布预览", class_card))
-        self.class_hint = CaptionLabel("", class_card)
-        class_layout.addWidget(self.class_hint)
-        self.bar_chart = BarChart(class_card)
-        class_layout.addWidget(self.bar_chart)
-        column.addWidget(class_card)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        scroll.viewport().setAutoFillBackground(False)
+        scroll.setWidget(content)
+        return scroll
 
-        output_card = CardWidget(self)
-        output_layout = QVBoxLayout(output_card)
-        output_layout.setContentsMargins(T.SPACE_XL, T.SPACE_LG, T.SPACE_XL, T.SPACE_LG)
-        output_layout.setSpacing(T.SPACE_SM)
-        output_layout.addWidget(StrongBodyLabel("拆分产物", output_card))
-        self.output_label = BodyLabel("—", output_card)
-        self.output_label.setWordWrap(True)
-        output_layout.addWidget(self.output_label)
-        self.yaml_label = BodyLabel("—", output_card)
-        self.yaml_label.setWordWrap(True)
-        output_layout.addWidget(self.yaml_label)
-        column.addWidget(output_card)
-        return column
+    # -----------------------------------------------------------
+    # 右侧信息卡
+    # -----------------------------------------------------------
+    def _build_overview_card(self, parent: QWidget) -> QWidget:
+        """拆分概览：环形图 + 汇总表（参照 DLT 的「数据拆分细节」）。
+
+        环形图固定宽度、汇总表用控件排版（数值不会被遮挡），内容靠左、
+        不随卡片宽度铺散；表底是分隔线 + 合计行。
+        """
+        card = CardWidget(parent)
+        self.overview_card = card
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(
+            T.CARD_PAD_H, T.CARD_PAD_V, T.CARD_PAD_H, T.CARD_PAD_V
+        )
+        layout.setSpacing(T.SPACE_SM)
+        layout.addWidget(StrongBodyLabel("拆分概览", card))
+
+        body = QHBoxLayout()
+        body.setSpacing(T.SPACE_XL)
+        self.pie = PieChart(card)
+        self.pie.setFixedWidth(T.CTRL_W_XL)
+        body.addWidget(self.pie)
+
+        table = QGridLayout()
+        table.setHorizontalSpacing(T.SPACE_MD)
+        table.setVerticalSpacing(T.SPACE_SM)
+        table.setColumnMinimumWidth(1, T.LABEL_MIN_W)
+
+        dataset_head = CaptionLabel("数据集", card)
+        table.addWidget(dataset_head, 0, 0, 1, 2)
+        count_head = CaptionLabel("图像", card)
+        count_head.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        table.addWidget(count_head, 0, 2)
+        percent_head = CaptionLabel("百分比", card)
+        percent_head.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        table.addWidget(percent_head, 0, 3)
+
+        self.summary_rows: dict[str, dict[str, QLabel]] = {}
+        for row, key in enumerate(("train", "val", "test"), start=1):
+            chip = QLabel(card)
+            chip.setFixedSize(12, 12)
+            chip.setStyleSheet(
+                f"background: {SPLIT_COLORS[key]}; border-radius: 2px;"
+            )
+            name = BodyLabel(SPLIT_LABELS[key], card)
+            count = CaptionLabel("0", card)
+            count.setAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
+            percent = CaptionLabel("0 %", card)
+            percent.setAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
+            table.addWidget(chip, row, 0)
+            table.addWidget(name, row, 1)
+            table.addWidget(count, row, 2)
+            table.addWidget(percent, row, 3)
+            self.summary_rows[key] = {"count": count, "percent": percent}
+
+        divider = QWidget(card)
+        divider.setFixedHeight(1)
+        divider.setStyleSheet(f"background: {T.GROUP_BORDER};")
+        table.addWidget(divider, 4, 0, 1, 4)
+
+        total_name = StrongBodyLabel("拆分中的图像", card)
+        self.summary_total = CaptionLabel("0", card)
+        self.summary_total.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.summary_percent = CaptionLabel("0 %", card)
+        self.summary_percent.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        table.addWidget(total_name, 5, 0, 1, 2)
+        table.addWidget(self.summary_total, 5, 2)
+        table.addWidget(self.summary_percent, 5, 3)
+
+        body.addLayout(table)
+        body.addStretch(1)          # 内容靠左：不随卡片宽度铺散
+        layout.addLayout(body)
+        return card
+
+    def _build_class_card(self, parent: QWidget) -> QWidget:
+        """类别分布预览：每个类别一行堆叠条（训练 / 验证 / 测试分段）。"""
+        card = CardWidget(parent)
+        self.class_card = card
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(
+            T.CARD_PAD_H, T.CARD_PAD_V, T.CARD_PAD_H, T.CARD_PAD_V
+        )
+        layout.setSpacing(T.SPACE_SM)
+        layout.addWidget(StrongBodyLabel("类别分布预览", card))
+        self.class_hint = CaptionLabel("", card)
+        layout.addWidget(self.class_hint)
+        self.bar_chart = StackedBarChart(card)
+        layout.addWidget(self.bar_chart)
+        return card
 
     # -----------------------------------------------------------
     # 绑定
     # -----------------------------------------------------------
     def _bind(self) -> None:
-        self.reload_btn.clicked.connect(self.refresh)
-        self.preview_btn.clicked.connect(self._on_preview_clicked)
-        self.apply_btn.clicked.connect(self._on_apply)
-        self.name_edit.editingFinished.connect(self._on_name_changed)
-
         self._vm.datasetChanged.connect(lambda _d: self.refresh())
         self._vm.taskFinished.connect(lambda _t: self.refresh())
         self._vm.splitsChanged.connect(lambda _rows: self.refresh())
@@ -376,29 +428,6 @@ class SplitTab(QWidget):
     # 刷新
     # -----------------------------------------------------------
     def refresh(self) -> None:
-        dataset = self._vm.dataset
-        self.title.setText(f"数据拆分 · {dataset.name}" if dataset else "数据拆分")
-
-        self._syncing = True
-        if dataset is not None:
-            self.ratio_spins["train"].setValue(int(round(dataset.split_train * 100)))
-            self.ratio_spins["val"].setValue(int(round(dataset.split_val * 100)))
-            self.ratio_spins["test"].setValue(int(round(dataset.split_test * 100)))
-            self.seed_spin.setValue(int(dataset.seed))
-            self.stratified_check.setChecked(bool(dataset.stratified))
-            self.output_label.setText(f"输出目录：{dataset.output_path or '—'}")
-            # 分类 / 异常检测以目录本体作为数据集，不存在 data.yaml
-            yaml_path = str(dataset.data_yaml or "")
-            has_yaml = bool(yaml_path) and not Path(yaml_path).is_dir()
-            self.yaml_label.setText(
-                f"数据集配置：{yaml_path}" if has_yaml else "数据集配置：—"
-            )
-        else:
-            self.output_label.setText("输出目录：—")
-            self.yaml_label.setText("数据集配置：—")
-        self.name_edit.setText(self._vm.split_name())
-        self._syncing = False
-
         self._refresh_splits()
         self._apply_lock_state()
         self._refresh_preview()
@@ -422,12 +451,36 @@ class SplitTab(QWidget):
                     text += f"  {row['total']} 张"
                 item = QListWidgetItem(text)
                 item.setData(Qt.ItemDataRole.UserRole, int(row["id"]))
+                reason = str(row.get("lock_reason") or "")
+                item.setData(_LOCKED_ROLE, bool(reason))
+                if reason:
+                    # 光标信息说明拆分状态（行右端另有锁图标）
+                    item.setToolTip(
+                        "该拆分正在训练中，无法编辑或删除"
+                        if reason == "running"
+                        else "该拆分已用于训练，无法编辑或删除"
+                    )
                 self.split_list.addItem(item)
                 if int(row["id"]) == active_id:
                     self.split_list.setCurrentRow(self.split_list.count() - 1)
         finally:
             self._syncing = False
-        self.del_split_btn.setEnabled(len(rows) > 1)
+        # 按钮可用性：只有被训练引用（训练中 / 暂停 / 已训练过）的拆分
+        # 不可编辑与删除——不再要求「至少保留一套」（可删光回到空态）
+        reason = self._vm.split_lock_reason()
+        has_selection = bool(rows) and self.split_list.currentRow() >= 0
+        self.edit_split_btn.setEnabled(has_selection and not reason)
+        self.edit_split_btn.setToolTip(
+            "该拆分正在训练中，无法编辑" if reason == "running"
+            else "该拆分已用于训练，无法编辑" if reason
+            else ""
+        )
+        self.del_split_btn.setEnabled(has_selection and not reason)
+        self.del_split_btn.setToolTip(
+            "该拆分正在训练中，无法删除" if reason == "running"
+            else "该拆分已用于训练，无法删除" if reason
+            else ""
+        )
 
     def _on_split_selected(self, row: int) -> None:
         if self._syncing or row < 0:
@@ -443,8 +496,67 @@ class SplitTab(QWidget):
         self.refresh()
 
     def _on_add_split(self) -> None:
-        self._vm.add_split()
+        """新建拆分：弹窗确认名称 / 分配，可一键创建并执行拆分。"""
+        dialog = SplitEditDialog(
+            self.window(),
+            mode=MODE_CREATE,
+            name=self._vm.suggest_split_name(),
+            total=len(self._vm.images()),
+            ratios=(0.7, 0.2, 0.1),
+            seed=0,
+            stratified=True,
+        )
+        choice = dialog.exec_choice()
+        if not choice:
+            return
+        values = dialog.values()
+        split_id = self._vm.add_split(values["name"])
+        if split_id < 0:
+            return
+        self._apply_split_values(split_id, values)
         self.refresh()
+        if choice == CREATE_APPLY:
+            self._vm.apply_split()
+
+    def _on_edit_split(self) -> None:
+        """编辑当前拆分：弹窗确认后保存，可选重新执行拆分。"""
+        split = self._vm.active_split()
+        if split is None:
+            self._vm.notify("请先创建或打开项目", "warning")
+            return
+        reason = self._vm.split_lock_reason(split.split_id)
+        if reason:
+            self._vm.notify(
+                "该拆分正在训练中，无法编辑" if reason == "running"
+                else "该拆分已用于训练，无法编辑",
+                "warning",
+            )
+            return
+        dialog = SplitEditDialog(
+            self.window(),
+            mode=MODE_EDIT,
+            name=split.name,
+            total=len(self._vm.images()),
+            ratios=(split.train, split.val, split.test),
+            seed=int(split.seed),
+            stratified=bool(split.stratified),
+        )
+        choice = dialog.exec_choice()
+        if not choice:
+            return
+        values = dialog.values()
+        self._apply_split_values(split.split_id, values)
+        self.refresh()
+        if choice == SAVE_APPLY:
+            self._vm.apply_split()
+
+    def _apply_split_values(self, split_id: int, values: dict) -> None:
+        """把弹窗结果写入拆分（名称 / 比例 / 自定义种子 / 分层）。"""
+        self._vm.rename_split(split_id, values["name"])
+        self._vm.set_split(*values["ratios"], quiet=True)
+        if values.get("seed") is not None:
+            self._vm.set_seed(values["seed"], quiet=True)
+        self._vm.set_stratified(values["stratified"])
 
     def _on_duplicate_split(self) -> None:
         active = self._vm.active_split()
@@ -456,10 +568,18 @@ class SplitTab(QWidget):
         active = self._vm.active_split()
         if active is None:
             return
+        reason = self._vm.split_lock_reason(active.split_id)
+        if reason:
+            self._vm.notify(
+                "该拆分正在训练中，无法删除" if reason == "running"
+                else "该拆分已用于训练，无法删除",
+                "warning",
+            )
+            return
         box = MessageBox(
             "删除拆分",
             f"确定要删除拆分「{active.name}」吗？\n\n"
-            "磁盘上的产物目录不会被删除。",
+            "磁盘上的产物目录将一并删除。",
             self.window(),
         )
         box.yesButton.setText("删除")
@@ -469,96 +589,66 @@ class SplitTab(QWidget):
             self.refresh()
 
     def _apply_lock_state(self) -> None:
-        """已被训练使用的拆分：比例只读。"""
-        locked = self._vm.split_locked()
-        for spin in self.ratio_spins.values():
-            spin.setEnabled(not locked)
-        self.seed_spin.setEnabled(not locked)
-        self.stratified_check.setEnabled(not locked)
-
-    def _on_preview_clicked(self) -> None:
-        self._refresh_preview()
-        preview = self._vm.preview_split()
-        total = int(preview.get("total", 0)) if preview else 0
-        self._vm.notify(f"共 {total} 张待划分" if total else "没有可划分的图片")
-
-    def _on_name_changed(self) -> None:
-        if self._syncing:
-            return
-        self._vm.set_split_name(self.name_edit.text())
-        resolved = self._vm.split_name()
-        self.name_edit.setText(resolved)
-        self._vm.notify(f"拆分名称：{resolved}")
+        """已被训练使用的拆分：参数只读（编辑 / 删除按钮见 _refresh_splits）。"""
+        if self._vm.split_locked():
+            for spin in self.anomaly_spins.values():
+                spin.setEnabled(False)
 
     def _refresh_preview(self) -> None:
-        preview = self._vm.preview_split()
+        # 没有拆分时不预览：预览基于 Dataset 的下沉比例计算，会显示成
+        # 「已有一套 70/20/10 拆分」的假象（历史缺陷——新建项目看似自带
+        # 一套 dataset 拆分）；预览从用户「新建」拆分后才开始
+        preview = (
+            self._vm.preview_split()
+            if self._vm.active_split() is not None
+            else {}
+        )
         total = int(preview.get("total", 0)) if preview else 0
         if not preview or not total:
             self.pie.set_data([], "")
-            self.legend.set_data([])
+            for row in self.summary_rows.values():
+                row["count"].setText("0")
+                row["percent"].setText("0 %")
+            self.summary_total.setText("0")
+            self.summary_percent.setText("0 %")
             self.bar_chart.set_data([])
             self.class_hint.setText("暂无数据")
             return
 
+        # 概览：环形图 + 汇总表（三行 + 合计）
         subsets = preview.get("subsets") or {}
         segments = []
-        legend = []
         for key in ("train", "val", "test"):
             count = int((subsets.get(key) or {}).get("count", 0))
-            color = SPLIT_COLORS[key]
-            segments.append((SPLIT_LABELS[key], count, color))
-            legend.append((
-                color, SPLIT_LABELS[key],
-                f"{count}  ({count * 100 / total:.0f}%)",
-            ))
+            segments.append((SPLIT_LABELS[key], count, SPLIT_COLORS[key]))
+            self.summary_rows[key]["count"].setText(str(count))
+            self.summary_rows[key]["percent"].setText(
+                f"{count * 100 / total:.0f} %"
+            )
         self.pie.set_data(segments, str(total))
-        self.legend.set_data(legend)
+        self.summary_total.setText(str(total))
+        self.summary_percent.setText("100 %")
 
+        # 类别分布：每类别一行堆叠条（训练 / 验证 / 测试分段）；
+        # 行序与「标签类别」管理一致：未标注在前、其余按项目类别定义顺序
         per_class = preview.get("per_class") or {}
+        order = [UNLABELED_LABEL, *self._vm.class_name_list()]
+        rank = {name: index for index, name in enumerate(order)}
         rows = []
-        maximum = 0
-        for name, info in per_class.items():
-            maximum = max(maximum, int(info.get("total", 0)))
         for name, info in sorted(
-            per_class.items(), key=lambda kv: -int(kv[1].get("total", 0))
+            per_class.items(),
+            key=lambda kv: (rank.get(kv[0], len(order)), kv[0]),
         ):
-            count = int(info.get("total", 0))
-            color = _COLOR_UNLABELED if name == UNLABELED_LABEL else "#0F6CBD"
-            rows.append((name, count, maximum or 1, color))
+            rows.append((
+                name,
+                int(info.get("total", 0)),
+                [
+                    (SPLIT_LABELS[key], int(info.get(key, 0) or 0),
+                     SPLIT_COLORS[key])
+                    for key in ("train", "val", "test")
+                ],
+            ))
         self.bar_chart.set_data(rows)
         self.class_hint.setText(f"共 {len(per_class)} 个类别 · {total} 张")
 
-    # -----------------------------------------------------------
-    # 参数
-    # -----------------------------------------------------------
-    def _on_ratio_changed(self) -> None:
-        if self._syncing:
-            return
-        values = [self.ratio_spins[k].value() for k in ("train", "val", "test")]
-        total = sum(values)
-        if total <= 0:
-            return
-        self._vm.set_split(
-            values[0] / total, values[1] / total, values[2] / total, quiet=True
-        )
-        self._refresh_preview()
 
-    def _on_seed_changed(self) -> None:
-        if self._syncing:
-            return
-        self._vm.set_seed(self.seed_spin.value())
-        self._refresh_preview()
-
-    def _on_stratified_changed(self) -> None:
-        if self._syncing:
-            return
-        self._vm.set_stratified(self.stratified_check.isChecked())
-        self._refresh_preview()
-
-    def _on_apply(self) -> None:
-        self._vm.notify(
-            f"正在按 {self.ratio_spins['train'].value()}/"
-            f"{self.ratio_spins['val'].value()}/"
-            f"{self.ratio_spins['test'].value()} 执行拆分…"
-        )
-        self._vm.apply_split()

@@ -110,9 +110,11 @@ class GalleryTab(QWidget):
         main.addWidget(self.grid, 1)
         root.addLayout(main, 1)
 
-        # 显示调试栏：窗口右侧竖直图标（亮度 / 对比度 / 类别名 / 缩略图尺寸）
+        # 显示调试栏：窗口右侧竖直图标（亮度 / 对比度 / 缩略图尺寸）
         self.display_dock = DisplayDock(self, with_size=True)
         self.display_dock.set_thumb_steps(_THUMB_STEPS)
+        # 档位初始值对齐网格当前尺寸（否则面板打开时读数与实际缩略图不符）
+        self.display_dock.set_thumb_size(self.grid.thumb_size())
         root.addWidget(self.display_dock)
         self._apply_display()
 
@@ -140,6 +142,8 @@ class GalleryTab(QWidget):
         self.tag_card.deleteRequested.connect(self._on_delete_tag)
 
         self.grid.imageActivated.connect(lambda _index: self._update_side_state())
+        # 选中项数量变化 → 即时刷新「已选 N」计数（点选 / 框选 / Ctrl 多选 / 全选）
+        self.grid.itemSelectionChanged.connect(self._on_selection_changed)
         self.grid.imageDoubleClicked.connect(self._on_double_click)
         self.grid.imageContextMenu.connect(self._on_context_menu)
 
@@ -217,10 +221,19 @@ class GalleryTab(QWidget):
 
         total = len(self._vm.images())
         self.filter_bar.set_summary(
-            len(new_paths), total, len(self.grid.selected_indexes())
+            len(new_paths), total, len(self.grid.selectedItems())
         )
         self._update_side_state()
         self._stale = False
+
+    def _on_selection_changed(self) -> None:
+        """选择变化：即时更新「已选 N」计数与左侧面板状态。"""
+        self.filter_bar.set_summary(
+            self.grid.count(),
+            len(self._vm.images()),
+            len(self.grid.selectedItems()),
+        )
+        self._update_side_state()
 
     def _update_side_state(self) -> None:
         """刷新拆分映射与标记面板（依赖图片集合、选中项与已挂标记数）。"""
@@ -263,11 +276,10 @@ class GalleryTab(QWidget):
         return paths
 
     def _class_counts(self) -> dict:
-        """各类别的实际图片数；检测任务额外统计未标注张数。"""
+        """各类别的实际图片数 + 「无标签」行数量（未标注张数，三页口径一致）。"""
         counts = self._vm.class_distribution()
-        if self._vm.split_layout() != "classify":
-            flags = self._vm.annotated_flags()
-            counts["未标注"] = sum(1 for flag in flags if not flag)
+        flags = self._vm.annotated_flags()
+        counts[""] = sum(1 for flag in flags if not flag)
         return counts
 
     def _on_thumb_size(self, step: int) -> None:
@@ -296,8 +308,13 @@ class GalleryTab(QWidget):
 
     def _on_split_requested(self, split: str) -> None:
         """点拆分映射行 → 把选中图像改划到该子集。"""
-        if self._vm.split_locked():
-            self._vm.notify("该拆分已用于训练，无法更改", "warning")
+        reason = self._vm.split_lock_reason()
+        if reason:
+            self._vm.notify(
+                "该拆分正在训练中，无法更改" if reason == "running"
+                else "该拆分已用于训练，无法更改",
+                "warning",
+            )
             return
         paths = self._require_selection()
         if paths:

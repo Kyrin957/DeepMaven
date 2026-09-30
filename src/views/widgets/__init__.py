@@ -15,6 +15,7 @@ from .charts import (
     LegendList,
     LineChart,
     PieChart,
+    StackedBarChart,
 )
 from .navigator import Navigator
 from .thumbnail_grid import (
@@ -35,6 +36,7 @@ __all__ = [
     "LineChart",
     "Navigator",
     "PieChart",
+    "StackedBarChart",
     "THUMB_LARGE",
     "THUMB_MEDIUM",
     "THUMB_SMALL",

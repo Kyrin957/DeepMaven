@@ -9,13 +9,15 @@
     * 方向键微调（`Alt` 或 `Shift` 更细 / 更大步长）；
     * 多边形模式：单击加点、右键或双击闭合；开启「孔洞」后画的是孔洞；
     * 掩码模式：画笔涂抹、橡皮擦除，`生成轮廓` 把掩码转成多边形实例；
-    * 右上角常驻显示按钮（放大 / 缩小 / 适应窗口 / 原始大小），
-      光标处像素信息固定在窗口**右下角**，右键弹出图像操作菜单。
+    * 滚轮缩放**以鼠标光标为锚点**（缩放后光标下的内容不动）；
+    * 显示缩放按钮（放大 / 缩小 / 适应窗口 / 原始大小）在图像窗口顶部
+      工具栏（本组件只提供 `zoom_in` 等方法）；光标信息经
+      `cursorInfoChanged` 上报，由页面状态栏显示；右键弹出图像操作菜单。
 """
 
 from __future__ import annotations
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -31,15 +33,11 @@ from PySide6.QtWidgets import (
     QGraphicsRectItem,
     QGraphicsScene,
     QGraphicsView,
-    QHBoxLayout,
-    QWidget,
 )
-from qfluentwidgets import Action, RoundMenu, TransparentToolButton
+from qfluentwidgets import Action, RoundMenu
 
 from src.models.annotation import BOX, POLYGON, TEXT, Annotation
 from src.utils.geometry import area, merge_holes, rotate, translate
-from src.views.ui import icon
-from src.views.ui import tokens as T
 
 MODE_BROWSE = "browse"
 MODE_BOX = "box"
@@ -49,12 +47,11 @@ MODE_TEXT = "text"      # OCR：拖出文本框，转写在对象列表 / 编辑
 
 _MIN_SIZE = 3.0        # 小于该像素尺寸的框视为误触
 _FALLBACK_COLOR = "#66CCFF"
+_CLASS_TAG_MARGIN = 6.0          # 图像左上角类别标签距图片边缘的间距
+_CLASS_TAG_FALLBACK = "#8A8A8A"  # 类别没有颜色时的兜底色（灰）
 _NUDGE_PIXELS = {"normal": 1.0, "fine": 0.2, "coarse": 10.0}
 # 掩码上过小的连通域直接丢弃（图片面积的比例；归一化面积本身即占比）
 _MIN_MASK_AREA = 0.00001
-# 右上角显示按钮（HUD）：画布背景恒为深色，图标固定用白色（不随主题）
-_HUD_ICON_COLOR = "#FFFFFF"
-_HUD_MARGIN = 8
 
 
 class AnnotationCanvas(QGraphicsView):
@@ -73,6 +70,7 @@ class AnnotationCanvas(QGraphicsView):
     maskChanged = Signal()                     # 掩码内容变化
     saveImageRequested = Signal()              # 右键菜单：另存当前图像
     openImageFolderRequested = Signal()        # 右键菜单：打开图像所在位置
+    cursorInfoChanged = Signal(str)            # 光标信息文本（页面状态栏显示）
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -81,7 +79,10 @@ class AnnotationCanvas(QGraphicsView):
         self.setScene(self._scene)
         self.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        # 缩放锚点用「视口中心」（按钮缩放 / 快捷键以中心为锚）；
+        # 滚轮的「光标为锚」在 wheelEvent 里手动实现（AnchorUnderMouse
+        # 依赖内部记录的最后鼠标事件位置，实测不跟随滚轮位置）。
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -137,38 +138,29 @@ class AnnotationCanvas(QGraphicsView):
         self._region_opacity = 50
         self._wheel_inverted = False
         self._show_pixel = True
-
-        # 右上角显示按钮（放大 / 缩小 / 适应窗口 / 原始大小）：
-        # 常用显示操作贴在图像窗口右上角（参照主流图片查看器）
-        self._hud = QWidget(self.viewport())
-        self._hud.setObjectName("canvasHud")
-        self._hud.setStyleSheet(
-            "#canvasHud { background: rgba(0, 0, 0, 0.38);"
-            " border-radius: 6px; }"
-        )
-        hud_layout = QHBoxLayout(self._hud)
-        hud_layout.setContentsMargins(
-            T.SPACE_XXS, T.SPACE_XXS, T.SPACE_XXS, T.SPACE_XXS
-        )
-        hud_layout.setSpacing(T.SPACE_XXS)
-        for name, tip, slot in (
-            ("zoom-out", "缩小", self.zoom_out),
-            ("zoom-in", "放大", self.zoom_in),
-            ("fit", "适应窗口", self.fit_to_view),
-            ("actual-size", "原始大小", self.actual_size),
-        ):
-            button = TransparentToolButton(self._hud)
-            button.setIcon(icon(name, color=_HUD_ICON_COLOR))
-            button.setIconSize(QSize(T.ICON_GLYPH_SM, T.ICON_GLYPH_SM))
-            button.setFixedSize(T.ICON_BTN_MD, T.ICON_BTN_MD)
-            button.setToolTip(tip)
-            button.clicked.connect(slot)
-            hud_layout.addWidget(button)
-        self._place_hud()
+        self._last_cursor_text = ""
+        # 图像左上角类别标签（整图任务：分类 / 异常检测——类别即标注结果）
+        self._image_class_name = ""
+        self._image_class_color = ""
+        # 缩放 / 平移后刷新状态栏光标信息（其中含缩放比例）
+        self.viewChanged.connect(self._emit_cursor_info)
 
     # -----------------------------------------------------------
     # 显示选项
     # -----------------------------------------------------------
+    def set_image_class(self, name: str, color: str = "") -> None:
+        """图像左上角类别标签（空名 = 不显示；整图任务：分类 / 异常检测）。
+
+        颜色取类别定义色；标签贴**图片区域**左上角，大小不随缩放变化。
+        """
+        name = str(name or "")
+        color = str(color or "")
+        if (name, color) == (self._image_class_name, self._image_class_color):
+            return
+        self._image_class_name = name
+        self._image_class_color = color
+        self.viewport().update()
+
     def set_crosshair(self, enabled: bool, opacity: int | None = None) -> None:
         self._crosshair = bool(enabled)
         if opacity is not None:
@@ -728,26 +720,13 @@ class AnnotationCanvas(QGraphicsView):
     # -----------------------------------------------------------
     def showEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         super().showEvent(event)
-        self._place_hud()
         if self._auto_fit:
             QTimer.singleShot(0, self._fit)
 
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         super().resizeEvent(event)
-        self._place_hud()
         if self._auto_fit:
             QTimer.singleShot(0, self._fit)
-
-    def _place_hud(self) -> None:
-        """把右上角显示按钮（HUD）贴到视口右上角。"""
-        hud = getattr(self, "_hud", None)
-        if hud is None:
-            return
-        hud.adjustSize()
-        hud.move(
-            max(0, self.viewport().width() - hud.width() - _HUD_MARGIN),
-            _HUD_MARGIN,
-        )
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         position = event.position().toPoint()
@@ -837,6 +816,7 @@ class AnnotationCanvas(QGraphicsView):
         scene_pos = self.mapToScene(position)
         # 十字准线跟随光标
         self._cursor_scene = scene_pos
+        self._emit_cursor_info()
         self.viewport().update()
         if self._mask_painting:
             self._paint_mask(scene_pos)
@@ -906,8 +886,25 @@ class AnnotationCanvas(QGraphicsView):
         if self._wheel_inverted:
             zoom_in = not zoom_in
         factor = 1.15 if zoom_in else 1 / 1.15
+        self._zoom_at(event.position().toPoint(), factor)
+        event.accept()
+
+    def _zoom_at(self, view_pos, factor: float) -> None:
+        """以视口内某点为锚缩放：缩放后该点下的场景内容保持不动。
+
+        QGraphicsView 的 AnchorUnderMouse 依赖内部记录的最后鼠标事件，
+        滚轮场景下锚点不准确（实测不跟随光标）；这里手动计算：
+        记缩放前光标下的场景点为 P，缩放后视口中心对应的场景点为 C，
+        令 P 显示在光标处，则 C = P − (光标−视口中心) / 缩放比例。
+        """
+        self._auto_fit = False
+        before = self.mapToScene(view_pos)
         self.scale(factor, factor)
+        scale = self.transform().m11() or 1.0
+        offset = QPointF(view_pos - self.viewport().rect().center())
+        self.centerOn(before - offset / scale)
         self.viewChanged.emit()
+        self.viewport().update()
 
     def contextMenuEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         """图像窗口右键菜单：显示操作 + 图像另存 / 打开所在位置。
@@ -936,6 +933,7 @@ class AnnotationCanvas(QGraphicsView):
 
     def leaveEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         self._cursor_scene = None
+        self._emit_cursor_info()
         self.viewport().update()
         super().leaveEvent(event)
 
@@ -944,6 +942,7 @@ class AnnotationCanvas(QGraphicsView):
     # -----------------------------------------------------------
     def drawForeground(self, painter, rect) -> None:  # noqa: N802 - Qt 命名
         super().drawForeground(painter, rect)
+        self._draw_image_class_tag(painter)
         if not self._img_w or self._cursor_scene is None:
             return
         if self._drawing and self._rubber is not None:
@@ -962,29 +961,34 @@ class AnnotationCanvas(QGraphicsView):
             x, y = self._cursor_scene.x(), self._cursor_scene.y()
             painter.drawLine(QPointF(x, 0.0), QPointF(x, float(self._img_h)))
             painter.drawLine(QPointF(0.0, y), QPointF(float(self._img_w), y))
-        if not self._show_pixel:
+        # 光标坐标 / 像素值不再画在视口右下角——改由页面状态栏显示
+        # （cursorInfoChanged 信号，见 annotate_tab 的 footer）
+
+    def _draw_image_class_tag(self, painter) -> None:
+        """图像左上角的类别标签：圆角胶囊（类别色）+ 白字，大小不随缩放变化。"""
+        if not self._img_w or not self._image_class_name:
             return
-        text = self._pixel_text()
-        if not text:
-            return
-        # 像素信息固定在视口**右下角**：切回视口坐标绘制（不随缩放放大，
-        # 也不遮挡光标附近的图像内容）
+        anchor = self.mapFromScene(QPointF(0.0, 0.0))     # 图片左上角 → 视口坐标
         painter.save()
-        painter.resetTransform()
+        painter.resetTransform()                          # 切到视口坐标绘制
         font = painter.font()
-        font.setPointSizeF(max(7.5, font.pointSizeF() - 1.0))
+        font.setPointSizeF(max(8.0, font.pointSizeF()))
+        font.setBold(True)
         painter.setFont(font)
         metrics = painter.fontMetrics()
-        box_w = metrics.horizontalAdvance(text) + 12
-        box_h = metrics.height() + 6
+        pad = 9.0
         box = QRectF(
-            max(0.0, self.viewport().width() - box_w - _HUD_MARGIN),
-            max(0.0, self.viewport().height() - box_h - _HUD_MARGIN),
-            box_w, box_h,
+            anchor.x() + _CLASS_TAG_MARGIN,
+            anchor.y() + _CLASS_TAG_MARGIN,
+            metrics.horizontalAdvance(self._image_class_name) + pad * 2,
+            metrics.height() + 6.0,
         )
-        painter.setPen(QPen(QColor("#FFFFFF"), 1))
-        painter.fillRect(box, QColor(0, 0, 0, 170))
-        painter.drawText(box, Qt.AlignmentFlag.AlignCenter, text)
+        if QRectF(self.viewport().rect()).intersects(box):
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(self._image_class_color or _CLASS_TAG_FALLBACK))
+            painter.drawRoundedRect(box, box.height() / 2.0, box.height() / 2.0)
+            painter.setPen(QColor("#FFFFFF"))
+            painter.drawText(box, Qt.AlignmentFlag.AlignCenter, self._image_class_name)
         painter.restore()
 
     @staticmethod
@@ -1002,19 +1006,36 @@ class AnnotationCanvas(QGraphicsView):
         painter.fillRect(box, QColor(0, 0, 0, 170))
         painter.drawText(box, Qt.AlignmentFlag.AlignCenter, text)
 
-    def _pixel_text(self) -> str:
-        """光标处的像素值（灰度 / RGB）。"""
-        if self._source_image is None or self._cursor_scene is None:
+    def _cursor_text(self) -> str:
+        """状态栏光标信息：像素坐标（在图内时）+ 可选像素值 + 当前缩放。"""
+        if self._cursor_scene is None or not self._img_w:
             return ""
+        parts: list[str] = []
         x = int(self._cursor_scene.x())
         y = int(self._cursor_scene.y())
-        if not (0 <= x < self._source_image.width()
-                and 0 <= y < self._source_image.height()):
-            return ""
-        pixel = self._source_image.pixelColor(x, y)
-        if pixel.red() == pixel.green() == pixel.blue():
-            return f"({x}, {y})  {pixel.red()}"
-        return f"({x}, {y})  R{pixel.red()} G{pixel.green()} B{pixel.blue()}"
+        inside = (
+            0 <= x < self._img_w and 0 <= y < self._img_h
+            and self._source_image is not None
+        )
+        if inside:
+            parts.append(f"({x}, {y})")
+            if self._show_pixel:
+                pixel = self._source_image.pixelColor(x, y)
+                if pixel.red() == pixel.green() == pixel.blue():
+                    parts.append(f"值 {pixel.red()}")
+                else:
+                    parts.append(
+                        f"R{pixel.red()} G{pixel.green()} B{pixel.blue()}"
+                    )
+        parts.append(f"缩放 {self.transform().m11() * 100:.0f}%")
+        return " · ".join(parts)
+
+    def _emit_cursor_info(self) -> None:
+        """光标信息变化时上报（文本不变不重复发）。"""
+        text = self._cursor_text()
+        if text != self._last_cursor_text:
+            self._last_cursor_text = text
+            self.cursorInfoChanged.emit(text)
 
     def scrollContentsBy(self, dx: int, dy: int) -> None:  # noqa: N802 - Qt 命名
         super().scrollContentsBy(dx, dy)

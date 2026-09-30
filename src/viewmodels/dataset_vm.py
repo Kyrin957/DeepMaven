@@ -87,6 +87,9 @@ class DatasetViewModel(QObject):
         self._label_index: dict | None = None
         # 图片所属子集标记缓存（T/V/E）
         self._subsets: list[str] | None = None
+        # 标注页推送的未落盘标注状态（{图片绝对路径: 是否已标注}）——
+        # 让缩略图角标与「已标注」统计与内存中尚未保存的改动保持一致
+        self._pending_annotations: dict[str, bool] = {}
 
     @property
     def dataset(self) -> Dataset | None:
@@ -427,15 +430,16 @@ class DatasetViewModel(QObject):
     # 数据拆分（一个项目可有多套拆分）
     # -----------------------------------------------------------
     def splits(self) -> list:
-        """项目内的全部拆分（旧项目会自动迁移出一套）。"""
+        """项目内的全部拆分（新建项目默认为空，由「新建」显式创建）。"""
         project = self._project_vm.project if self._project_vm else None
-        if project is None:
-            return []
-        project.ensure_splits(self.split_layout())
-        return list(project.splits)
+        return list(project.splits) if project is not None else []
 
     def splits_ready(self) -> list[dict]:
-        """拆分列表的展示数据（下拉 / 列表通用）。"""
+        """拆分列表的展示数据（下拉 / 列表通用）。
+
+        ``lock_reason``："" = 可编辑 / 删除；running = 训练中 / 暂停（配置
+        指向该拆分）；used = 完成过训练——界面据此禁用按钮并画锁图标。
+        """
         return [
             {
                 "id": split.split_id,
@@ -444,6 +448,7 @@ class DatasetViewModel(QObject):
                          + (f" · {split.total()} 张" if split.ready else ""),
                 "ready": split.ready,
                 "locked": split.locked,
+                "lock_reason": self.split_lock_reason(split.split_id),
                 "counts": {key: int(value) for key, value in split.counts.items()},
                 "total": split.total(),
             }
@@ -451,12 +456,9 @@ class DatasetViewModel(QObject):
         ]
 
     def active_split(self):
-        """当前选中的拆分。"""
+        """当前选中的拆分（无拆分时为 None）。"""
         project = self._project_vm.project if self._project_vm else None
-        if project is None:
-            return None
-        project.ensure_splits(self.split_layout())
-        return project.active_split()
+        return project.active_split() if project is not None else None
 
     def split_by_id(self, split_id: int):
         project = self._project_vm.project if self._project_vm else None
@@ -486,7 +488,6 @@ class DatasetViewModel(QObject):
         if project is None:
             self.message.emit("warning", "请先创建或打开项目")
             return -1
-        project.ensure_splits(self.split_layout())
         base = (
             project.split_by_id(base_split_id) if base_split_id is not None
             else project.active_split()
@@ -522,7 +523,7 @@ class DatasetViewModel(QObject):
         return self.add_split(f"{source.name} 副本", base_split_id=split_id)
 
     def rename_split(self, split_id: int, name: str) -> str:
-        """重命名拆分（名称同时用作划分产物的目录名）。"""
+        """重命名拆分（名称同时用作划分产物的目录名，磁盘目录一并改名）。"""
         project = self._project_vm.project if self._project_vm else None
         split = project.split_by_id(split_id) if project is not None else None
         if project is None or split is None:
@@ -532,7 +533,12 @@ class DatasetViewModel(QObject):
         if other is not None and other.split_id != split.split_id:
             self.message.emit("warning", f"拆分名「{title}」已存在")
             return split.name
+        old_name = split.name
         split.name = title
+        if title != old_name:
+            # 产物目录随名称走：重命名而不是下次执行拆分时新建一个目录
+            # （历史缺陷：改名后执行拆分新增目录、旧目录残留）
+            self._rename_split_dirs(project, split, old_name)
         if project.active_split() is split:
             project.params["split_name"] = title
             project.training.split_name = title
@@ -540,27 +546,155 @@ class DatasetViewModel(QObject):
         self._emit_splits()
         return title
 
+    def _rename_split_dirs(self, project, split, old_name: str) -> None:
+        """产物目录随拆分改名（项目内目录直接移动，路径引用同步更新）。"""
+        path_text = str(project.params.get("path") or "").strip()
+        if not path_text:
+            return
+        root = ProjectService.project_dir(Path(path_text))
+        dataset_root = ProjectService.dataset_dir(Path(path_text))
+        # 兼容两种布局：新（<root>/dataset/<名>）与旧（<root>/<名>）
+        old_dir = next(
+            (
+                candidate
+                for candidate in (
+                    dataset_root / old_name,
+                    root / old_name,
+                )
+                if candidate.is_dir()
+            ),
+            dataset_root / old_name,
+        )
+        new_dir = dataset_root / split.name
+        if not old_dir.is_dir() or new_dir.exists():
+            return
+        try:
+            shutil.move(str(old_dir), str(new_dir))
+        except OSError as exc:
+            logger.warning("拆分目录改名失败 %s -> %s: %s", old_dir, new_dir, exc)
+            return
+
+        old_text, new_text = str(old_dir), str(new_dir)
+
+        def _sub(value: str) -> str:
+            text = str(value or "")
+            if text.startswith(old_text):
+                return new_text + text[len(old_text):]
+            return text
+
+        split.output_dir = _sub(split.output_dir)
+        split.data_yaml = _sub(split.data_yaml)
+        dataset = project.dataset
+        dataset.output_path = _sub(dataset.output_path)
+        dataset.data_yaml = _sub(dataset.data_yaml)
+        project.training.data_yaml = _sub(project.training.data_yaml)
+        project.training.anomaly_root = _sub(
+            getattr(project.training, "anomaly_root", "")
+        )
+
+    def suggest_split_name(self) -> str:
+        """给「新建拆分」弹窗的默认名称（拆分N，重名自动让位）。"""
+        project = self._project_vm.project if self._project_vm else None
+        if project is None:
+            return ""
+        split_id = project.next_split_id()
+        title = f"拆分{split_id + 1}"
+        if project.split_by_name(title) is not None:
+            title = f"{title} ({split_id + 1})"
+        return title
+
     def remove_split(self, split_id: int) -> bool:
-        """删除一套拆分（磁盘上的产物目录保留）。"""
+        """删除一套拆分：连同磁盘上的产物目录（来源数据不动）。
+
+        被训练锁定的拆分不允许删除（训练中 / 完成过训练）——守卫在这里
+        兜底，界面同时禁用删除按钮；来源目录（数据集本体）绝不删除。
+        """
         project = self._project_vm.project if self._project_vm else None
         split = project.split_by_id(split_id) if project is not None else None
         if project is None or split is None:
             return False
-        if len(project.splits) <= 1:
-            self.message.emit("warning", "至少保留一套拆分")
+        reason = self.split_lock_reason(split.split_id)
+        if reason:
+            self.message.emit(
+                "warning",
+                "该拆分正在训练中，无法删除" if reason == "running"
+                else "该拆分已用于训练，无法删除",
+            )
             return False
+        # 不再要求「至少保留一套」：只有被训练引用的拆分不可删除
+        # （running / paused / used，见 split_lock_reason 守卫）
+        removed = self._remove_split_dirs(project, split)
         project.splits = [
             item for item in project.splits if item.split_id != split.split_id
         ]
+        fallback = project.splits[0] if project.splits else None
         if project.active_split_id == split.split_id:
-            project.active_split_id = project.splits[0].split_id
-            # 当前拆分换人后同步兼容副本，避免界面残留已删除的拆分名
-            project.params["split_name"] = project.splits[0].name
+            project.active_split_id = fallback.split_id if fallback else 0
+            # 当前拆分换人后同步兼容副本，避免界面残留已删除的拆分名；
+            # 删光拆分时清掉副本，回到「未创建拆分」状态
+            if fallback is not None:
+                project.params["split_name"] = fallback.name
+            else:
+                project.params.pop("split_name", None)
+        # 训练配置引用被删拆分时回退到剩余拆分（无剩余则清空，由
+        # 后端 validate 引导用户重新创建）
+        try:
+            training_split = int(getattr(project.training, "split_id", -1) or -1)
+        except (TypeError, ValueError):
+            training_split = -1
+        if training_split == split.split_id:
+            project.training.split_id = fallback.split_id if fallback else 0
+            project.training.split_name = fallback.name if fallback else ""
+            project.training.data_yaml = (
+                fallback.data_yaml if fallback else ""
+            )
+        # 异常检测的数据集根目录指向该拆分产物时一并清空（避免悬空路径）
+        root = str(getattr(project.training, "anomaly_root", "") or "").strip()
+        if root and root.lower() in {str(path).lower() for path in removed}:
+            project.training.anomaly_root = ""
         project.touch()
         self._mirror_split(project.active_split())
         self._emit_splits()
-        self.message.emit("success", f"已删除拆分「{split.name}」")
+        detail = f"（已清理产物目录 {len(removed)} 个）" if removed else ""
+        self.message.emit("success", f"已删除拆分「{split.name}」{detail}")
         return True
+
+    def _remove_split_dirs(self, project, split) -> list:
+        """删除拆分的产物目录（返回实际删除的路径；来源目录绝不删）。"""
+        root = ProjectService.project_dir(
+            Path(str(project.params.get("path") or ""))
+        )
+        sources = {
+            str(Path(raw)).lower()
+            for raw in (getattr(project.dataset, "sources", []) or [])
+        }
+        dataset_root = ProjectService.dataset_dir(
+            Path(str(project.params.get("path") or ""))
+        )
+        candidates = [
+            str(getattr(split, "output_dir", "") or "").strip(),
+            str(dataset_root / split.name) if root else "",
+            str(root / split.name) if root else "",
+        ]
+        removed: list = []
+        seen: set[str] = set()
+        for raw in candidates:
+            if not raw:
+                continue
+            target = Path(raw)
+            key = str(target).lower()
+            if key in seen or key in sources:
+                continue
+            seen.add(key)
+            if not target.is_dir():
+                continue
+            try:
+                shutil.rmtree(target)
+            except OSError as exc:
+                logger.warning("删除拆分产物目录失败 %s: %s", target, exc)
+                continue
+            removed.append(target)
+        return removed
 
     def mark_active_split_used(self) -> None:
         """把当前拆分标记为「已被训练使用」（比例不再改动）。"""
@@ -660,10 +794,13 @@ class DatasetViewModel(QObject):
         if project is None:
             self.message.emit("warning", "请先创建或打开项目")
             return
+        if project.active_split() is None:
+            self.message.emit("warning", "请先在拆分列表新建一套拆分")
+            return
 
         mprj = Path(project.params.get("path", ""))
-        # 产物写进项目文件夹（与 Halcon DLT 一致：删除项目时一并清理）
-        out_dir = ProjectService.project_dir(mprj) / self.split_name()
+        # 产物写进项目文件夹的 dataset 子目录（删除项目时一并清理）
+        out_dir = ProjectService.dataset_dir(mprj) / self.split_name()
         split = (
             self._dataset.split_train,
             self._dataset.split_val,
@@ -676,6 +813,8 @@ class DatasetViewModel(QObject):
         label_index = self.label_index()
         # 异常检测：按「良好 / 异常」分配，训练集只放良好图
         kinds, counts = self._anomaly_inputs()
+        # 手工拆分映射：图库 / 标注页指定的图片优先落位（与预览同口径）
+        split_overrides = self._resolved_overrides("split_overrides", library)
 
         # 预检查：验证集为空时后端会直接失败（val=None），这里提前拦住
         try:
@@ -688,6 +827,7 @@ class DatasetViewModel(QObject):
                 layout=layout,
                 kinds=kinds,
                 counts=counts,
+                overrides=split_overrides,
             )
         except (OSError, ValueError):
             buckets = {}
@@ -704,6 +844,7 @@ class DatasetViewModel(QObject):
                 split=split, stratified=self._dataset.stratified, layout=layout,
                 images=library, label_index=label_index,
                 kinds=kinds, counts=counts,
+                overrides=split_overrides,
             )
             if stats["total"] == 0:
                 self.message.emit("warning", "来源目录中未找到图片")
@@ -799,8 +940,9 @@ class DatasetViewModel(QObject):
         else:
             self._dataset = dataset
         if project is not None:
-            # 旧项目没有拆分列表：这里补一套出来，并让界面按当前拆分显示
-            split = project.ensure_splits(self.split_layout())
+            # 拆分不再自动补建（新建项目从空开始）；旧格式项目的历史迁移
+            # 在 Project.from_dict 完成
+            split = project.active_split()
             # 兼容副本「当前拆分名」跟随模型：副本过期时，凡按下沉字段显示的
             # 位置都会残留上一次的拆分名（如删除当前拆分后未同步）
             if split is not None:
@@ -848,7 +990,7 @@ class DatasetViewModel(QObject):
         return None
 
     def run_quality_check(self) -> None:
-        """后台执行数据质检：重复图片 / 模糊 / 曝光 / 标签校验。"""
+        """后台执行数据质检：重复图片 / 模糊 / 曝光 / 标签校验（按任务差异）。"""
         if self.is_busy():
             self.message.emit("warning", "已有任务在运行")
             return
@@ -857,6 +999,10 @@ class DatasetViewModel(QObject):
             self.message.emit("warning", "请先导入数据集")
             return
         label_index = self.source_label_index()
+        # 项目任务决定标签校验口径（分类 / 异常检测无 YOLO 标签体系，
+        # 分割按多边形点列、旋转框按四角点校验——见 QualityService）
+        project = self._project_vm.project if self._project_vm else None
+        task = str(getattr(project, "model_type", "") or "detect")
 
         def job(progress, is_cancelled):
             progress(5, "查找重复图片")
@@ -872,10 +1018,11 @@ class DatasetViewModel(QObject):
             if is_cancelled():
                 return {}
             progress(88, "校验标签")
-            labels = QualityService.check_labels(images, label_index)
+            labels = QualityService.check_labels(images, label_index, task)
             progress(100, "完成")
             return {
                 "total": len(images),
+                "task": task,
                 "duplicates": duplicates,
                 "blurry": blurry,
                 "exposure": exposure,
@@ -1097,53 +1244,60 @@ class DatasetViewModel(QObject):
             self._label_index = self.source_label_index()
         return self._label_index
 
-    def annotated_flags(self) -> list[bool]:
-        """每张图片是否「已标注」。
+    def set_pending_annotations(self, mapping: dict | None) -> None:
+        """接收标注页推送的未落盘标注状态（{绝对路径: 是否已标注}）。
+
+        缩略图角标与「已标注」统计据此合并内存中尚未保存的改动——
+        选「不保存」退出后，下次打开读到的是修改前的磁盘状态。
+        """
+        incoming = {
+            str(key): bool(value) for key, value in (mapping or {}).items()
+        }
+        if incoming == self._pending_annotations:
+            return
+        self._pending_annotations = incoming
+
+    def is_annotated(self, image) -> bool:
+        """单张图片是否「已标注」（与 :meth:`annotated_flags` 同一判定口径）。
 
         判定顺序：
-            1. 项目里有该图片的**类别覆盖值**（导入时按子文件夹标签写入 / 手工指定）
-               → 覆盖值非空即已标注，显式为空的「无标签」即未标注
-            2. **分类任务**：图片位于某个类别目录下即为已标注（类别本身就是标注结果）
-            3. **检测 / 分割 / 异常**：存在且非空的 YOLO 标签文件
+            1. 内存中有未保存改动（标注页 pending）→ 以内存状态为准；
+            2. 项目里有该图片的**类别覆盖值**（导入时按子文件夹标签写入 / 手工
+               指定）→ 覆盖值非空即已标注，显式为空的「无标签」即未标注；
+            3. **整图任务（分类 / 异常检测）**：类别本身就是标注结果——图片
+               落在已知类别目录（或类别覆盖值非空）即已标注，**没有 YOLO
+               标签文件**；
+            4. **框选 / 分割 / 旋转框 / OCR**：存在且非空的 YOLO 标签文件。
         """
-        images = self.images()
-        if not images:
-            return []
+        image = Path(image)
+        pending = self._pending_annotations.get(str(image))
+        if pending is not None:
+            return bool(pending)
         overrides = self._params_dict("class_overrides")
         roots = self._source_roots()
-
-        if self.split_layout() == "classify":
-            # 已知类别 = 数据集统计里的类别 ∪ 项目类别表
+        key = self._relative_key(image, roots)
+        if key in overrides:
+            return bool(str(overrides[key] or "").strip())
+        if self.split_layout() in ("classify", "anomaly_folder"):
+            # 已知类别 = 数据集统计里的类别 ∪ 项目类别表（空表时用目录名兜底）
             names = set(self._dataset.class_names) if self._dataset else set()
             project = self._project_vm.project if self._project_vm else None
             if project is not None:
                 names.update(str(cls.name) for cls in project.classes)
             if not names:
                 names = set(DatasetService.child_class_dirs_multi(roots))
-            flags: list[bool] = []
-            for image in images:
-                key = self._relative_key(image, roots)
-                if key in overrides:
-                    flags.append(bool(str(overrides[key] or "").strip()))
-                else:
-                    # 图片落在某个类别目录里即为已标注
-                    flags.append(self.image_class(image) in names)
-            return flags
-
+            return bool(self.image_class(image) in names)
         label_dir = self.label_dir()
-        flags = []
-        for image in images:
-            key = self._relative_key(image, roots)
-            if key in overrides:
-                flags.append(bool(str(overrides[key] or "").strip()))
-                continue
-            flags.append(
-                label_dir is not None
-                and DatasetService.label_has_content(
-                    AnnotationService.label_path_for(image, label_dir)
-                )
+        return bool(
+            label_dir is not None
+            and DatasetService.label_has_content(
+                AnnotationService.label_path_for(image, label_dir)
             )
-        return flags
+        )
+
+    def annotated_flags(self) -> list[bool]:
+        """每张图片是否「已标注」（判定口径见 :meth:`is_annotated`）。"""
+        return [self.is_annotated(image) for image in self.images()]
 
     def annotated_count(self) -> int:
         return sum(1 for flag in self.annotated_flags() if flag)
@@ -1266,6 +1420,7 @@ class DatasetViewModel(QObject):
                 layout=layout,
                 kinds=kinds,
                 counts=counts,
+                overrides=self._resolved_overrides("split_overrides", images),
             )
         except (OSError, ValueError) as exc:
             logger.warning("计算子集归属失败: %s", exc)
@@ -1538,8 +1693,9 @@ class DatasetViewModel(QObject):
         与 :meth:`split_name` 同源，都以模型中的当前拆分为准；
         ``params["split_name"]`` 只是兼容旧项目的下沉副本，不作为显示依据
         ——副本过期时图库会显示上一次的拆分名，与数据拆分页对不上。
+        没有拆分时返回空串（界面显示「未创建拆分」占位）。
         """
-        return self.split_name()
+        return self.split_name() if self.active_split() is not None else ""
 
     # -----------------------------------------------------------
     # 异常检测：按类别分配（良好 / 异常）
@@ -1677,23 +1833,49 @@ class DatasetViewModel(QObject):
         plan = self.anomaly_allocation()
         return kinds, {kind: dict(rows) for kind, rows in plan.items()}
 
-    def split_locked(self) -> bool:
-        """当前拆分是否已被训练使用（使用后不再改比例）。"""
-        split = self.active_split()
-        if split is not None and split.locked:
-            return True
+    def split_lock_reason(self, split_id: int | None = None) -> str:
+        """拆分（缺省当前拆分）的锁定原因："" = 可改；running / used。
+
+        锁定只按**该拆分**是否被训练使用判定（与 Halcon 一致）：
+          * `running`：训练进行中（含暂停），且训练配置指向该拆分；
+          * `used`：该拆分完成过训练（`Split.locked`，训练完成时按
+            ``config.split_id`` 置位；旧项目兼容训练记录里的 split_id）。
+        执行拆分（生成产物）**不锁定**——新建拆分只要没训练过，比例与映射
+        都可自由调整（历史缺陷：`training` 的镜像字段被误当「已训练使用」，
+        新建拆分执行一次拆分后即被误锁）。
+        """
         project = self._project_vm.project if self._project_vm else None
         if project is None:
-            return False
-        # 兼容旧项目：训练已完成，且用的正是当前拆分的 data.yaml
-        status = str(getattr(project.training, "status", "") or "")
-        trained_yaml = str(getattr(project.training, "data_yaml", "") or "")
-        current_yaml = str(getattr(split, "data_yaml", "") or "")
-        return (
-            bool(trained_yaml)
-            and trained_yaml == current_yaml
-            and status in ("running", "finished", "done", "success")
+            return ""
+        split = (
+            project.split_by_id(split_id) if split_id is not None
+            else self.active_split()
         )
+        if split is None:
+            return ""
+        training = project.training
+        status = str(getattr(training, "status", "") or "")
+        if status in ("running", "paused"):
+            try:
+                active_id = int(getattr(training, "split_id", -1) or -1)
+            except (TypeError, ValueError):
+                active_id = -1
+            if active_id == int(split.split_id):
+                return "running"
+        if split.locked:
+            return "used"
+        for record in list(getattr(training, "history", []) or []):
+            try:
+                used = int(record.get("split_id", -1) or -1)
+            except (TypeError, ValueError):
+                used = -1
+            if used == int(split.split_id):
+                return "used"
+        return ""
+
+    def split_locked(self, split_id: int | None = None) -> bool:
+        """拆分（缺省当前拆分）是否已被训练锁定（见 `split_lock_reason`）。"""
+        return bool(self.split_lock_reason(split_id))
 
     # -----------------------------------------------------------
     # 组合筛选：标签状态 / 图像标记 / 数据集划分 / 文本
@@ -1835,11 +2017,6 @@ class DatasetViewModel(QObject):
         self._refresh_stats(project)
 
         project.touch()
-        try:
-            self._project_vm.service.save(project)
-        except (OSError, ValueError) as exc:
-            logger.warning("保存项目失败: %s", exc)
-            self.message.emit("error", f"保存项目失败：{exc}")
         self.invalidate_images()
         self.datasetChanged.emit(self._dataset)
         self._project_vm.notify_changed()
@@ -1881,6 +2058,28 @@ class DatasetViewModel(QObject):
         roots = self._source_roots()
         return [self._relative_key(image, roots) for image in images]
 
+    def _resolved_overrides(self, key: str, images: list) -> dict:
+        """项目内的手工覆盖（相对 key）→ ``{图片绝对路径: 值}``。
+
+        ``key`` 取 "split_overrides"（T / V / E 映射）或 "class_overrides"
+        （类别名，"" = 无标签）；值统一转成字符串，供服务层按绝对路径查询。
+        """
+        overrides = self._params_dict(key)
+        if not overrides:
+            return {}
+        return {
+            str(image): str(overrides[item_key] or "")
+            for image, item_key in zip(images, self._keys(images))
+            if item_key in overrides
+        }
+
+    def class_name_list(self) -> list:
+        """类别 id → 名称表（标签里的数字 id 在统计 / 预览中显示为名称）。"""
+        project = self._project_vm.project if self._project_vm else None
+        if project is None:
+            return []
+        return list(project.class_names)
+
     def _params_dict(self, key: str, create: bool = False) -> dict:
         """读取项目 params 中的字典型元信息。"""
         project = self._project_vm.project if self._project_vm else None
@@ -1895,17 +2094,14 @@ class DatasetViewModel(QObject):
         return value
 
     def _commit_meta(self, text: str) -> None:
-        """把项目元信息（标记 / 拆分 / 类别覆盖）落盘并通知界面。"""
+        """登记项目元信息改动（标记 / 拆分 / 类别覆盖）。
+
+        未保存，随「保存项目」/ 退出询问统一落盘——选「不保存」即可回退。
+        """
         project = self._project_vm.project if self._project_vm else None
         if project is None:
             return
         project.touch()
-        try:
-            self._project_vm.service.save(project)
-        except (OSError, ValueError) as exc:
-            logger.warning("保存项目元信息失败: %s", exc)
-            self.message.emit("error", f"保存失败：{exc}")
-            return
         self.invalidate_images()
         self.datasetChanged.emit(self._dataset)
         self._project_vm.notify_changed()
@@ -1963,7 +2159,12 @@ class DatasetViewModel(QObject):
         return "detect"
 
     def preview_split(self) -> dict:
-        """不落盘地计算划分结果（供拆分页预览饼图与类别分布）。"""
+        """不落盘地计算划分结果（供拆分页预览饼图与类别分布）。
+
+        与执行拆分**同口径**：手工拆分映射优先落位、手工类别覆盖参与类别
+        统计、类别 id 显示为名称——图库 / 标注页改完类别或映射，预览随之
+        更新（历史缺陷：预览不看这两个覆盖，改完「无标签」不变化）。
+        """
         images = self.images()
         if not images or self._dataset is None:
             return {}
@@ -1984,6 +2185,11 @@ class DatasetViewModel(QObject):
                 label_index={} if layout == "classify" else self.label_index(),
                 kinds=kinds,
                 counts=counts,
+                overrides=self._resolved_overrides("split_overrides", images),
+                class_overrides=self._resolved_overrides(
+                    "class_overrides", images
+                ),
+                class_names=self.class_name_list(),
             )
         except (OSError, ValueError) as exc:
             logger.warning("划分预览失败: %s", exc)

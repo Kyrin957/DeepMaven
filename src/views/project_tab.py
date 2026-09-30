@@ -45,6 +45,7 @@ from src.utils.constants import (
 )
 from src.viewmodels.project_vm import ProjectViewModel
 from src.views.dialogs import DeleteProjectDialog, NewProjectDialog
+from src.views.ui import BusyPopup
 from src.views.ui import tokens as T
 
 _COVER_W, _COVER_H = 184, 116
@@ -242,41 +243,19 @@ class ProjectTab(QWidget):
         scroll.setWidget(info_card)
         layout.addWidget(scroll, 1)
 
-        # 可恢复项目（崩溃 / 异常退出后残留的自动备份）
-        self.recover_card = CardWidget(container)
-        recover_layout = QVBoxLayout(self.recover_card)
-        recover_layout.setContentsMargins(T.SPACE_XL, T.CARD_PAD_H, T.SPACE_XL, T.CARD_PAD_H)
-        recover_layout.setSpacing(T.SPACE_SM)
-        recover_layout.addWidget(StrongBodyLabel("可恢复项目", self.recover_card))
-        self.recover_hint = CaptionLabel("", self.recover_card)
-        self.recover_hint.setWordWrap(True)
-        recover_layout.addWidget(self.recover_hint)
-        self.recover_buttons = QVBoxLayout()
-        self.recover_buttons.setSpacing(T.SPACE_XS)
-        recover_layout.addLayout(self.recover_buttons)
-        layout.addWidget(self.recover_card)
-        self.recover_card.setVisible(False)
-
-        # 图像位置：基础路径 + 缺失重定位
+        # 图像位置：基础路径 + 缺失提示（异常退出残留的自动备份在打开
+        # 项目时对比时间由人工选版本，见 views/dialogs/backup_dialog.py）
         self.location_card = CardWidget(container)
         location_layout = QVBoxLayout(self.location_card)
         location_layout.setContentsMargins(T.SPACE_XL, T.CARD_PAD_H, T.SPACE_XL, T.CARD_PAD_H)
         location_layout.setSpacing(T.SPACE_SM)
         location_layout.addWidget(StrongBodyLabel("图像位置", self.location_card))
-        path_row = QHBoxLayout()
         self.base_edit = LineEdit(self.location_card)
         self.base_edit.setPlaceholderText("图像基础路径")
-        path_row.addWidget(self.base_edit, 1)
-        base_browse = PushButton("浏览", self.location_card)
-        base_browse.clicked.connect(self._on_browse_base_path)
-        path_row.addWidget(base_browse)
-        location_layout.addLayout(path_row)
+        location_layout.addWidget(self.base_edit)
         self.missing_label = CaptionLabel("", self.location_card)
         self.missing_label.setWordWrap(True)
         location_layout.addWidget(self.missing_label)
-        self.relocate_btn = PushButton("重定位缺失图像", self.location_card)
-        self.relocate_btn.clicked.connect(self._on_relocate)
-        location_layout.addWidget(self.relocate_btn)
         layout.addWidget(self.location_card)
 
         self.close_btn = PushButton(container)
@@ -325,8 +304,6 @@ class ProjectTab(QWidget):
         self._vm.projectChanged.connect(self._on_project_changed)
         # 最近项目按需自动刷新（打开程序、新建、打开、保存、另存为、删除等）
         self._vm.recentUpdated.connect(lambda _items: self._reload_recent())
-        # 可恢复项目（自动备份）
-        self._vm.recoverableChanged.connect(self._on_recoverable)
         self.base_edit.editingFinished.connect(self._on_base_path_changed)
 
     # -----------------------------------------------------------
@@ -342,6 +319,25 @@ class ProjectTab(QWidget):
         """
         self._unsaved_check = check
         self._unsaved_confirm = confirm
+
+    def has_pending_edits(self) -> bool:
+        """名称 / 说明输入框是否有尚未写回项目的编辑。
+
+        这类编辑停留在输入框里（未点「保存项目」），不体现在
+        ``project.dirty`` 上——关闭 / 切换项目的守卫必须单独检查，
+        否则会静默丢失。
+        """
+        project = self._vm.project
+        if project is None or self._shown_path != self._vm.current_path:
+            return False
+        name = self.name_edit.text().strip()
+        if name and name != project.name:
+            return True
+        return self.desc_edit.toPlainText() != (project.description or "")
+
+    def commit_edits(self) -> None:
+        """把名称 / 说明输入框的内容写回项目对象（未保存检查 / 保存前调用）。"""
+        self._apply_edits()
 
     def _is_dirty(self) -> bool:
         """当前是否有未保存改动（未注入检查器时退化为只看项目标记）。"""
@@ -454,12 +450,6 @@ class ProjectTab(QWidget):
         self._vm.delete_project(path)
         self._reload_recent()
 
-    def _on_recover(self, backup: str) -> None:
-        """从自动备份恢复项目（恢复会替换当前项目，先处理未保存改动）。"""
-        if not self._unsaved_guard("恢复其它项目"):
-            return
-        self._vm.recover_project(backup)
-
     # -----------------------------------------------------------
     # 项目操作
     # -----------------------------------------------------------
@@ -519,26 +509,23 @@ class ProjectTab(QWidget):
         if Path(path).resolve() == Path(self._vm.current_path).resolve():
             self._vm.message.emit("warning", "目标与原项目相同，请换一个文件名")
             return
-        self._vm.save_project_as(path)
+        # 另存为会连同项目文件夹（dataset / model 产物）一起复制，可能较久
+        with BusyPopup.scope(
+            self.window(), "正在另存为（复制项目文件夹）"
+        ) as busy:
+            self._vm.save_project_as(path, progress=busy.step)
 
     def close_project(self) -> None:
-        """关闭当前项目：先处理未保存改动，再确认关闭。"""
+        """关闭当前项目：只处理未保存改动（一次弹窗），不再二次确认。
+
+        「是否保存」人工确认本身就是对关闭动作的确认；确认后直接关闭。
+        """
         if not self._vm.has_project():
             self._vm.message.emit("warning", "当前没有打开的项目")
             return
         if not self._unsaved_guard("关闭项目"):
             return
-        project = self._vm.project
-        box = MessageBox(
-            "关闭项目",
-            f"确定要关闭项目「{project.name}」吗？\n\n"
-            "项目文件不会被删除。",
-            self,
-        )
-        box.yesButton.setText("关闭")
-        box.cancelButton.setText("取消")
-        if box.exec():
-            self._vm.close_project()
+        self._vm.close_project()
 
     def _apply_edits(self) -> None:
         """把名称 / 说明输入框的内容写回项目对象（仅在展示当前项目时）。"""
@@ -637,56 +624,7 @@ class ProjectTab(QWidget):
         self._values["log"].setText(str(DATA_DIR / "logs" / "deepmaven.log"))
 
     # -----------------------------------------------------------
-    # 可恢复项目（自动备份）
-    # -----------------------------------------------------------
-    def _on_recoverable(self, items: list) -> None:
-        """重建「可恢复项目」卡片按钮。"""
-        while self.recover_buttons.count():
-            item = self.recover_buttons.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
-        if not items:
-            self.recover_card.setVisible(False)
-            return
-        self.recover_card.setVisible(True)
-        self.recover_hint.setText(f"检测到 {len(items)} 个自动备份")
-        for info in items:
-            row = QWidget(self.recover_card)
-            layout = QVBoxLayout(row)
-            layout.setContentsMargins(0, 0, 0, 0)
-            layout.setSpacing(T.SPACE_XS)
-            # 名称 / 时间 / 按钮分三行：侧栏只有 320px，「名字 · 时间戳」挤在
-            # 一行会被压成省略号（文字必须完整可读，见 RULE.mdc §1）。
-            name_label = CaptionLabel(str(info.get("name") or ""), row)
-            name_label.setWordWrap(True)
-            name_label.setToolTip(str(info.get("backup", "")))
-            layout.addWidget(name_label)
-            time_label = CaptionLabel(str(info.get("time", "")), row)
-            time_label.setToolTip(str(info.get("backup", "")))
-            layout.addWidget(time_label)
-
-            restore = PushButton("恢复", row)
-            restore.clicked.connect(
-                lambda _checked=False, target=str(info.get("backup", "")):
-                self._on_recover(target)
-            )
-            discard = PushButton("忽略", row)
-            discard.clicked.connect(
-                lambda _checked=False, target=str(info.get("backup", "")):
-                self._vm.discard_backup(target)
-            )
-            buttons = QHBoxLayout()
-            buttons.setContentsMargins(0, 0, 0, 0)
-            buttons.setSpacing(T.SPACE_SM)
-            buttons.addStretch(1)
-            buttons.addWidget(restore)
-            buttons.addWidget(discard)
-            layout.addLayout(buttons)
-            self.recover_buttons.addWidget(row)
-
-    # -----------------------------------------------------------
-    # 图像位置（基础路径 / 缺失重定位）
+    # 图像位置（基础路径 / 缺失提示）
     # -----------------------------------------------------------
     def _refresh_location(self) -> None:
         """刷新基础路径与缺失图像提示。"""
@@ -703,38 +641,10 @@ class ProjectTab(QWidget):
             self.missing_label.setText(f"缺失 {missing} / {expected} 张")
         else:
             self.missing_label.setText(f"全部就位（{expected} 张）")
-        self.relocate_btn.setEnabled(bool(missing))
-
-    def _on_browse_base_path(self) -> None:
-        directory = QFileDialog.getExistingDirectory(self, "选择图像基础路径")
-        if directory and self._dataset_vm is not None:
-            self.base_edit.setText(directory)
-            self._dataset_vm.set_base_path(directory)
 
     def _on_base_path_changed(self) -> None:
         if self._dataset_vm is not None:
             self._dataset_vm.set_base_path(self.base_edit.text().strip())
-
-    def _on_relocate(self) -> None:
-        """按新根目录重定位缺失图像（要求目录结构一致）。"""
-        if self._dataset_vm is None:
-            return
-        missing = self._dataset_vm.missing_count()
-        if not missing:
-            return
-        directory = QFileDialog.getExistingDirectory(self, "选择图像所在的新根目录")
-        if not directory:
-            return
-        result = self._dataset_vm.relocate_images(directory)
-        if result.get("relocated"):
-            self._vm.message.emit("success", f"已重定位 {result['total']} 张图像")
-            self._dataset_vm.set_base_path(directory)
-        else:
-            self._vm.message.emit(
-                "warning",
-                f"只找到 {result.get('found', 0)} / {result.get('total', 0)} 张，未改动来源",
-            )
-        self._refresh_location()
 
     def refresh_current(self) -> None:
         """外部数据变化后刷新当前项目信息（如完成划分、标注）。"""
@@ -746,5 +656,4 @@ class ProjectTab(QWidget):
         super().showEvent(event)
         self.refresh_current()
         self._reload_recent()       # 回到本页时按需刷新（替代手动刷新按钮）
-        self._on_recoverable(self._vm.recoverable_projects())
         self._update_actions()

@@ -124,11 +124,13 @@ class PreferencesDialog(MessageBoxBase):
         self.autosave_spin.setRange(0, 600)
         self.autosave_spin.setSuffix(" 秒")
         self.autosave_spin.setValue(self._config.autosave_seconds)
-        self.autosave_spin.setToolTip("0 表示关闭自动保存")
+        self.autosave_spin.setToolTip(
+            "0 表示关闭自动备份；其余为停止改动后写入备份的等待秒数"
+        )
         self.autosave_spin.setFixedWidth(
             T.field_width(self.autosave_spin, T.STEPPER_CHARS_NARROW)
         )
-        form.addRow("自动保存间隔", self.autosave_spin)
+        form.addRow("自动备份延迟", self.autosave_spin)
 
         # 日志：单文件上限与保留份数（重启后生效）
         self.log_count_spin = SafeSpinBox(body)

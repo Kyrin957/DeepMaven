@@ -440,11 +440,12 @@ class SplitMapCard(CardWidget):
             counts: 以子集标记（T / V / E / 空串）为键的图片数。
             current: 当前选中图像所在的子集标记（T / V / E / 空串）。
         """
+        label = name or "未创建拆分"
         self.name_box.blockSignals(True)
         if self.name_box.count() == 0:
-            self.name_box.addItem(name or "dataset")
+            self.name_box.addItem(label)
         else:
-            self.name_box.setItemText(0, name or "dataset")
+            self.name_box.setItemText(0, label)
         self.name_box.setCurrentIndex(0)
         self.name_box.blockSignals(False)
         self.name_box.setEnabled(not locked)
