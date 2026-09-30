@@ -471,10 +471,19 @@ $env:QT_QPA_PLATFORM="offscreen"
   **数量口径**为准（数量 / 总数），保证「设 100 张」划分就是 100 张
   （历史缺陷：一律按百分比往返取整，「100」被改成 99；且输入框不
   联动）。数量模式下百分比为换算近似（取整显示）。
-- **改名校目录**：`rename_split` 把项目内的产物目录连同改名（旧名目录
-  移动为新名，`output_dir` / `data_yaml` / `dataset` / `training` /
-  `anomaly_root` 引用同步）——不得下次执行拆分时新建目录、旧目录残留
-  （历史缺陷）。
+- **列表行口径与概览一致**（`Split.ratio_text`）：**已生成给实际张数**
+  （`189/52/31`，与拆分概览的「图像」列逐项对得上），**未生成给计划百分比**
+  （四舍五入、差额补最大项，合计恒 100）——**禁止**再按 `int(比例 × 100)`
+  截断（历史缺陷：191/54/27 换算的比例显示成 `70/19/9`，合计 98，
+  与概览的实际张数对不上，看着像「重新分配没生效」）。
+- **执行拆分必须传 `seed`**：`split_dataset(..., seed=拆分.seed)` 与预览 /
+  预检查同源——不传时服务走默认 0，自定义种子的拆分会出现「概览按种子 N、
+  落盘产物按 0」的隐性错位（张数相同、分到各子集的图片不同）。
+- **分层抽样的取舍口径要可解释**：按类别分组后**向下取整**、余数归测试集
+  （小组 < 3 整体进训练集），因此「图像数」输入是**比例来源**、实际张数可能
+  差几张（弹窗「图像数」列头 tooltip 已注明）。**禁止**把这一差异当成
+  「没保存 / 没重新分配」去改刷新链路——判定是否真的执行过要看
+  「划分完成：训练 x / 验证 y / 测试 z」反馈与产物时间。
 - 拆分删除：**只有被训练引用的拆分不可编辑 / 删除**（`split_lock_reason`
   非空：`running` = 训练中 / 暂停且配置指向它；`used` = 完成过训练）——
   列表对应行在**行右端绘制锁图标**（`_SplitListDelegate` + `ui.icons`
@@ -558,6 +567,10 @@ $env:QT_QPA_PLATFORM="offscreen"
   （左列：数据集拆分 / 模型与权重 / 类别权重；右列：训练参数 / 数据增强），
   卡片按内容自适应高度、控件按参数字符宽度收紧，**不得一律纵向占满整行**；
   结果页承载进度 / 曲线 / 指标对比 / 训练记录 / 日志。
+- 右栏顶部三个 tab **必须等分铺满右栏宽度**（`SegmentedWidget` 显式
+  `Expanding` + `header_layout.addWidget(..., 1)`；qf 的 `Pivot.insertWidget`
+  已给条目 stretch 1）——qf 默认按文字宽度出尺寸，只有几个字那么宽、看着很小；
+  分段之外**只允许**留一个状态标签（训练中 / 已完成 / 失败…）。
 - **一个项目可创建多个训练模型**，每个模型 = 一整套参数（变体、拆分、
   超参、增强）+ 自己的产物目录 + 指标，便于同项目内横向对比：
   - 存储 `project.params["training_models"]` + `active_model_id`；活动模型
@@ -581,18 +594,28 @@ $env:QT_QPA_PLATFORM="offscreen"
     不携带它（`_snapshot` 排除）、加载后强制回写（历史故障：分类项目里
     下拉与卡片显示检测名）；
   - 状态行：训练中 / 已暂停 / 失败 / `主指标 值（第 N 轮）` / 未训练；
-  - 控制按钮 **复位 / 开始（运行中变暂停、暂停后变继续）/ 停止**：qf
-    `PushButton`（32px 高、**等分拉伸占满卡片宽度**）+ **图标 + 文字**
-    （文字居中；图标走 `ui.icons` 语义名 `reset / play / pause / stop`）；
-    样式**必须用 `setCustomStyleSheet` 追加**（`_CARD_BTN_QSS`：收紧
-    min-width + `text-align: center` + `:disabled` 高对比样式）——
-    **禁止** `setStyleSheet` 整体替换（会丢 qf 的居中与禁用样式，历史故障：
-    图标偏左、禁用态几乎看不出）；**复位启用矩阵**：未训练禁用；训练中禁用；
-    暂停 / 停止 / 完成 / 失败（有训练记录）启用；开始 / 停止按状态互斥；
-    **非活动卡片按钮禁用**（点击卡片先切换模型）；
+  - 控制按钮 **复位 / 开始（运行中变暂停、暂停后变继续）/ 停止**：**纯图标**
+    （`_ControlButton` = qf `TransparentToolButton` 子类；32px 高、**等分拉伸
+    占满卡片宽度**、图标 20px、语义名 `reset / play / pause / stop`）——
+    **不写文字**，含义一律走 tooltip（§10；卡片窄，图标 + 文字互相挤压）；
+    **禁用态必须明显**：qtawesome 字体图标**不吃** qf 的
+    `painter.setOpacity(0.43)`（实测禁用 / 可用逐像素相同），必须在
+    `setEnabled` 时挂 / 摘 `QGraphicsOpacityEffect`（40%）；自检要断言
+    「同一按钮 禁用 / 可用 墨量比 ≈ 0.4」且「可用时 effect 已注销」；
+    **复位启用矩阵**：未训练禁用；训练中禁用；暂停 / 停止 / 完成 / 失败
+    （有训练记录）启用；开始 / 停止按状态互斥；**非活动卡片按钮禁用**
+    （点击卡片先切换模型）；
   - 「⋯」菜单：重命名（聚焦名称编辑）/ 复制 / 删除 / 在文件资源管理器中
     打开训练；**不得**提供「继续训练（+50 轮）」等断点续训入口（已删）；
   - 选中高亮：边框品牌蓝 + 淡蓝底（未选中 `T.GROUP_BORDER`）。
+- **类别权重卡按当前拆分的训练集统计**（`train_class_counts` 读
+  `Split.output_dir` 的 train 子集）：**切换拆分 / 重新分配后必须随之刷新**
+  ——`_refresh_split` 每次都要走 `_fill_weights()`，且用输入签名
+  （拆分 id / 总张数 / 权重配置 / 任务 / 异常根目录）挡掉无变化时的重扫，
+  避免参数改动频繁触发扫描。历史缺陷：只有「未生成」分支才刷新，重新分配
+  后卡片仍显示上一套拆分的数字。该权重**只写进训练配置备查**，不改动拆分
+  与图片，也不被 Ultralytics 消费（说明走 tooltip，界面只留
+  「建议权重（未写入训练配置）/ 已应用逆频次权重」）。
 - 无模型时：左栏提示「暂无训练模型：点击「新建模型」创建」、右栏设置页
   整体禁用；训练启动前绑定活动模型目录（`start` 内 `_store_active` +
   `_apply_model_dir`），无模型时提示先新建。
@@ -652,9 +675,10 @@ $env:QT_QPA_PLATFORM="offscreen"
   260px 上下）里，一行最多 2 个默认 `PushButton`**；3 个及以上必须：
   ① 覆盖 min-width：
   `btn.setStyleSheet("PushButton { min-width: 0px; padding-left: 8px;"
-  " padding-right: 8px; }")`（`train_tab._ModelCard._tool` 的做法）；
-  ② 改用 `ToolButton`；③ 分行 / 进出菜单。**禁止**三个默认 PushButton
-  并排塞进侧栏卡片。
+  " padding-right: 8px; }")`；
+  ② 改用图标按钮（`ToolButton` / `TransparentToolButton`，最小宽 24~38px——
+  训练页模型卡片的三枚控制按钮走这条）；③ 分行 / 进出菜单。**禁止**三个
+  默认 PushButton 并排塞进侧栏卡片。
 - 横向布局必须显式指定 stretch 或宽度策略，**禁止**依赖默认 sizeHint
   "刚好放下"；新卡片/新工具栏完成后必须做下面的估算：
   `Σ 子件 minimumSizeHint + 间距 + 容器边距 ≤ 父容器内区宽`。
@@ -680,8 +704,10 @@ $env:QT_QPA_PLATFORM="offscreen"
 - **禁止** `widget.setStyleSheet(qss)` 整体替换 qf 组件样式：会连带清掉
   对齐（`text-align: center`）、`:hover` / `:disabled` / 焦点态等行为样式。
   历史故障：模型卡片控制按钮——换样式后**图标偏左、禁用态几乎看不出**
-  （`train_tab._CARD_BTN_QSS` 是正确写法的参考：收紧 min-width +
-  居中 + `:disabled` 高对比）。
+  （参考写法：`_ModelCard` 名称行内编辑只追加「透明无边框」一条
+  `setCustomStyleSheet`，保留 qf 输入的焦点 / 悬停行为；注：卡片三枚控制
+  按钮已改为纯图标 `_ControlButton`，它的禁用态走 `QGraphicsOpacityEffect`
+  ——QSS 的 `:disabled` 对**图标**无效）。
 - 例外：**自绘容器**不承载 qf 行为样式，可以直接 `setStyleSheet`——
   如 `#ModelCard` 的选中边框、概览卡的色块 `chip` / `divider` 纯色条。
 - 自检要求：卡片/工具栏类控件断言 `widget.styleSheet()` 同时包含

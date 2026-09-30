@@ -841,7 +841,11 @@ class DatasetViewModel(QObject):
         try:
             stats = self._service.split_dataset(
                 source, out_dir,
-                split=split, stratified=self._dataset.stratified, layout=layout,
+                # seed 必须与预览 / 预检查同源：不传时 split_dataset 走默认 0，
+                # 自定义种子的拆分就会出现「概览（按种子 N）与落盘产物（按 0）」
+                # 成员不同的隐性错位（张数相同、分到各子集的图片不同）
+                split=split, seed=self._dataset.seed,
+                stratified=self._dataset.stratified, layout=layout,
                 images=library, label_index=label_index,
                 kinds=kinds, counts=counts,
                 overrides=split_overrides,
@@ -915,16 +919,19 @@ class DatasetViewModel(QObject):
 
         linked = int(stats.get("linked", 0))
         copied = int(stats.get("copied", 0))
-        if linked and not copied:
-            storage = f"；{linked} 张为链接，不额外占用磁盘"
-        elif copied:
-            storage = f"；{linked} 张链接 / {copied} 张复制（跨盘或权限不足）"
-        else:
-            storage = ""
+        # 存储明细只进日志：界面反馈只讲结果与各子集张数（UI 规则 §10）
+        logger.info(
+            "划分产物落盘：链接 %s 张 / 复制 %s 张（跨盘或权限不足时复制）",
+            linked, copied,
+        )
+        # 与拆分概览 / 拆分列表同一口径（实际张数），便于对照
         self.message.emit(
             "success",
-            f"划分完成：train {stats['train']} / val {stats['val']} / "
-            f"test {stats['test']}{storage}",
+            "划分完成："
+            + " / ".join(
+                f"{SPLIT_LABELS[sub]} {stats[sub]}"
+                for sub in ("train", "val", "test")
+            ),
         )
 
     def load_from_project(self, project) -> None:

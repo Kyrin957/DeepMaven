@@ -13,14 +13,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, Qt, QUrl, Signal
+from PySide6.QtCore import QPoint, QSize, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
+    QGraphicsOpacityEffect,
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QSizePolicy,
     QStackedWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -119,19 +121,30 @@ def _duration(seconds: float) -> str:
     return f"{total // 3600:02d}:{total % 3600 // 60:02d}:{total % 60:02d}"
 
 
-# 模型卡片控制按钮的追加样式（`setCustomStyleSheet`，**不得**整体替换 qf
-# 样式——替换会丢失 qf 的 text-align:center 与 :disabled 规则，历史故障：
-# 图标偏左、禁用态几乎看不出）。内容：
-# - min-width 收紧（qf 默认 106px，三枚并排会撑宽卡片，见 UI 规则 §24）；
-# - 图标 + 文字水平居中；
-# - 禁用态高对比（背景 / 文字 / 边框同时变淡）。
-_CARD_BTN_QSS = (
-    "PushButton { min-width: 0px; padding-left: 6px; padding-right: 6px;"
-    " text-align: center; }"
-    "PushButton:disabled { background-color: rgba(140, 140, 140, 0.10);"
-    " color: rgba(140, 140, 140, 0.60);"
-    " border-color: rgba(140, 140, 140, 0.22); }"
-)
+class _ControlButton(TransparentToolButton):
+    """模型卡片控制按钮（复位 / 开始 / 停止）：纯图标 + **禁用态明显淡化**。
+
+    qf 的 ``ToolButton.paintEvent`` 用 ``painter.setOpacity(0.43)`` 表达禁用态，
+    但 ``ui.icons`` 的图标来自 qtawesome（字体引擎）——实测该不透明度对它无效，
+    禁用与可用**逐像素相同**（《开发文档.md》§4.61 自检：墨量 47134 → 47134）。
+    卡片按钮不写文字（§10），禁用提示只能靠图标本身，故在启用状态变化时挂 /
+    摘 ``QGraphicsOpacityEffect``（40 %）：未训练的「复位 / 停止」一眼可辨。
+    """
+
+    _DISABLED_OPACITY = 0.4
+
+    def setEnabled(self, enabled: bool) -> None:  # noqa: N802 - Qt 命名
+        super().setEnabled(enabled)
+        has_effect = self.graphicsEffect() is not None
+        if enabled:
+            if has_effect:
+                # 置 None 即销毁 effect，恢复按可用态绘制
+                self.setGraphicsEffect(None)  # type: ignore[arg-type]
+            return
+        if not has_effect:
+            effect = QGraphicsOpacityEffect(self)
+            effect.setOpacity(self._DISABLED_OPACITY)
+            self.setGraphicsEffect(effect)
 
 
 class _ModelCard(QFrame):
@@ -139,7 +152,8 @@ class _ModelCard(QFrame):
 
     参照 Halcon DLT 的模型卡：点击选中；名称直接在卡片上改（回车 / 失焦
     提交，不再弹窗）；「⋯」菜单含 重命名 / 复制 / 删除 / 在文件资源管理器
-    中打开训练；底部三个等分按钮为 复位 / 开始（暂停 → 继续）/ 停止。
+    中打开训练；底部三个等分图标按钮为 复位 / 开始（暂停 → 继续）/ 停止
+    （不写文字，含义走 tooltip；不可用时整枚淡化，见 `_ControlButton`）。
     """
 
     selected = Signal(int)
@@ -201,7 +215,8 @@ class _ModelCard(QFrame):
         self.state_label.setToolTip(state)
         layout.addWidget(self.state_label)
 
-        # 控制按钮：图标 + 文字、等分拉伸占满卡片宽度，点击面积大、禁用态明显。
+        # 控制按钮：只画图标、等分拉伸占满卡片宽度——图标居中、点击面积大；
+        # 含义一律走 tooltip，不写文字（卡片窄，图标 + 文字会互相挤压，§10）。
         # 复位仅在**训练过**（暂停 / 停止 / 完成 / 失败）且非「运行中」时可用；
         # 未训练的模型不可复位（历史：未训练也能点，语义不明）。
         status = str(model.get("status") or "")
@@ -213,24 +228,23 @@ class _ModelCard(QFrame):
         row = QHBoxLayout()
         row.setSpacing(T.SPACE_SM)
         self.reset_btn = self._tool(
-            "reset", "复位", "复位训练状态", self.resetRequested,
+            "reset", "复位训练状态", self.resetRequested,
             enabled=attempted and not (running and not paused),
         )
         row.addWidget(self.reset_btn, 1)
         if running and not paused:
             self.toggle_btn = self._tool(
-                "pause", "暂停", "暂停训练（本轮结束后生效）", self.toggleRequested
+                "pause", "暂停训练（本轮结束后生效）", self.toggleRequested
             )
         else:
             self.toggle_btn = self._tool(
                 "play",
-                "继续" if paused else "开始",
                 "继续训练" if paused else "开始训练",
                 self.toggleRequested,
             )
         row.addWidget(self.toggle_btn, 1)
         self.stop_btn = self._tool(
-            "stop", "停止", "停止训练", self.stopRequested, enabled=running
+            "stop", "停止训练", self.stopRequested, enabled=running
         )
         row.addWidget(self.stop_btn, 1)
         layout.addLayout(row)
@@ -263,21 +277,24 @@ class _ModelCard(QFrame):
         return "未训练"
 
     def _tool(
-        self, name: str, text: str, tip: str, signal, enabled: bool = True
-    ):
-        """卡片内的控制按钮（图标 + 文字；等分拉伸、禁用态明显）。
+        self, name: str, tip: str, signal, enabled: bool = True
+    ) -> TransparentToolButton:
+        """卡片内的控制按钮（图标态；等分拉伸、禁用态明显）。
 
-        用 `setCustomStyleSheet` **追加**样式（见 `_CARD_BTN_QSS`）：直接
-        `setStyleSheet` 会整体替换 qf 按钮样式——丢失 `text-align: center`
-        （图标偏左）与 `:disabled` 规则（禁用态几乎看不出），均为历史故障。
-        收紧 min-width 防三枚并排撑宽卡片（UI 规则 §24）。
+        用 `_ControlButton`（`TransparentToolButton` 子类）：图标由 qf 居中
+        绘制、禁用时整体降到 40% 不透明度；图标按钮的最小宽只有 24px，三枚
+        并排不会撑宽卡片（UI 规则 §24）。含义一律走 tooltip，不写文字（§10）。
         """
-        button = PushButton(self)
-        button.setText(text)
+        button = _ControlButton(self)
         button.setIcon(icon(name))
+        button.setIconSize(QSize(T.ICON_GLYPH_LG, T.ICON_GLYPH_LG))
         button.setToolTip(tip)
         button.setFixedHeight(32)
-        setCustomStyleSheet(button, _CARD_BTN_QSS, _CARD_BTN_QSS)
+        # QToolButton 默认不参与拉伸，显式声明横向 Expanding：行内三枚
+        # `addWidget(..., 1)` 等分占满卡片宽度（图标仍居中）
+        button.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
         button.setEnabled(enabled)
         button.clicked.connect(lambda: signal.emit(self.model_id))
         return button
@@ -345,6 +362,7 @@ class TrainTab(QWidget):
         self._checks: dict[str, CheckBox] = {}
         self._aug_spins: dict[str, SafeDoubleSpinBox] = {}
         self._tile_values: dict[str, BodyLabel] = {}
+        self._weight_inputs_rendered: tuple = ()
         self._build_ui()
         self._bind()
         self._on_status(self._vm.config.status)
@@ -512,8 +530,13 @@ class TrainTab(QWidget):
         self.tab_seg.addItem("results", "结果", onClick=lambda: self._switch(1))
         self.tab_seg.addItem("compare", "对比", onClick=lambda: self._switch(2))
         self.tab_seg.setCurrentItem("settings")
-        header_layout.addWidget(self.tab_seg)
-        header_layout.addStretch(1)
+        # 三个 tab 等分撑满右栏宽度：`SegmentedWidget`（Pivot）自身是横向
+        # Minimum 策略、按文字宽度出尺寸，看着很小；改为 Expanding + 拉伸
+        # 系数 1，条目侧 `insertWidget(..., stretch=1)` 已就位，随之等分。
+        self.tab_seg.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+        header_layout.addWidget(self.tab_seg, 1)
         self.state_label = CaptionLabel("", header)
         header_layout.addWidget(self.state_label)
         column.addWidget(header)
@@ -828,7 +851,17 @@ class TrainTab(QWidget):
         return card
 
     def _fill_weights(self) -> None:
-        """刷新类别权重展示（数量 / 权重 / 是否已应用）。"""
+        """刷新类别权重卡（数量 / 权重 / 是否已应用）。
+
+        统计要扫训练集标签，而刷新链路会被参数改动频繁触发——用输入签名
+        挡掉无变化的重算重绘。**切换拆分 / 重新分配拆分必须跟着刷新**
+        （历史缺陷：只有「未生成」分支才刷新，重新分配后卡片仍显示上一套
+        拆分的数字）。
+        """
+        signature = self._weight_inputs()
+        if signature == self._weight_inputs_rendered:
+            return
+        self._weight_inputs_rendered = signature
         while self.weight_grid.count():
             item = self.weight_grid.takeAt(0)
             widget = item.widget()
@@ -836,7 +869,7 @@ class TrainTab(QWidget):
                 widget.deleteLater()
         rows = self._vm.class_weight_rows()
         if not rows:
-            self.weight_hint.setText("暂无可统计的训练集（请先选择已生成的拆分）")
+            self.weight_hint.setText("暂无可统计的训练集")
             return
         for index, row in enumerate(rows):
             self.weight_grid.addWidget(
@@ -848,11 +881,26 @@ class TrainTab(QWidget):
             )
         applied = all(row["applied"] for row in rows)
         self.weight_hint.setText(
-            "已应用逆频次权重。说明：Ultralytics 当前不消费该权重，"
-            "此项用于判断数据是否均衡、是否需要补样本或改用单类训练"
-            if applied else
-            "未设置：上面是按训练集频次算出的「建议」权重，"
-            "点「平衡」后写入训练配置备查"
+            "已应用逆频次权重" if applied else "建议权重（未写入训练配置）"
+        )
+
+    def _weight_inputs(self) -> tuple:
+        """权重卡的输入签名：训练集统计只依赖这些（不含磁盘内容）。"""
+        config = self._vm.config
+        split = (
+            self._dataset_vm.active_split()
+            if self._dataset_vm is not None else None
+        )
+        stored = dict(getattr(config, "class_weights", {}) or {})
+        return (
+            int(getattr(config, "split_id", 0) or 0),
+            str(getattr(config, "task_type", "") or ""),
+            str(getattr(config, "anomaly_root", "") or ""),
+            tuple(sorted(
+                (str(key), float(value)) for key, value in stored.items()
+            )),
+            0 if split is None else int(split.split_id),
+            0 if split is None else int(split.total()),
         )
 
     def _on_preview_params(self) -> None:
@@ -1271,6 +1319,8 @@ class TrainTab(QWidget):
 
     def _refresh_split(self) -> None:
         """拆分下拉 + 占比图（一个项目可有多套拆分，训练前先选一套）。"""
+        # 类别权重按当前拆分的训练集统计：拆分切换 / 重新分配后一并刷新
+        self._fill_weights()
         config = self._vm.config
         splits = (
             self._dataset_vm.splits_ready() if self._dataset_vm is not None else []
@@ -1324,7 +1374,6 @@ class TrainTab(QWidget):
         self._set_split_summary(
             preview_counts, int(preview.get("total", 0) or 0)
         )
-        self._fill_weights()
 
     def _set_split_summary(self, counts: dict, total: int) -> None:
         """更新拆分概览（环形图 + 汇总表；与数据拆分页概览卡同一结构）。"""

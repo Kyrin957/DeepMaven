@@ -13,9 +13,21 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from src.utils.constants import SPLIT_SUBDIRS
+
 
 def _now_iso() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _plan_percents(*ratios: float) -> tuple[int, int, int]:
+    """比例 → 计划百分比（四舍五入，差额补到最大的一项以保证合计 100）。"""
+    values = [max(0, int(round(float(value) * 100))) for value in ratios]
+    gap = 100 - sum(values)
+    if gap:
+        index = values.index(max(values))
+        values[index] = max(0, values[index] + gap)
+    return tuple(values)  # type: ignore[return-value]
 
 
 # 默认拆分目录名（未命名时的兜底）
@@ -61,7 +73,23 @@ class Split:
 
     @property
     def ratio_text(self) -> str:
-        return f"{int(self.train * 100)}/{int(self.val * 100)}/{int(self.test * 100)}"
+        """划分文本：**已生成给实际张数**，未生成给计划百分比。
+
+        已生成（有产物）时给 ``189/52/31`` 这样的**实际张数**——与拆分概览的
+        「图像」列逐个对上；未生成时给按比例四舍五入、合计 100 的百分比。
+
+        历史缺陷：这里固定输出 ``int(比例 × 100)``（截断），于是「按张数 191/54/27
+        换算出来的比例」（0.702 / 0.199 / 0.099）显示成 ``70/19/9``——合计只有
+        98，且与拆分概览按分层抽样算出的 189/52/31 对不上，看着像「没更新」。
+        """
+        if self.ready and self.counts:
+            return "/".join(
+                str(int(self.counts.get(sub, 0) or 0)) for sub in SPLIT_SUBDIRS
+            )
+        return "/".join(
+            str(value)
+            for value in _plan_percents(self.train, self.val, self.test)
+        )
 
     def total(self) -> int:
         return sum(int(value) for value in self.counts.values())

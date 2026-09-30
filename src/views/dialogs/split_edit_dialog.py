@@ -133,6 +133,7 @@ class SplitEditDialog(MessageBoxBase):
         table.setVerticalSpacing(T.SPACE_SM)
 
         head_count = CaptionLabel("图像数", self)
+        head_count.setToolTip("分层抽样会按类别微调实际张数")
         head_count.setAlignment(
             Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter
         )
