@@ -65,7 +65,12 @@ from src.viewmodels.model_vm import ModelViewModel
 from src.viewmodels.train_vm import TrainViewModel
 from src.views.data_widgets import side_column
 from src.views.dialogs import ImagePreviewDialog
-from src.views.ui import ParamGroup, SafeDoubleSpinBox, SafeSpinBox
+from src.views.ui import (
+    ParamGroup,
+    SafeDoubleSpinBox,
+    SafeSpinBox,
+    icon_button,
+)
 from src.views.ui import tokens as T
 from src.views.ui.icons import icon
 from src.views.widgets import LineChart, PieChart
@@ -363,6 +368,8 @@ class TrainTab(QWidget):
         self._aug_spins: dict[str, SafeDoubleSpinBox] = {}
         self._tile_values: dict[str, BodyLabel] = {}
         self._weight_inputs_rendered: tuple = ()
+        # 最近一次选定的自定义权重（切回「自定义权重」时免再弹一次对话框）
+        self._custom_weights = ""
         self._build_ui()
         self._bind()
         self._on_status(self._vm.config.status)
@@ -421,7 +428,10 @@ class TrainTab(QWidget):
             is_active = model_id == active_id
             card = _ModelCard(
                 model,
-                variant_label=self._variant_label_for(model),
+                # 活动模型用**活配置**：改完变体 / 权重来源，卡片规格行立刻反映
+                variant_label=self._variant_label_for(
+                    model, self._vm.config if is_active else None
+                ),
                 active=is_active,
                 running=alive and is_active,
                 paused=paused and is_active,
@@ -441,13 +451,27 @@ class TrainTab(QWidget):
         )
 
     @staticmethod
-    def _variant_label_for(model: dict) -> str:
-        """模型卡片规格行：变体**全名**（含任务后缀）+ 输入尺寸。
+    def _variant_label_for(model: dict, live=None) -> str:
+        """模型卡片规格行：**实际用于训练的权重来源**。
 
-        分类 / 分割 / 旋转框的权重名带任务后缀（如 ``yolo11n-cls``），
-        规格行必须显示 ``YOLO11n-cls`` 全名，避免与检测变体混淆。
+        预训练变体：显示变体**全名**（含任务后缀）+ 输入尺寸——分类 / 分割 /
+        旋转框的权重名带任务后缀（如 ``yolo11n-cls``），必须显示全名以免与
+        检测变体混淆。自定义权重：显示「自定义权重 · 文件名」（此时变体不参与
+        训练，显示变体名会误导）。
+
+        ``live``：活动模型的活配置（快照要等「切换模型 / 开始训练」才回写，
+        用活配置才能当场反映变体与权重来源的改动）。
         """
-        key = str((model.get("config") or {}).get("model_key") or "")
+        config = live if live is not None else (model.get("config") or {})
+        read = (
+            (lambda name: config.get(name))
+            if isinstance(config, dict)
+            else (lambda name: getattr(config, name, ""))
+        )
+        weights = str(read("weights_path") or "")
+        if weights:
+            return f"自定义权重 · {Path(weights).name}"
+        key = str(read("model_key") or "")
         base = base_variant_key(key)
         variant = next(
             (v for v in YOLO_MODEL_VARIANTS if v["key"] == base), None
@@ -672,12 +696,33 @@ class TrainTab(QWidget):
         return card
 
     def _build_model_card(self) -> CardWidget:
-        """模型与权重：变体全名（含任务后缀）+ 自定义权重（紧凑排布）。"""
+        """模型与权重：**二选一**的权重来源（预训练变体 / 自定义权重文件）。
+
+        训练时两者等价：`--weights = weights_path or f"{model_key}.pt"`——
+        选了自定义权重，变体就不再参与训练（只作为展示与兜底名）。因此界面
+        用分段开关二选一，避免「下拉也选了、权重也导了，到底用哪个」的歧义。
+        其它任务（U-Net / 异常检测 / OCR）训练不用自定义权重，只显示变体。
+        """
         card, layout = self._card("模型与权重")
-        # 变体（模型规格）选择：属于所选训练模型的参数（参照 DLT 的「神经网络」）
+
+        # 来源切换：未导入过权重时点「自定义权重」直接弹导入对话框
+        self.source_seg = SegmentedWidget(card)
+        self.source_seg.addItem("pretrained", "预训练模型")
+        self.source_seg.addItem("custom", "自定义权重")
+        self.source_seg.setCurrentItem("pretrained")
+        self.source_seg.currentItemChanged.connect(self._on_source_changed)
+        layout.addWidget(self.source_seg)
+
+        # —— 来源 1：预训练变体 ——
+        self.variant_holder = QWidget(card)
+        variant_box = QVBoxLayout(self.variant_holder)
+        variant_box.setContentsMargins(0, 0, 0, 0)
+        variant_box.setSpacing(T.SPACE_SM)
         variant_row = QHBoxLayout()
-        variant_row.addWidget(CaptionLabel("模型", card))
-        self.variant_combo = ComboBox(card)
+        variant_row.setContentsMargins(0, 0, 0, 0)
+        variant_row.setSpacing(T.SPACE_SM)
+        variant_row.addWidget(CaptionLabel("模型", self.variant_holder))
+        self.variant_combo = ComboBox(self.variant_holder)
         # 显示名带任务后缀（分类的 yolo11n-cls → YOLO11n-cls），避免与
         # 检测变体混淆；下拉宽度按内容收紧，不占满整行
         task = str(self._vm.config.task_type or "detect")
@@ -686,31 +731,107 @@ class TrainTab(QWidget):
         self.variant_combo.setMinimumWidth(170)
         variant_row.addWidget(self.variant_combo)
         variant_row.addStretch(1)
-        layout.addLayout(variant_row)
-        self.variant_desc = CaptionLabel("", card)
-        layout.addWidget(self.variant_desc)
+        variant_box.addLayout(variant_row)
+        self.variant_desc = CaptionLabel("", self.variant_holder)
+        variant_box.addWidget(self.variant_desc)
+        layout.addWidget(self.variant_holder)
 
+        # —— 来源 2：自定义权重（导入按钮 + 文件名）——
+        self.weights_holder = QWidget(card)
+        weights_box = QVBoxLayout(self.weights_holder)
+        weights_box.setContentsMargins(0, 0, 0, 0)
+        weights_box.setSpacing(T.SPACE_SM)
         weights_row = QHBoxLayout()
-        self.weights_edit = LineEdit(card)
-        self.weights_edit.setPlaceholderText("自定义权重 (.pt)")
-        self.weights_edit.setToolTip("留空则使用所选变体的官方预训练权重")
-        self.weights_edit.textChanged.connect(
-            lambda text: self._on_param_changed() if not self._syncing
-            else None
+        weights_row.setContentsMargins(0, 0, 0, 0)
+        weights_row.setSpacing(T.SPACE_SM)
+        self.import_btn = icon_button(
+            icon("import"), "导入权重文件", self.weights_holder
         )
-        weights_row.addWidget(self.weights_edit, 1)
-        browse_btn = PushButton("浏览", card)
-        browse_btn.clicked.connect(self._on_browse_weights)
-        weights_row.addWidget(browse_btn)
-        import_btn = PushButton("导入", card)
-        import_btn.clicked.connect(self._on_import_weights)
-        weights_row.addWidget(import_btn)
-        layout.addLayout(weights_row)
+        self.import_btn.clicked.connect(self._on_import_weights)
+        weights_row.addWidget(self.import_btn)
+        self.weights_name = CaptionLabel("未选择权重文件", self.weights_holder)
+        self.weights_name.setWordWrap(True)
+        weights_row.addWidget(self.weights_name, 1)
+        weights_box.addLayout(weights_row)
+        layout.addWidget(self.weights_holder)
 
-        self.model_info = CaptionLabel("未导入权重", card)
+        # 权重信息 / 任务状态（导入探测结果；常显，不随来源切换隐藏）
+        self.model_info = CaptionLabel("", card)
         self.model_info.setWordWrap(True)
         layout.addWidget(self.model_info)
+        self._update_source_ui("")
         return card
+
+    # -----------------------------------------------------------
+    # 权重来源（预训练变体 ↔ 自定义权重）
+    # -----------------------------------------------------------
+    def _supports_custom_weights(self, task: str = "") -> bool:
+        """训练是否用得上自定义权重：YOLO 系 `weights_path` 覆盖预训练权重。
+
+        U-Net / 异常检测 / OCR 的训练参数里没有自定义权重（那是评估 / 导出
+        的输入），对它们不提供这个入口，避免出现「导了权重却不生效」。
+        """
+        task = task or str(self._vm.config.task_type or "detect")
+        return backend_for_task(task).key == "yolo"
+
+    def _current_weights(self) -> str:
+        """当前生效的自定义权重路径（预训练模式 / 不支持的任务为空串）。"""
+        custom = (
+            self._supports_custom_weights()
+            and self.source_seg.currentRouteKey() == "custom"
+        )
+        return str(self._custom_weights or "") if custom else ""
+
+    def _pick_weights_file(self) -> str:
+        """弹窗选择权重文件（取消返回空串）。"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入权重文件", "", "PyTorch Weight (*.pt)"
+        )
+        return str(path or "")
+
+    def _on_source_changed(self, key: str) -> None:
+        """来源切换：自定义权重 → 导入对话框（取消则退回预训练）。"""
+        if self._syncing:
+            return
+        if key != "custom":
+            # 预训练：自定义权重退出（配置清空，变体生效）
+            self._apply({"weights_path": ""})
+            self._update_source_ui("")
+            return
+        path = str(self._custom_weights or "")
+        if not path or not Path(path).is_file():
+            path = self._pick_weights_file()
+        if not path:
+            # 取消导入：回到预训练模式，不留「自定义但没文件」的半选状态
+            self._syncing = True
+            try:
+                self.source_seg.setCurrentItem("pretrained")
+            finally:
+                self._syncing = False
+            self._update_source_ui("")
+            return
+        self._apply_weights(path)
+
+    def _apply_weights(self, path: str) -> None:
+        """把自定义权重写入配置并探测模型信息（界面同步显示文件名）。"""
+        self._custom_weights = str(path)
+        self._apply({"weights_path": self._custom_weights})
+        if self._model_vm is not None:
+            self._model_vm.import_weights(self._custom_weights)
+        self._update_source_ui(self._custom_weights)
+
+    def _update_source_ui(self, weights: str) -> None:
+        """按当前来源切换两个模式区的显隐与文件信息（不回写配置）。"""
+        support = self._supports_custom_weights()
+        custom = bool(weights) and support
+        self.source_seg.setVisible(support)
+        self.variant_holder.setVisible(not custom)
+        self.weights_holder.setVisible(custom)
+        name = Path(weights).name if weights else ""
+        self.weights_name.setText(name or "未选择权重文件")
+        self.weights_name.setToolTip(str(weights) or "点击左侧按钮导入权重文件")
+        if not custom:
+            self.model_info.setText("")
 
     def _build_param_card(self) -> CardWidget:
         """训练参数：模块化容器 + 紧凑步进器（参照 Halcon DLT 的设置分组）。
@@ -1124,20 +1245,11 @@ class TrainTab(QWidget):
                 lambda _rows: self._refresh_split()
             )
 
-    def _on_browse_weights(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "选择权重文件", "", "PyTorch Weight (*.pt)"
-        )
-        if path:
-            self.weights_edit.setText(path)
-            self._on_import_weights()
-
     def _on_import_weights(self) -> None:
-        """导入自定义权重：交给模型 ViewModel 探测信息，同时写进训练配置。"""
-        path = self.weights_edit.text().strip()
-        if self._model_vm is not None and path:
-            self._model_vm.import_weights(path)
-        self._apply({"weights_path": path})
+        """自定义权重区：重新选择权重文件（取消则保持原文件）。"""
+        path = self._pick_weights_file()
+        if path:
+            self._apply_weights(path)
 
     def _on_browse_anomaly(self) -> None:
         directory = QFileDialog.getExistingDirectory(self, "选择异常检测数据目录")
@@ -1154,13 +1266,8 @@ class TrainTab(QWidget):
         if self._model_vm is not None:
             self._model_vm.select_variant(key)
         self._update_variant_desc(key)
-        # 变体换了以后，官方权重路径要跟着换（自定义权重保留）
-        current = self.weights_edit.text().strip()
-        changes = {"model_key": key}
-        if current and Path(current).name == f"{self._vm.config.model_key}.pt":
-            self.weights_edit.setText("")
-            changes["weights_path"] = ""
-        self._apply(changes)
+        # 变体只影响预训练权重来源：自定义权重模式下它是被忽略的兜底名
+        self._apply({"model_key": key})
 
     def _update_variant_desc(self, key: str) -> None:
         """显示变体描述（key 可能带任务后缀，如分类的 yolo11n-cls）。"""
@@ -1213,7 +1320,7 @@ class TrainTab(QWidget):
         """把界面上的全部参数收集为配置字典。"""
         values: dict = {
             "model_key": str(self.variant_combo.currentData() or ""),
-            "weights_path": self.weights_edit.text().strip(),
+            "weights_path": self._current_weights(),
             "optimizer": self.opt_combo.currentText(),
             "device": str(self.device_combo.currentData() or "auto"),
             "anomaly_root": self.anomaly_edit.text().strip(),
@@ -1277,7 +1384,16 @@ class TrainTab(QWidget):
             if key_index >= 0:
                 self.variant_combo.setCurrentIndex(key_index)
             self._update_variant_desc(str(getattr(config, "model_key", "")))
-            self.weights_edit.setText(str(getattr(config, "weights_path", "")))
+            # 权重来源：有自定义权重 → 自定义模式（记住路径便于切回），
+            # 否则预训练模式（变体生效）
+            weights = str(getattr(config, "weights_path", ""))
+            if weights:
+                self._custom_weights = weights
+            support = self._supports_custom_weights(task)
+            self.source_seg.setCurrentItem(
+                "custom" if (weights and support) else "pretrained"
+            )
+            self._update_source_ui(weights if support else "")
             self.anomaly_edit.setText(str(getattr(config, "anomaly_root", "")))
             self.anomaly_check.setChecked(
                 bool(getattr(config, "anomaly_pretrained", True))
@@ -1362,7 +1478,8 @@ class TrainTab(QWidget):
             self._set_split_summary(counts, total)
             return
 
-        # 未生成：用当前拆分参数的预览值
+        # 未生成：用当前拆分参数的预览值（“拆分中的图像” = 三个子集之和，
+        # 与拆分页概览同口径——改划到「未划分」的图片不计入）
         preview = (
             self._dataset_vm.preview_split() if self._dataset_vm is not None else {}
         ) or {}
@@ -1371,9 +1488,7 @@ class TrainTab(QWidget):
             name: int((subsets.get(name) or {}).get("count", 0))
             for name in ("train", "val", "test")
         }
-        self._set_split_summary(
-            preview_counts, int(preview.get("total", 0) or 0)
-        )
+        self._set_split_summary(preview_counts, sum(preview_counts.values()))
 
     def _set_split_summary(self, counts: dict, total: int) -> None:
         """更新拆分概览（环形图 + 汇总表；与数据拆分页概览卡同一结构）。"""
@@ -1556,8 +1671,9 @@ class TrainTab(QWidget):
         self._switch(1)
 
     def _on_model_info(self, info: dict) -> None:
+        """权重探测信息（导入后显示类别数 / 参数量 / 层数）。"""
         if not info:
-            self.model_info.setText("未导入权重")
+            self.model_info.setText("")
             return
         names = info.get("names") or {}
         labels = list(names.values()) if isinstance(names, dict) else list(names)

@@ -603,7 +603,14 @@ class SplitTab(QWidget):
             if self._vm.active_split() is not None
             else {}
         )
-        total = int(preview.get("total", 0)) if preview else 0
+        subsets = preview.get("subsets") or {}
+        counts = {
+            key: int((subsets.get(key) or {}).get("count", 0))
+            for key in ("train", "val", "test")
+        }
+        # 「拆分中的图像」= 三个子集之和：手工改划到「未划分」的图片不在其中
+        # （概览与百分比都用这个口径，否则分母比分子之和大、百分比合计不到 100 %）
+        total = sum(counts.values())
         if not preview or not total:
             self.pie.set_data([], "")
             for row in self.summary_rows.values():
@@ -616,14 +623,12 @@ class SplitTab(QWidget):
             return
 
         # 概览：环形图 + 汇总表（三行 + 合计）
-        subsets = preview.get("subsets") or {}
         segments = []
         for key in ("train", "val", "test"):
-            count = int((subsets.get(key) or {}).get("count", 0))
-            segments.append((SPLIT_LABELS[key], count, SPLIT_COLORS[key]))
-            self.summary_rows[key]["count"].setText(str(count))
+            segments.append((SPLIT_LABELS[key], counts[key], SPLIT_COLORS[key]))
+            self.summary_rows[key]["count"].setText(str(counts[key]))
             self.summary_rows[key]["percent"].setText(
-                f"{count * 100 / total:.0f} %"
+                f"{counts[key] * 100 / total:.0f} %"
             )
         self.pie.set_data(segments, str(total))
         self.summary_total.setText(str(total))

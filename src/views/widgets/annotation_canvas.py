@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 from qfluentwidgets import Action, RoundMenu
 
 from src.models.annotation import BOX, POLYGON, TEXT, Annotation
+from src.utils.constants import SPLIT_COLORS
 from src.utils.geometry import area, merge_holes, rotate, translate
 
 MODE_BROWSE = "browse"
@@ -49,6 +50,12 @@ _MIN_SIZE = 3.0        # 小于该像素尺寸的框视为误触
 _FALLBACK_COLOR = "#66CCFF"
 _CLASS_TAG_MARGIN = 6.0          # 图像左上角类别标签距图片边缘的间距
 _CLASS_TAG_FALLBACK = "#8A8A8A"  # 类别没有颜色时的兜底色（灰）
+# 缩放下限（10%）：图像位置由导航器定位，缩得过小只剩几个像素没有意义
+_MIN_ZOOM = 0.10
+# 图像右下角数据集划分标签：标记 T / V / E → SPLIT_COLORS 的键
+# （与图库 / 检查页缩略图右下角的划分角标同口径，RULE §13）
+_SPLIT_KEYS = {"T": "train", "V": "val", "E": "test"}
+_SPLIT_TAG_FALLBACK = "#4A5459"  # 未知标记的兜底色（灰）
 _NUDGE_PIXELS = {"normal": 1.0, "fine": 0.2, "coarse": 10.0}
 # 掩码上过小的连通域直接丢弃（图片面积的比例；归一化面积本身即占比）
 _MIN_MASK_AREA = 0.00001
@@ -86,6 +93,10 @@ class AnnotationCanvas(QGraphicsView):
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        # 滚动条只作内部平移通道（平移改写滚动值），不显示：图像可随意拖出窗口，
+        # 位置感由左栏导航器给出（与 Halcon DLT 一致）
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         self._img_w = 0
         self._img_h = 0
@@ -107,6 +118,7 @@ class AnnotationCanvas(QGraphicsView):
         # 交互中间态
         self._panning = False
         self._pan_start = None
+        self._pan_mode = False        # 手掌光标：左键拖动图像（见 set_pan_mode）
         self._drawing = False
         self._start = None
         self._rubber = None
@@ -142,6 +154,8 @@ class AnnotationCanvas(QGraphicsView):
         # 图像左上角类别标签（整图任务：分类 / 异常检测——类别即标注结果）
         self._image_class_name = ""
         self._image_class_color = ""
+        # 图像右下角数据集划分标签（T / V / E，见 set_image_split）
+        self._image_split = ""
         # 缩放 / 平移后刷新状态栏光标信息（其中含缩放比例）
         self.viewChanged.connect(self._emit_cursor_info)
 
@@ -159,6 +173,20 @@ class AnnotationCanvas(QGraphicsView):
             return
         self._image_class_name = name
         self._image_class_color = color
+        self.viewport().update()
+
+    def set_image_split(self, marker: str) -> None:
+        """图像右下角数据集划分标签（"" = 不显示）。
+
+        取值用子集标记 T / V / E（与缩略图右下角划分角标同一套标记与配色，
+        见 RULE §13）；未知标记按「未划分」处理、不显示。标签贴**图片区域**
+        右下角，大小不随缩放变化。
+        """
+        marker = str(marker or "").upper()
+        marker = marker if marker in _SPLIT_KEYS else ""
+        if marker == self._image_split:
+            return
+        self._image_split = marker
         self.viewport().update()
 
     def set_crosshair(self, enabled: bool, opacity: int | None = None) -> None:
@@ -196,17 +224,42 @@ class AnnotationCanvas(QGraphicsView):
         self._cancel_pending()
         self._moving = False
         self._band_selecting = False
-        if mode == MODE_BROWSE:
-            self.setCursor(Qt.CursorShape.ArrowCursor)
-        elif mode == MODE_MASK:
+        if mode == MODE_MASK:
             self._ensure_mask()
-            self.setCursor(Qt.CursorShape.CrossCursor)
-        else:
-            self.setCursor(Qt.CursorShape.CrossCursor)
+        self._apply_cursor()
 
     @property
     def mode(self) -> str:
         return self._mode
+
+    def set_pan_mode(self, enabled: bool) -> None:
+        """鼠标光标 ↔ 手掌光标：手掌模式下**左键拖动**平移图像。
+
+        与「滚轮按下」的中键拖动等价（中键在两种模式下都可用）；
+        切到手掌时取消半途的绘制（与切换绘制模式一致），切回后原绘制模式不变。
+        """
+        enabled = bool(enabled)
+        if enabled == self._pan_mode:
+            return
+        self._pan_mode = enabled
+        if enabled:
+            self._cancel_pending()
+            self._moving = False
+            self._band_selecting = False
+        self._apply_cursor()
+
+    @property
+    def pan_mode(self) -> bool:
+        return self._pan_mode
+
+    def _apply_cursor(self) -> None:
+        """按当前「手掌 / 绘制模式」设置光标形态。"""
+        if self._pan_mode:
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+        elif self._mode == MODE_BROWSE:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        else:
+            self.setCursor(Qt.CursorShape.CrossCursor)
 
     # -----------------------------------------------------------
     # 掩码（画笔 / 橡皮 / 生成轮廓）
@@ -418,7 +471,7 @@ class AnnotationCanvas(QGraphicsView):
         self._img_w = pixmap.width()
         self._img_h = pixmap.height()
         self._pixmap_item = self._scene.addPixmap(pixmap)
-        self._scene.setSceneRect(QRectF(pixmap.rect()))
+        self._relayout_scene_rect()      # 场景四周留出平移空白（可拖出窗口）
         self._auto_fit = True
         self._apply_adjust()
         self._fit()
@@ -722,17 +775,24 @@ class AnnotationCanvas(QGraphicsView):
         super().showEvent(event)
         if self._auto_fit:
             QTimer.singleShot(0, self._fit)
+        else:
+            self._relayout_scene_rect()   # 视口尺寸变化 → 平移空白随缩放重算
 
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         super().resizeEvent(event)
         if self._auto_fit:
             QTimer.singleShot(0, self._fit)
+        else:
+            self._relayout_scene_rect()
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         position = event.position().toPoint()
         scene_pos = self.mapToScene(position)
 
-        if event.button() == Qt.MouseButton.MiddleButton:
+        # 中键：任何模式下都能拖图；左键：仅手掌光标模式
+        if event.button() == Qt.MouseButton.MiddleButton or (
+            self._pan_mode and event.button() == Qt.MouseButton.LeftButton
+        ):
             self._panning = True
             self._auto_fit = False
             self._pan_start = position
@@ -839,12 +899,11 @@ class AnnotationCanvas(QGraphicsView):
             )
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802 - Qt 命名
-        if event.button() == Qt.MouseButton.MiddleButton:
+        if event.button() == Qt.MouseButton.MiddleButton or (
+            event.button() == Qt.MouseButton.LeftButton and self._panning
+        ):
             self._panning = False
-            self.setCursor(
-                Qt.CursorShape.CrossCursor
-                if self._mode != MODE_BROWSE else Qt.CursorShape.ArrowCursor
-            )
+            self._apply_cursor()
             return
 
         if event.button() == Qt.MouseButton.LeftButton:
@@ -899,7 +958,8 @@ class AnnotationCanvas(QGraphicsView):
         """
         self._auto_fit = False
         before = self.mapToScene(view_pos)
-        self.scale(factor, factor)
+        if not self._scale_by(factor):
+            return                        # 已到缩放下限（10%）
         scale = self.transform().m11() or 1.0
         offset = QPointF(view_pos - self.viewport().rect().center())
         self.centerOn(before - offset / scale)
@@ -943,6 +1003,7 @@ class AnnotationCanvas(QGraphicsView):
     def drawForeground(self, painter, rect) -> None:  # noqa: N802 - Qt 命名
         super().drawForeground(painter, rect)
         self._draw_image_class_tag(painter)
+        self._draw_image_split_tag(painter)
         if not self._img_w or self._cursor_scene is None:
             return
         if self._drawing and self._rubber is not None:
@@ -989,6 +1050,40 @@ class AnnotationCanvas(QGraphicsView):
             painter.drawRoundedRect(box, box.height() / 2.0, box.height() / 2.0)
             painter.setPen(QColor("#FFFFFF"))
             painter.drawText(box, Qt.AlignmentFlag.AlignCenter, self._image_class_name)
+        painter.restore()
+
+    def _draw_image_split_tag(self, painter) -> None:
+        """图像右下角的划分标签：字母方块（T / V / E，划分配色）+ 白字。
+
+        与图库 / 检查页缩略图右下角的划分角标同口径（RULE §13）：颜色取
+        `SPLIT_COLORS`、白色加粗字母；贴**图片区域**右下角，大小不随缩放变化。
+        """
+        key = _SPLIT_KEYS.get(self._image_split)
+        if not self._img_w or key is None:
+            return
+        anchor = self.mapFromScene(                        # 图片右下角 → 视口坐标
+            QPointF(float(self._img_w), float(self._img_h))
+        )
+        painter.save()
+        painter.resetTransform()                           # 切到视口坐标绘制
+        font = painter.font()
+        font.setPointSizeF(max(8.0, font.pointSizeF()))
+        font.setBold(True)
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        side = float(metrics.height()) + 8.0               # 方块边长随字体度量走
+        box = QRectF(
+            anchor.x() - _CLASS_TAG_MARGIN - side,
+            anchor.y() - _CLASS_TAG_MARGIN - side,
+            side,
+            side,
+        )
+        if QRectF(self.viewport().rect()).intersects(box):
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(SPLIT_COLORS.get(key, _SPLIT_TAG_FALLBACK)))
+            painter.drawRoundedRect(box, 4.0, 4.0)
+            painter.setPen(QColor("#FFFFFF"))
+            painter.drawText(box, Qt.AlignmentFlag.AlignCenter, self._image_split)
         painter.restore()
 
     @staticmethod
@@ -1081,6 +1176,7 @@ class AnnotationCanvas(QGraphicsView):
             return
         self._auto_fit = False
         self.resetTransform()
+        self._relayout_scene_rect()
         self.centerOn(self._pixmap_item)
         self.viewChanged.emit()
 
@@ -1140,12 +1236,61 @@ class AnnotationCanvas(QGraphicsView):
 
     def _zoom_by(self, factor: float) -> None:
         self._auto_fit = False
-        self.scale(factor, factor)
-        self.viewChanged.emit()
+        self._scale_by(factor)
 
     # -----------------------------------------------------------
     # 内部
     # -----------------------------------------------------------
+    def _min_scale(self) -> float:
+        """缩放下限：10%（`_MIN_ZOOM`）。
+
+        图像极大时「适应窗口」的比例可能小于 10%，此时以适配比例为准——
+        否则点完「适应窗口」后的第一次缩小会反而把画面放大，跳动难解释。
+        """
+        floor = _MIN_ZOOM
+        if self._img_w and self._img_h and self.viewport().width() > 1:
+            fit = min(
+                self.viewport().width() / self._img_w,
+                self.viewport().height() / self._img_h,
+            )
+            floor = min(floor, fit)
+        return floor
+
+    def _scale_by(self, factor: float) -> bool:
+        """按倍率缩放（受缩放下限约束），返回是否真的发生变化。"""
+        current = self.transform().m11() or 1.0
+        floor = self._min_scale()
+        if factor < 1.0 and current <= floor:
+            return False                  # 已在下限（含「适应窗口」小于 10% 的情形）
+        target = max(current * factor, floor)
+        if abs(target - current) < 1e-9:
+            return False
+        center = self.mapToScene(self.viewport().rect().center())
+        self.scale(target / current, target / current)
+        self._relayout_scene_rect()
+        self.centerOn(center)             # 平移空白重算后视口中心不动
+        self.viewChanged.emit()
+        return True
+
+    def _relayout_scene_rect(self) -> None:
+        """给场景四周留出可平移的空白（图片能拖到窗口任意位置）。
+
+        场景矩形只包住图片时，平移范围被卡在图片边界——角落的缺陷拖不到
+        窗口中间。这里按当前缩放向四周各留出**一个视口大小**的空白，
+        缩放 / 视口变化时重算，拖动即可越过图片边界。
+        """
+        if not self._img_w or not self._img_h:
+            return
+        scale = self.transform().m11() or 1.0
+        viewport = self.viewport().size()
+        margin_x = max(1.0, viewport.width() / scale)
+        margin_y = max(1.0, viewport.height() / scale)
+        self._scene.setSceneRect(
+            QRectF(0.0, 0.0, float(self._img_w), float(self._img_h)).adjusted(
+                -margin_x, -margin_y, margin_x, margin_y
+            )
+        )
+
     def _fit(self) -> None:
         """按当前视口尺寸适配图片。
 
@@ -1158,6 +1303,8 @@ class AnnotationCanvas(QGraphicsView):
         if self.viewport().width() <= 1 or self.viewport().height() <= 1:
             return
         self.fitInView(self._pixmap_item, Qt.AspectRatioMode.KeepAspectRatio)
+        self._relayout_scene_rect()
+        self.centerOn(QPointF(self._img_w / 2.0, self._img_h / 2.0))
         self.viewChanged.emit()
 
     def rotate_selected(self, delta_deg: float) -> bool:

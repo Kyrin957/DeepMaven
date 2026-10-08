@@ -49,7 +49,10 @@ _NAMES: dict[str, str] = {
     "actual-size": "mdi.numeric-1-box-outline",  # 原始大小（100%）
     "save-as": "mdi.content-save-outline",    # 另存为
     "reveal": "mdi.folder-open-outline",      # 打开所在位置
+    "import": "mdi.file-import-outline",      # 导入文件（自定义权重等）
     "locked": "mdi.lock",                     # 锁定（被训练引用的拆分等）
+    "cursor-mouse": "mdi.cursor-default-outline",  # 鼠标光标（选择 / 绘制）
+    "cursor-hand": "mdi.hand",                     # 手掌光标（左键拖动图像）
     "play": "mdi.play",                       # 开始 / 继续训练
     "pause": "mdi.pause",                     # 暂停训练
     "stop": "mdi.stop",                       # 停止训练
@@ -67,8 +70,17 @@ def icon(name: str, color: str | None = None) -> QIcon:
 
 
 def bind_icon(button, name: str) -> None:
-    """给按钮设置图标，并登记为「明暗主题切换时自动重绘」。"""
+    """给按钮设置图标，并登记为「明暗主题切换时自动重绘」。
+
+    同一个按钮重复登记时**更新语义名**（不再追加第二条记录）——供
+    「图标随状态切换」的按钮改绑（如手掌 / 鼠标光标开关）。
+    """
     button.setIcon(icon(name))
+    for index, (reference, _old) in enumerate(_bound):
+        if reference() is button:
+            _bound[index] = (reference, name)
+            _ensure_listener()
+            return
     _bound.append((weakref.ref(button), name))
     _ensure_listener()
 

@@ -1677,15 +1677,54 @@ class DatasetViewModel(QObject):
         )
 
     def set_split_for(self, images: list, split: str) -> None:
-        """把图片划入指定子集（train / val / test，"" = 不在任何一个拆分集里）。"""
-        overrides = self._params_dict("split_overrides", create=True)
-        marker = {"train": "T", "val": "V", "test": "E"}
-        keys = self._keys([Path(p) for p in images])
+        """把图片划入指定子集（train / val / test，"" = 不在任何一个拆分集里）。
+
+        **已在目标子集的图片不写覆盖**：写覆盖会把「按比例算出来的归属」变成
+        手工固定，剩余图片重新参与分配，于是「点图片当前所在的档位」反而把别的
+        图片挪走（历史缺陷：20 张按 0.7/0.2/0.1 划分成 14/4/2，对训练集图片再点
+        一次「训练」变成 14/3/3——验证集少一张、测试集多一张）。全部图片都已在
+        该档位时不做任何改动，也不产生未保存标记。
+        """
+        targets = [Path(p) for p in images]
+        keys = self._keys(targets)
         if not keys:
             return
-        for key in keys:
-            overrides[key] = marker.get(split, "")
-        self._commit_meta(f"已划入「{SPLIT_LABELS.get(split, '未划分')}」：{len(keys)} 张")
+        wanted = {"train": "T", "val": "V", "test": "E"}.get(split, "")
+        label = SPLIT_LABELS.get(split, "未划分")
+        current = self.subset_labels()
+        position = {str(path): index for index, path in enumerate(self.images())}
+        pending: list[str] = []
+        for key, image in zip(keys, targets):
+            index = position.get(str(image))
+            if index is not None and index < len(current) and current[index] == wanted:
+                continue                  # 已在该子集：保持算法分配的归属
+            pending.append(key)
+        if not pending:
+            self.message.emit("info", f"所选图像已在「{label}」")
+            return
+        overrides = self._params_dict("split_overrides", create=True)
+        for key in pending:
+            overrides[key] = wanted
+        self.invalidate_images()          # 覆盖值变了：清缓存后重算实际分布
+        self._sync_split_counts()
+        self._commit_meta(f"已划入「{label}」：{len(pending)} 张")
+
+    def _sync_split_counts(self) -> None:
+        """把手工改动后的**实际张数**写回当前拆分（列表 / 概览跟随更新）。
+
+        只同步「张数」这一份统计：拆分比例（`train / val / test`）仍是**划分
+        依据**、只在新建 / 编辑拆分时设定——跟随改动会导致下次复算的边界移动，
+        其余图片又被重排（正是「改一张、别人跟着换位」的来源）。
+        """
+        split = self.active_split()
+        if split is None:
+            return
+        summary = self.split_summary()
+        split.counts = {
+            "train": int(summary.get("T", 0)),
+            "val": int(summary.get("V", 0)),
+            "test": int(summary.get("E", 0)),
+        }
 
     def split_summary(self) -> dict[str, int]:
         """各子集的图片数，键为 T / V / E / ""（未划分）。"""

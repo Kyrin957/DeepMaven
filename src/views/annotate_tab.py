@@ -63,6 +63,7 @@ from src.views.ui import (
     bind_icon,
     icon,
     icon_button,
+    tool_separator,
 )
 from src.views.ui import tokens as T
 from src.views.widgets import (
@@ -419,8 +420,14 @@ class AnnotateTab(QWidget):
 
         row.addWidget(tools, 1)
 
-        # 右侧：显示缩放（放大 / 缩小 / 适应窗口 / 原始大小）
-        self.view_buttons: dict[str, object] = {}
+        # 右侧：平移光标切换 + 显示缩放（放大 / 缩小 / 适应窗口 / 原始大小）
+        # 手掌光标：左键拖动图像（中键在两种模式下都可拖）；图标随状态切换
+        self.pan_btn = icon_button(icon("cursor-mouse"), "切换手掌光标", bar)
+        self.pan_btn.setCheckable(True)
+        self.pan_btn.toggled.connect(self._on_pan_toggled)
+        self.view_buttons: dict[str, object] = {"pan": self.pan_btn}
+        row.addWidget(self.pan_btn)
+        row.addWidget(tool_separator(bar))
         for name, tip, slot in (
             ("zoom-out", "缩小", self.canvas.zoom_out),
             ("zoom-in", "放大", self.canvas.zoom_in),
@@ -433,6 +440,15 @@ class AnnotateTab(QWidget):
             row.addWidget(button)
             self.view_buttons[name] = button
         return bar
+
+    def _on_pan_toggled(self, checked: bool) -> None:
+        """手掌光标开关：开启后左键拖动图像（中键两种模式都可拖）。"""
+        checked = bool(checked)
+        self.canvas.set_pan_mode(checked)
+        bind_icon(self.pan_btn, "cursor-hand" if checked else "cursor-mouse")
+        self.pan_btn.setToolTip(
+            "切换鼠标光标（选择 / 绘制）" if checked else "切换手掌光标"
+        )
 
     def _build_canvas_card(self) -> CardWidget:
         card = CardWidget(self)
@@ -958,10 +974,15 @@ class AnnotateTab(QWidget):
         self.canvas.set_image_class(name or "无标签", color)
 
     def _refresh_side(self) -> None:
-        """刷新左侧「标签类别 / 拆分映射 / 图像标记」卡片状态。"""
+        """刷新左侧「标签类别 / 拆分映射 / 图像标记」卡片状态。
+
+        同时把当前图的划分同步给画布右下角的划分标签（与图库 / 检查页
+        缩略图的划分角标同口径）。
+        """
         vm = self._dataset_vm
         self._sync_image_class_tag()        # 画布左上角类别标签（整图任务）
         if vm is None or vm.dataset is None:
+            self.canvas.set_image_split("")
             return
         if self.class_card is not None and self._category_vm is not None:
             self.class_card.set_classes(
@@ -978,6 +999,7 @@ class AnnotateTab(QWidget):
         self.split_map_card.set_state(
             vm.split_name_label(), vm.split_summary(), current, vm.split_locked()
         )
+        self.canvas.set_image_split(current)   # 画布右下角划分标签
         counts: dict[str, int] = {}
         for values in vm.tag_map().values():
             for name in values:

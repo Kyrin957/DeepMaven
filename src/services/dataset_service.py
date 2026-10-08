@@ -487,8 +487,9 @@ class DatasetService:
                 训练集只放良好图。
             counts: 按类别指定的各子集数量（`Split.anomaly_counts`）。
             overrides: 手工拆分映射（``str(图片)`` → "T" / "V" / "E"）——
-                图库 / 标注页指定的图片**优先**进入对应子集、不再参与比例 /
-                分层分配（与 `subset_labels` 的「手工映射优先」口径一致）。
+                图库 / 标注页指定的图片在**算法归属之上搬图**：只把被指定的
+                图片挪到目标子集，其余图片原位不动（与 `subset_labels` 的
+                「手工映射优先」口径一致）。
         """
         import random
 
@@ -498,64 +499,77 @@ class DatasetService:
         if not items:
             return buckets
 
-        # 手工映射先落位；其余图片再按比例 / 分层分配
-        marker_to_sub = {"T": "train", "V": "val", "E": "test"}
-        if overrides:
-            rest: list[Path] = []
-            for item in items:
-                target = marker_to_sub.get(str(overrides.get(str(item), "")))
-                if target is None:
-                    rest.append(item)
-                else:
-                    buckets[target].append(item)
-            items = rest
-            if not items:
-                return buckets
-
+        # 1) 先按种类 / 比例 / 分层算出**全体图片**的算法归属
         if kinds:
-            # 异常检测按类别分配；结果与手工映射的固定成员合并
+            # 异常检测按类别分配
             allocated = DatasetService._allocate_by_kind(
                 items, kinds, counts or {}, split, seed
             )
             for sub in SPLIT_SUBDIRS:
                 buckets[sub].extend(allocated[sub])
-            return buckets
-
-        if not stratified:
+        elif not stratified:
             rng.shuffle(items)
             total = len(items)
             n_train = int(total * split[0])
             n_val = int(total * split[1])
-            # 追加到已有成员之后：手工映射的固定成员不能被覆盖（赋值会冲掉）
             buckets["train"].extend(items[:n_train])
             buckets["val"].extend(items[n_train:n_train + n_val])
             buckets["test"].extend(items[n_train + n_val:])
-            return buckets
+        else:
+            groups: dict[tuple, list[Path]] = {}
+            for image in items:
+                key = DatasetService._group_key(image, label_index, layout)
+                groups.setdefault(key, []).append(image)
 
-        groups: dict[tuple, list[Path]] = {}
-        for image in items:
-            key = DatasetService._group_key(image, label_index, layout)
-            groups.setdefault(key, []).append(image)
+            for key in sorted(groups, key=lambda k: sorted(k)):
+                members = sorted(groups[key])
+                rng.shuffle(members)
+                count = len(members)
+                if count >= 3:
+                    n_train = max(1, int(count * split[0]))
+                    n_val = max(1, int(count * split[1]))
+                    while n_train + n_val >= count:
+                        if n_val > 1:
+                            n_val -= 1
+                        elif n_train > 1:
+                            n_train -= 1
+                        else:
+                            break
+                else:
+                    n_train, n_val = count, 0
+                buckets["train"].extend(members[:n_train])
+                buckets["val"].extend(members[n_train:n_train + n_val])
+                buckets["test"].extend(members[n_train + n_val:])
 
-        for key in sorted(groups, key=lambda k: sorted(k)):
-            members = sorted(groups[key])
-            rng.shuffle(members)
-            count = len(members)
-            if count >= 3:
-                n_train = max(1, int(count * split[0]))
-                n_val = max(1, int(count * split[1]))
-                while n_train + n_val >= count:
-                    if n_val > 1:
-                        n_val -= 1
-                    elif n_train > 1:
-                        n_train -= 1
-                    else:
-                        break
-            else:
-                n_train, n_val = count, 0
-            buckets["train"].extend(members[:n_train])
-            buckets["val"].extend(members[n_train:n_train + n_val])
-            buckets["test"].extend(members[n_train + n_val:])
+        # 2) 手工映射在算法归属**之上搬图**：只把被指定的图片挪到目标子集，
+        #    其余图片原位不动。历史缺陷：把固定成员先从池子里摘掉再分配，
+        #    池子变小 → 边界移动 → 用户改一张图，别的图片跟着换位
+        #    （"验证集张数不变、训练集少一张、测试集多一张"，见开发文档 §4.66）。
+        if overrides:
+            marker_to_sub = {"T": "train", "V": "val", "E": "test"}
+            owner: dict[str, str] = {}
+            for sub in SPLIT_SUBDIRS:
+                for image in buckets[sub]:
+                    owner[str(image)] = sub
+            for image in [Path(p) for p in images]:
+                name = str(image)
+                if name not in overrides:
+                    continue                   # 没有手工映射：保持算法归属
+                marker = str(overrides[name] or "")
+                source = owner.get(name)
+                if source is None:
+                    continue
+                if not marker:
+                    # 显式「不在任何一个拆分集里」：移出全部子集（不进训练数据）
+                    buckets[source].remove(image)
+                    owner.pop(name, None)
+                    continue
+                target = marker_to_sub.get(marker)
+                if target is None or target == source:
+                    continue                   # 未知标记 / 本就在目标子集：不动
+                buckets[source].remove(image)
+                buckets[target].append(image)
+                owner[name] = target
         return buckets
 
     @staticmethod
@@ -623,6 +637,34 @@ class DatasetService:
         return buckets
 
     @staticmethod
+    def _clear_subsets(target: Path, layout: str) -> None:
+        """清掉上一次拆分产物的**子集目录**（重新执行拆分前调用）。
+
+        只动「这次会重新生成」的子集目录，不碰 data.yaml / 其它产物；来源
+        数据目录在项目外，绝不受影响（产物侧是硬链接副本，删除不伤原图）。
+        """
+        import shutil
+
+        if layout == "classify":
+            folders = [target / sub for sub in SPLIT_SUBDIRS]
+        elif layout == "anomaly_folder":
+            folders = [
+                target / ANOMALY_NORMAL_DIR,
+                target / f"{ANOMALY_NORMAL_DIR}_test",
+                target / ANOMALY_ABNORMAL_DIR,
+            ]
+        else:
+            folders = [target / "images" / sub for sub in SPLIT_SUBDIRS]
+            folders += [target / "labels" / sub for sub in SPLIT_SUBDIRS]
+            if layout == "mask":
+                folders += [target / "masks" / sub for sub in SPLIT_SUBDIRS]
+            elif layout == "ocr_det_rec":
+                folders.append(target / "ocr")
+        for folder in folders:
+            if folder.is_dir():
+                shutil.rmtree(folder, ignore_errors=True)
+
+    @staticmethod
     def split_dataset(
         source_dir: str | Path,
         target_dir: str | Path,
@@ -671,6 +713,11 @@ class DatasetService:
         if not images:
             logger.warning("无图片可划分: %s", source)
             return stats
+
+        # 重新执行拆分：先清掉上一次的子集目录，避免旧成员残留——用户手工改划
+        # 后再执行，产物必须与当前分配一致；残留会让训练读到「已经移走的图片」，
+        # 甚至同一张图同时出现在训练集与验证集（数据泄漏）。
+        DatasetService._clear_subsets(target, layout)
 
         if layout == "anomaly_folder":
             # 异常检测：产物即 Anomalib Folder 结构——

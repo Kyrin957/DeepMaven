@@ -79,7 +79,11 @@ class Navigator(QWidget):
                 target.top() + self._frame.top() * target.height(),
                 max(3.0, self._frame.width() * target.width()),
                 max(3.0, self._frame.height() * target.height()),
-            )
+            # 画布可自由平移（图片能拖出窗口）：视口框绘制时裁到缩略图内，
+            # 否则框会画到缩略图外的空白上
+            ).intersected(target)
+            if frame.isEmpty():
+                return
             painter.setPen(QPen(QColor(_COLOR_VIEW), 2))
             painter.setBrush(QColor(15, 108, 189, 60))
             painter.drawRect(frame)
