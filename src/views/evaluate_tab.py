@@ -35,6 +35,7 @@ from qfluentwidgets import (
     CardWidget,
     CheckBox,
     ComboBox,
+    FluentIcon,
     LineEdit,
     PrimaryPushButton,
     ProgressBar,
@@ -57,8 +58,9 @@ from src.utils.constants import PLOT_COLORS
 from src.utils.tasks import VIEW_ANOMALY, VIEW_DETECT, VIEW_SEGMENT
 from src.viewmodels.evaluate_vm import EvaluateViewModel
 from src.views.data_widgets import side_column
-from src.views.ui import FlowContainer, SafeSpinBox, ToolGroup
+from src.views.ui import FlowContainer, SafeSpinBox, ToolGroup, icon_button
 from src.views.ui import tokens as T
+from src.views.ui.icons import bind_icon, icon
 from src.views.widgets import (
     BarChart,
     ConfusionMatrixView,
@@ -124,66 +126,71 @@ class EvaluateTab(QWidget):
     def _build_side(self) -> QWidget:
         config_card, layout = self._card("评估配置")
 
-        row = QHBoxLayout()
-        self.weights_edit = LineEdit(config_card)
+        # 路径行：文本框撑满一行，选择文件走图标按钮（§10 简单动作不写文字）
+        weights_row = QWidget(config_card)
+        weights_box = QHBoxLayout(weights_row)
+        weights_box.setContentsMargins(0, 0, 0, 0)
+        weights_box.setSpacing(T.SPACE_SM)
+        self.weights_edit = LineEdit(weights_row)
         self.weights_edit.setPlaceholderText("模型权重 (.pt / .ckpt)")
-        row.addWidget(self.weights_edit, 1)
-        weights_btn = PushButton("浏览", config_card)
+        weights_box.addWidget(self.weights_edit, 1)
+        weights_btn = icon_button(FluentIcon.FOLDER, "选择模型权重文件", weights_row)
         weights_btn.clicked.connect(self._on_browse_weights)
-        row.addWidget(weights_btn)
-        layout.addLayout(row)
+        weights_box.addWidget(weights_btn)
+        layout.addWidget(weights_row)
 
         self.history_combo = ComboBox(config_card)
         self.history_combo.setPlaceholderText("最近训练")
         self.history_combo.currentIndexChanged.connect(self._on_pick_history)
         layout.addWidget(self.history_combo)
 
-        form = QFormLayout()
-        form.setSpacing(T.SPACE_MD)
+        # 参数区：容器化 + 可换行（§1）。**不能用 QFormLayout**——标签列会吃掉
+        # 侧栏宽度，字段被压到 26px、文字整段消失（历史故障 §4.71）
+        container = FlowContainer(config_card, spacing=T.SPACE_MD)
+        layout.addWidget(container)
+
         self.source_combo = ComboBox(config_card)
         self.source_combo.currentIndexChanged.connect(self._on_eval_source_picked)
-        form.addRow("数据拆分", self.source_combo)
+        container.add(ToolGroup(
+            CaptionLabel("数据拆分", config_card), self.source_combo, parent=config_card
+        ))
 
         # 评估图像集可多选（训练 / 验证 / 测试），对齐 DLT 的评估设置
-        subsets_row = QHBoxLayout()
-        subsets_row.setSpacing(T.SPACE_ML)
         self.subset_checks: dict[str, CheckBox] = {}
+        subsets_group = ToolGroup(
+            CaptionLabel("图像集", config_card), parent=config_card
+        )
         for key, text in (("train", "训练"), ("val", "验证"), ("test", "测试")):
             box = CheckBox(text, config_card)
             box.toggled.connect(self._on_subsets_changed)
-            subsets_row.addWidget(box)
+            subsets_group.add(box)
             self.subset_checks[key] = box
-        subsets_row.addStretch(1)
-        form.addRow("图像集", subsets_row)
+        container.add(subsets_group)
 
-        random_row = QHBoxLayout()
         self.random_check = CheckBox("随机抽样", config_card)
         self.random_check.setToolTip("达到图片上限时随机抽取（相同种子结果可复现）")
         self.random_check.toggled.connect(self._on_random_changed)
-        random_row.addWidget(self.random_check)
         self.seed_spin = SafeSpinBox(config_card)
         self.seed_spin.setRange(0, 999999)
         self.seed_spin.setToolTip("随机种子（相同种子结果可复现）")
         self.seed_spin.valueChanged.connect(self._on_seed_changed)
         self.seed_spin.setFixedWidth(
-            T.field_width(self.seed_spin, T.STEPPER_CHARS)
+            T.field_width(self.seed_spin, T.STEPPER_CHARS_NARROW)
         )
-        random_row.addWidget(self.seed_spin)
-        random_row.addStretch(1)
-        form.addRow("抽样", random_row)
-
-        folder_row = QHBoxLayout()
-        self.folder_edit = LineEdit(config_card)
-        self.folder_edit.setPlaceholderText("或指定目录")
-        folder_row.addWidget(self.folder_edit, 1)
-        folder_btn = PushButton("浏览", config_card)
-        folder_btn.clicked.connect(self._on_browse_folder)
-        folder_row.addWidget(folder_btn)
-        form.addRow("自定义", folder_row)
+        # 抽样 / 种子**分成两组**：并成一组宽 273px > 侧栏 238px，会被顶出卡片
+        # 右缘（§1：分组整体折行，单个分组比容器还宽时就溢出了）
+        container.add(ToolGroup(
+            CaptionLabel("抽样", config_card), self.random_check, parent=config_card
+        ))
+        container.add(ToolGroup(
+            CaptionLabel("种子", config_card), self.seed_spin, parent=config_card
+        ))
 
         self.device_combo = ComboBox(config_card)
         self.device_combo.addItems(["auto", "cpu", "cuda:0"])
-        form.addRow("设备", self.device_combo)
+        container.add(ToolGroup(
+            CaptionLabel("设备", config_card), self.device_combo, parent=config_card
+        ))
 
         self.limit_spin = SafeSpinBox(config_card)
         self.limit_spin.setRange(1, 5000)
@@ -192,13 +199,30 @@ class EvaluateTab(QWidget):
         self.limit_spin.setFixedWidth(
             T.field_width(self.limit_spin, T.STEPPER_CHARS_NARROW)
         )
-        form.addRow("图片上限", self.limit_spin)
+        container.add(ToolGroup(
+            CaptionLabel("图片上限", config_card), self.limit_spin, parent=config_card
+        ))
 
         self.anomaly_combo = ComboBox(config_card)
         for name in AnomalibService.available_models():
             self.anomaly_combo.addItem(name, userData=name)
-        form.addRow("异常模型", self.anomaly_combo)
-        layout.addLayout(form)
+        container.add(ToolGroup(
+            CaptionLabel("异常模型", config_card), self.anomaly_combo,
+            parent=config_card,
+        ))
+
+        folder_row = QWidget(config_card)
+        folder_box = QHBoxLayout(folder_row)
+        folder_box.setContentsMargins(0, 0, 0, 0)
+        folder_box.setSpacing(T.SPACE_SM)
+        folder_box.addWidget(CaptionLabel("自定义目录", folder_row))
+        self.folder_edit = LineEdit(folder_row)
+        self.folder_edit.setPlaceholderText("或指定目录")
+        folder_box.addWidget(self.folder_edit, 1)
+        folder_btn = icon_button(FluentIcon.FOLDER, "选择评估目录", folder_row)
+        folder_btn.clicked.connect(self._on_browse_folder)
+        folder_box.addWidget(folder_btn)
+        layout.addWidget(folder_row)
 
         self.conf_slider, self.conf_val = self._make_threshold(
             "置信度", 0.25, layout, config_card
@@ -207,21 +231,23 @@ class EvaluateTab(QWidget):
             "IOU", 0.45, layout, config_card
         )
 
-        buttons = QHBoxLayout()
+        # 操作行：容器化 + 可换行；停止 / 导出报告是「一看图标就懂」的动作（§10）
+        actions = FlowContainer(config_card, spacing=T.SPACE_SM)
+        layout.addWidget(actions)
         self.run_btn = PrimaryPushButton("开始评估", config_card)
-        self.stop_btn = PushButton("停止", config_card)
-        self.export_btn = PushButton("导出报告", config_card)
-        buttons.addWidget(self.run_btn)
-        buttons.addWidget(self.stop_btn)
-        buttons.addWidget(self.export_btn)
+        actions.add(self.run_btn)
+        self.stop_btn = icon_button(icon("stop"), "停止评估", config_card)
+        bind_icon(self.stop_btn, "stop")
+        actions.add(self.stop_btn)
+        self.export_btn = icon_button(icon("export"), "导出评估报告", config_card)
+        bind_icon(self.export_btn, "export")
+        actions.add(self.export_btn)
         self.ood_btn = PushButton("OOD 检测", config_card)
         self.ood_btn.setToolTip(
             "用已知样本拟合特征分布，判定新图是否为分布外样本（需分类模型）"
         )
         self.ood_btn.clicked.connect(self._on_ood)
-        buttons.addWidget(self.ood_btn)
-        buttons.addStretch(1)
-        layout.addLayout(buttons)
+        actions.add(self.ood_btn)
 
         self.progress_bar = ProgressBar(config_card)
         self.progress_bar.setRange(0, 100)
@@ -320,7 +346,8 @@ class EvaluateTab(QWidget):
         self.segment_card.setVisible(False)
 
         return side_column(
-            config_card, overview_card, self.anomaly_card, self.segment_card, width=310
+            config_card, overview_card, self.anomaly_card, self.segment_card,
+            width=T.SIDE_W_WIDE,
         )
 
     def _make_threshold(self, label, default, layout, parent):
@@ -594,7 +621,7 @@ class EvaluateTab(QWidget):
         self.weights_edit2 = LineEdit(card)
         self.weights_edit2.setPlaceholderText("模型权重 (.pt / .ckpt)")
         weights_row.addWidget(self.weights_edit2, 1)
-        weights_btn = PushButton("浏览", card)
+        weights_btn = icon_button(FluentIcon.FOLDER, "选择模型权重文件", card)
         weights_btn.clicked.connect(self._on_browse_weights2)
         weights_row.addWidget(weights_btn)
         form.addRow("模型权重", weights_row)
@@ -609,25 +636,26 @@ class EvaluateTab(QWidget):
         self.path_edit = LineEdit(card)
         self.path_edit.setPlaceholderText("图片 / 视频文件路径")
         path_row.addWidget(self.path_edit, 1)
-        self.path_btn = PushButton("浏览", card)
+        self.path_btn = icon_button(FluentIcon.FOLDER, "选择图片 / 视频文件", card)
         self.path_btn.clicked.connect(self._on_browse_source)
         path_row.addWidget(self.path_btn)
         form.addRow("输入路径", path_row)
         layout.addLayout(form)
 
-        row = QHBoxLayout()
+        # 操作行：容器化 + 可换行（§1）；进度条独占一行，不参与折行挤压
+        actions = FlowContainer(card, spacing=T.SPACE_SM)
+        layout.addWidget(actions)
         self.detect_btn = PrimaryPushButton("开始检测", card)
-        self.detect_stop_btn = PushButton("停止", card)
-        self.detect_export_btn = PushButton("导出报告", card)
-        row.addWidget(self.detect_btn)
-        row.addWidget(self.detect_stop_btn)
-        row.addWidget(self.detect_export_btn)
-        row.addStretch(1)
+        actions.add(self.detect_btn)
+        self.detect_stop_btn = icon_button(icon("stop"), "停止检测", card)
+        bind_icon(self.detect_stop_btn, "stop")
+        actions.add(self.detect_stop_btn)
+        self.detect_export_btn = icon_button(icon("export"), "导出检测报告", card)
+        bind_icon(self.detect_export_btn, "export")
+        actions.add(self.detect_export_btn)
         self.detect_progress = ProgressBar(card)
         self.detect_progress.setRange(0, 100)
-        self.detect_progress.setFixedWidth(T.CTRL_W_LG)
-        row.addWidget(self.detect_progress)
-        layout.addLayout(row)
+        layout.addWidget(self.detect_progress)
         return card
 
     def _build_result_card(self) -> CardWidget:
@@ -707,9 +735,46 @@ class EvaluateTab(QWidget):
                 if config.eval_sort in [key for key, _text in _SORTS] else 0
             ))
             self.sort_combo.blockSignals(False)
+            # 阈值滑杆与异常参数**必须从配置回填**：这些控件不回填时显示默认值
+            # （0.25 / 0.45），下次「开始评估 / 推理」会把保存的值静默改回默认
+            # （历史故障，见《开发文档.md》§4.70）
+            self._set_threshold(self.conf_slider, self.conf_val, config.confidence)
+            self._set_threshold(self.iou_slider, self.iou_val, config.iou)
+            model_index = self.anomaly_combo.findData(
+                str(config.anomaly_model or "")
+            )
+            if model_index >= 0:
+                self.anomaly_combo.setCurrentIndex(model_index)
+            self._fill_anomaly_widgets(
+                float(config.anomaly_threshold or 0.0),
+                float(config.anomaly_tolerance or 0.0),
+                int(config.anomaly_min_size or 0),
+            )
             self._reload_history(config.weights_path)
         finally:
             self._syncing = False
+
+    @staticmethod
+    def _set_threshold(slider, label, value) -> None:
+        """把 0~1 的阈值写进滑杆与读数（调用方已置 ``_syncing``，不回写配置）。"""
+        raw = max(0, min(100, int(round(float(value or 0.0) * 100))))
+        slider.setValue(raw)
+        label.setText(f"{raw / 100.0:.2f}")
+
+    def _fill_anomaly_widgets(
+        self, threshold: float, tolerance: float, min_size: int
+    ) -> None:
+        """异常后处理控件回填：分类阈值 / 分数容忍度 / 最小缺陷尺寸 + 读数。
+
+        调用方负责 ``_syncing`` 守卫（滑块信号在同步期间不写回配置）。
+        """
+        threshold = max(0.0, min(1.0, float(threshold or 0.0)))
+        tolerance = max(0.0, min(0.5, float(tolerance or 0.0)))
+        self.anomaly_slider.setValue(int(round(threshold * 100)))
+        self.tolerance_slider.setValue(int(round(tolerance * 100)))
+        self.min_size_spin.setValue(max(0, int(min_size or 0)))
+        self.anomaly_value.setText(f"{threshold:.3f}")
+        self.tolerance_value.setText(f"{int(round(tolerance * 100))}%")
 
     def refresh_splits(self) -> None:
         """拆分列表变化后重取「数据拆分」下拉（主窗口在 splitsChanged 时调用）。
@@ -839,20 +904,34 @@ class EvaluateTab(QWidget):
         self._vm.set_eval_seed(int(value))
 
     def _on_params_changed(self, *_args) -> None:
+        """设备 / 图片上限变化。
+
+        **先把控件值读进局部变量，再写配置**：每次 `_emit` 都会同步触发
+        `_on_config` 把配置回填到控件，边写边读会让后写的那个控件被回填成
+        配置里的旧值（图片上限因此根本改不动，见《开发文档.md》§4.70）。
+        """
         if self._syncing:
             return
-        self._vm.set_device(self.device_combo.currentText())
-        self._vm.set_max_images(self.limit_spin.value())
+        device = self.device_combo.currentText()
+        limit = self.limit_spin.value()
+        self._vm.set_device(device)
+        self._vm.set_max_images(limit)
 
     def _on_run(self) -> None:
-        self._vm.set_weights(self.weights_edit.text().strip())
-        self._vm.set_device(self.device_combo.currentText())
-        self._vm.set_max_images(self.limit_spin.value())
-        self._vm.set_eval_folder(self.folder_edit.text().strip())
-        self._vm.set_thresholds(
-            self.conf_slider.value() / 100.0, self.iou_slider.value() / 100.0
-        )
-        self._vm.set_anomaly_model(self.anomaly_combo.currentData())
+        # 同上：先把控件值全部读出，再逐项写配置（写配置会回填控件）
+        weights = self.weights_edit.text().strip()
+        device = self.device_combo.currentText()
+        limit = self.limit_spin.value()
+        folder = self.folder_edit.text().strip()
+        confidence = self.conf_slider.value() / 100.0
+        iou = self.iou_slider.value() / 100.0
+        anomaly_model = self.anomaly_combo.currentData()
+        self._vm.set_weights(weights)
+        self._vm.set_device(device)
+        self._vm.set_max_images(limit)
+        self._vm.set_eval_folder(folder)
+        self._vm.set_thresholds(confidence, iou)
+        self._vm.set_anomaly_model(anomaly_model)
         self._vm.run_evaluation()
 
     def _on_ood(self) -> None:
@@ -900,14 +979,20 @@ class EvaluateTab(QWidget):
             self.path_edit.setPlaceholderText("图片 / 视频文件路径")
 
     def _on_detect(self) -> None:
-        self._vm.set_weights(self.weights_edit2.text().strip())
-        self._vm.set_source(self.source_combo2.currentData())
-        self._vm.set_source_path(self.path_edit.text().strip())
-        self._vm.set_device(self.device_combo.currentText())
-        self._vm.set_anomaly_model(self.anomaly_combo.currentData())
-        self._vm.set_thresholds(
-            self.conf_slider.value() / 100.0, self.iou_slider.value() / 100.0
-        )
+        # 同 `_on_run`：先把控件值全部读出，再逐项写配置（写配置会回填控件）
+        weights = self.weights_edit2.text().strip()
+        source = self.source_combo2.currentData()
+        source_path = self.path_edit.text().strip()
+        device = self.device_combo.currentText()
+        anomaly_model = self.anomaly_combo.currentData()
+        confidence = self.conf_slider.value() / 100.0
+        iou = self.iou_slider.value() / 100.0
+        self._vm.set_weights(weights)
+        self._vm.set_source(source)
+        self._vm.set_source_path(source_path)
+        self._vm.set_device(device)
+        self._vm.set_anomaly_model(anomaly_model)
+        self._vm.set_thresholds(confidence, iou)
         self._vm.run_detection()
 
     def _on_export_demo(self) -> None:
@@ -1018,13 +1103,11 @@ class EvaluateTab(QWidget):
         tolerance = self._vm.anomaly_tolerance()
         self._syncing = True
         try:
-            self.anomaly_slider.setValue(int(round(threshold * 100)))
-            self.tolerance_slider.setValue(int(round(tolerance * 100)))
-            self.min_size_spin.setValue(int(self._vm.anomaly_min_size()))
+            self._fill_anomaly_widgets(
+                threshold, tolerance, self._vm.anomaly_min_size()
+            )
         finally:
             self._syncing = False
-        self.anomaly_value.setText(f"{threshold:.3f}")
-        self.tolerance_value.setText(f"{int(round(tolerance * 100))}%")
         self.hist_view.set_data(
             self._vm.anomaly_scores(), threshold,
             self._vm.anomaly_median(), self._vm.anomaly_best_threshold(),

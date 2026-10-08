@@ -320,6 +320,16 @@ class ProjectTab(QWidget):
         self._unsaved_check = check
         self._unsaved_confirm = confirm
 
+    def _edits_pending(self, project=None) -> bool:
+        """输入框里的名称 / 说明是否与项目对象不一致（不判断展示的是哪个项目）。"""
+        target = self._vm.project if project is None else project
+        if target is None:
+            return False
+        name = self.name_edit.text().strip()
+        if name and name != target.name:
+            return True
+        return self.desc_edit.toPlainText() != (target.description or "")
+
     def has_pending_edits(self) -> bool:
         """名称 / 说明输入框是否有尚未写回项目的编辑。
 
@@ -327,13 +337,9 @@ class ProjectTab(QWidget):
         ``project.dirty`` 上——关闭 / 切换项目的守卫必须单独检查，
         否则会静默丢失。
         """
-        project = self._vm.project
-        if project is None or self._shown_path != self._vm.current_path:
+        if self._vm.project is None or self._shown_path != self._vm.current_path:
             return False
-        name = self.name_edit.text().strip()
-        if name and name != project.name:
-            return True
-        return self.desc_edit.toPlainText() != (project.description or "")
+        return self._edits_pending()
 
     def commit_edits(self) -> None:
         """把名称 / 说明输入框的内容写回项目对象（未保存检查 / 保存前调用）。"""
@@ -565,6 +571,7 @@ class ProjectTab(QWidget):
             card.set_selected(card.path == current)
 
     def _show_project(self, project, current: bool) -> None:
+        previous_path = self._shown_path
         self._shown_path = (
             str(project.params.get("path", "") or "") if project is not None else ""
         )
@@ -584,8 +591,13 @@ class ProjectTab(QWidget):
 
         item = project_type(project.model_type)
         self.info_title.setText("当前项目" if current else "选中的项目（未打开）")
-        self.name_edit.setText(project.name)
-        self.desc_edit.setPlainText(project.description or "")
+        # 名称 / 说明：**刷新同一个项目时不覆盖未提交的编辑**——新增类别、
+        # 新建拆分等都会触发项目变化信号重走这里，无脑 setText 会把用户刚
+        # 输入的内容抹掉（保存后名称没改，见《开发文档.md》§4.70）
+        same_project = previous_path == self._shown_path
+        if not same_project or not self._edits_pending(project):
+            self.name_edit.setText(project.name)
+            self.desc_edit.setPlainText(project.description or "")
         self._values["type"].setText(
             f"{item['label']}（{item['short']}）"
             + ("" if item["supported"] else " · 规划中")

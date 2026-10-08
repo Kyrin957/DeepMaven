@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, QSize, Qt, QUrl, Signal
+from PySide6.QtCore import QEvent, QPoint, QSize, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -118,6 +118,19 @@ _AUG_PARAMS = [
 
 _LOSS_COLORS = {"训练损失": "#0F6CBD", "验证损失": "#0F7B0F"}
 _METRIC_COLORS = ("#0F6CBD", "#0F7B0F", "#C42B1C", "#B16CEA", "#E8A33D")
+
+# 预训练模型下拉里「导入的权重文件」项的标记：userData = (_CUSTOM_TAG, 路径)，
+# 与官方变体项（userData = 变体 key，字符串）区分开——一个下拉两个来源。
+_CUSTOM_TAG = "custom"
+# qf 下拉的箭头与左右内边距（按控件实现预留，量测文本宽度时扣除）
+_COMBO_TEXT_CHROME = 34
+
+
+def _custom_path(data) -> str:
+    """下拉项的 userData 是否为导入权重项；是则返回路径，否则空串。"""
+    if isinstance(data, tuple) and len(data) == 2 and data[0] == _CUSTOM_TAG:
+        return str(data[1])
+    return ""
 
 
 def _duration(seconds: float) -> str:
@@ -696,66 +709,40 @@ class TrainTab(QWidget):
         return card
 
     def _build_model_card(self) -> CardWidget:
-        """模型与权重：**二选一**的权重来源（预训练变体 / 自定义权重文件）。
+        """模型与权重：**一个下拉**里二选一（官方预训练变体 / 导入的权重文件）。
 
-        训练时两者等价：`--weights = weights_path or f"{model_key}.pt"`——
-        选了自定义权重，变体就不再参与训练（只作为展示与兜底名）。因此界面
-        用分段开关二选一，避免「下拉也选了、权重也导了，到底用哪个」的歧义。
-        其它任务（U-Net / 异常检测 / OCR）训练不用自定义权重，只显示变体。
+        训练时两者等价：`--weights = weights_path or f"{model_key}.pt"`——导入
+        的权重覆盖变体，变体此时只作为展示与兜底名。参照 Halcon DLT：预训练模型
+        下拉右侧一个导入按钮，导入的文件作为下拉里的**一项**（显示文件名）加入，
+        选中即生效。一个控件一个来源，不会有「下拉也选了、权重也导了，用哪个」
+        的歧义，也不需要额外的分段开关。
+        其它任务（U-Net / 异常检测 / OCR）训练不用自定义权重，只显示变体、
+        不显示导入按钮。
         """
         card, layout = self._card("模型与权重")
 
-        # 来源切换：未导入过权重时点「自定义权重」直接弹导入对话框
-        self.source_seg = SegmentedWidget(card)
-        self.source_seg.addItem("pretrained", "预训练模型")
-        self.source_seg.addItem("custom", "自定义权重")
-        self.source_seg.setCurrentItem("pretrained")
-        self.source_seg.currentItemChanged.connect(self._on_source_changed)
-        layout.addWidget(self.source_seg)
-
-        # —— 来源 1：预训练变体 ——
-        self.variant_holder = QWidget(card)
-        variant_box = QVBoxLayout(self.variant_holder)
-        variant_box.setContentsMargins(0, 0, 0, 0)
-        variant_box.setSpacing(T.SPACE_SM)
-        variant_row = QHBoxLayout()
-        variant_row.setContentsMargins(0, 0, 0, 0)
-        variant_row.setSpacing(T.SPACE_SM)
-        variant_row.addWidget(CaptionLabel("模型", self.variant_holder))
-        self.variant_combo = ComboBox(self.variant_holder)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(T.SPACE_SM)
+        row.addWidget(CaptionLabel("预训练模型", card))
+        self.variant_combo = ComboBox(card)
         # 显示名带任务后缀（分类的 yolo11n-cls → YOLO11n-cls），避免与
         # 检测变体混淆；下拉宽度按内容收紧，不占满整行
         task = str(self._vm.config.task_type or "detect")
         for candidate in backend_for_task(task).candidates(task):
             self.variant_combo.addItem(candidate["label"], userData=candidate["key"])
         self.variant_combo.setMinimumWidth(170)
-        variant_row.addWidget(self.variant_combo)
-        variant_row.addStretch(1)
-        variant_box.addLayout(variant_row)
-        self.variant_desc = CaptionLabel("", self.variant_holder)
-        variant_box.addWidget(self.variant_desc)
-        layout.addWidget(self.variant_holder)
-
-        # —— 来源 2：自定义权重（导入按钮 + 文件名）——
-        self.weights_holder = QWidget(card)
-        weights_box = QVBoxLayout(self.weights_holder)
-        weights_box.setContentsMargins(0, 0, 0, 0)
-        weights_box.setSpacing(T.SPACE_SM)
-        weights_row = QHBoxLayout()
-        weights_row.setContentsMargins(0, 0, 0, 0)
-        weights_row.setSpacing(T.SPACE_SM)
-        self.import_btn = icon_button(
-            icon("import"), "导入权重文件", self.weights_holder
-        )
+        row.addWidget(self.variant_combo, 1)
+        self.variant_combo.installEventFilter(self)
+        # 导入自定义权重：作为下拉里的一项加入（Halcon DLT 的预训练模型行）
+        self.import_btn = icon_button(icon("import"), "导入权重文件", card)
         self.import_btn.clicked.connect(self._on_import_weights)
-        weights_row.addWidget(self.import_btn)
-        self.weights_name = CaptionLabel("未选择权重文件", self.weights_holder)
-        self.weights_name.setWordWrap(True)
-        weights_row.addWidget(self.weights_name, 1)
-        weights_box.addLayout(weights_row)
-        layout.addWidget(self.weights_holder)
+        row.addWidget(self.import_btn)
+        layout.addLayout(row)
 
-        # 权重信息 / 任务状态（导入探测结果；常显，不随来源切换隐藏）
+        self.variant_desc = CaptionLabel("", card)
+        layout.addWidget(self.variant_desc)
+        # 权重信息 / 任务状态（导入探测结果）
         self.model_info = CaptionLabel("", card)
         self.model_info.setWordWrap(True)
         layout.addWidget(self.model_info)
@@ -763,7 +750,7 @@ class TrainTab(QWidget):
         return card
 
     # -----------------------------------------------------------
-    # 权重来源（预训练变体 ↔ 自定义权重）
+    # 权重来源（下拉内二选一：官方变体 ↔ 导入的权重文件）
     # -----------------------------------------------------------
     def _supports_custom_weights(self, task: str = "") -> bool:
         """训练是否用得上自定义权重：YOLO 系 `weights_path` 覆盖预训练权重。
@@ -775,12 +762,82 @@ class TrainTab(QWidget):
         return backend_for_task(task).key == "yolo"
 
     def _current_weights(self) -> str:
-        """当前生效的自定义权重路径（预训练模式 / 不支持的任务为空串）。"""
-        custom = (
-            self._supports_custom_weights()
-            and self.source_seg.currentRouteKey() == "custom"
-        )
-        return str(self._custom_weights or "") if custom else ""
+        """当前生效的自定义权重路径（下拉选中导入项 / 不支持的任务为空串）。"""
+        if not self._supports_custom_weights():
+            return ""
+        return self._selected_custom()
+
+    def _current_model_key(self) -> str:
+        """下拉选中的官方变体 key；选中导入的权重时沿用配置里的兜底名。"""
+        if self._selected_custom():
+            return str(self._vm.config.model_key or "")
+        return str(self.variant_combo.currentData() or "")
+
+    def _selected_custom(self) -> str:
+        """下拉当前项是否为导入的权重（是则返回路径，否则空串）。"""
+        return _custom_path(self.variant_combo.currentData())
+
+    def _custom_index(self, path: str) -> int:
+        """下拉里导入权重项的下标（按路径匹配，官方变体项跳过）。"""
+        if not path:
+            return -1
+        for i in range(self.variant_combo.count()):
+            if _custom_path(self.variant_combo.itemData(i)) == path:
+                return i
+        return -1
+
+    def _ensure_custom_item(self, path: str) -> int:
+        """把导入的权重作为下拉里的一项加入（同名更新，不重复添加）。"""
+        name = Path(path).name or path
+        index = self._custom_index(path)
+        if index < 0:
+            self.variant_combo.addItem(name, userData=(_CUSTOM_TAG, path))
+            index = self.variant_combo.count() - 1
+        self._elide_weights_items()
+        return index
+
+    def _drop_stale_custom_items(self, keep: str) -> None:
+        """移除与配置不符的导入权重项（同一次会话里换项目 / 换模型时不留残余）。
+
+        清理后残留项不会「另一项目的权重还能在下拉里选到」，也不会被误当
+        当前来源（下拉当前项若不是官方变体，``_selected_custom`` 才会命中）。
+        """
+        for i in reversed(range(self.variant_combo.count())):
+            path = _custom_path(self.variant_combo.itemData(i))
+            if path and path != keep:
+                self.variant_combo.removeItem(i)
+
+    def _elide_weights_items(self) -> None:
+        """导入项文字按**实际可见宽度**中间省略（超长文件名不被裁切）。
+
+        qf 的 ``ComboBox`` 继承 ``QPushButton``，``sizeHint`` 随当前项文字增长
+        ——权重文件名很长时会把整行挤窄、文字被裁掉（§8.5 文字不得被截断）。
+        与缩略图角标同一口径：**装得下就原样显示**，省略后完整文件名走下拉
+        tooltip（``_update_source_ui``）。
+        """
+        combo = self.variant_combo
+        budget = combo.width() - _COMBO_TEXT_CHROME
+        if budget <= 0 or getattr(self, "_eliding", False):
+            return
+        self._eliding = True
+        try:
+            metrics = combo.fontMetrics()
+            for i in range(combo.count()):
+                path = _custom_path(combo.itemData(i))
+                if not path:
+                    continue
+                name = Path(path).name or path
+                combo.setItemText(i, metrics.elidedText(
+                    name, Qt.TextElideMode.ElideMiddle, budget
+                ))
+        finally:
+            self._eliding = False
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802 - Qt 命名
+        # 下拉宽度变化后重算导入项的省略文字（超长文件名不随窗口变窄被裁切）
+        if obj is self.variant_combo and event.type() == QEvent.Resize:
+            self._elide_weights_items()
+        return super().eventFilter(obj, event)
 
     def _pick_weights_file(self) -> str:
         """弹窗选择权重文件（取消返回空串）。"""
@@ -789,47 +846,27 @@ class TrainTab(QWidget):
         )
         return str(path or "")
 
-    def _on_source_changed(self, key: str) -> None:
-        """来源切换：自定义权重 → 导入对话框（取消则退回预训练）。"""
-        if self._syncing:
-            return
-        if key != "custom":
-            # 预训练：自定义权重退出（配置清空，变体生效）
-            self._apply({"weights_path": ""})
-            self._update_source_ui("")
-            return
-        path = str(self._custom_weights or "")
-        if not path or not Path(path).is_file():
-            path = self._pick_weights_file()
-        if not path:
-            # 取消导入：回到预训练模式，不留「自定义但没文件」的半选状态
-            self._syncing = True
-            try:
-                self.source_seg.setCurrentItem("pretrained")
-            finally:
-                self._syncing = False
-            self._update_source_ui("")
-            return
-        self._apply_weights(path)
-
     def _apply_weights(self, path: str) -> None:
-        """把自定义权重写入配置并探测模型信息（界面同步显示文件名）。"""
+        """把导入的权重写入配置并探测模型信息（下拉里选中对应项）。"""
         self._custom_weights = str(path)
+        index = self._ensure_custom_item(self._custom_weights)
+        if self.variant_combo.currentIndex() != index:
+            # 尚未选中：由变体切换路径统一处理，避免重复导入探测
+            self.variant_combo.setCurrentIndex(index)
+            return
         self._apply({"weights_path": self._custom_weights})
         if self._model_vm is not None:
             self._model_vm.import_weights(self._custom_weights)
         self._update_source_ui(self._custom_weights)
 
     def _update_source_ui(self, weights: str) -> None:
-        """按当前来源切换两个模式区的显隐与文件信息（不回写配置）。"""
+        """按当前下拉选择刷新说明文字与导入按钮显隐（不回写配置）。"""
         support = self._supports_custom_weights()
         custom = bool(weights) and support
-        self.source_seg.setVisible(support)
-        self.variant_holder.setVisible(not custom)
-        self.weights_holder.setVisible(custom)
-        name = Path(weights).name if weights else ""
-        self.weights_name.setText(name or "未选择权重文件")
-        self.weights_name.setToolTip(str(weights) or "点击左侧按钮导入权重文件")
+        self.import_btn.setVisible(support)
+        # 选中导入项时下拉项文字就是文件名，变体描述不再适用
+        self.variant_desc.setVisible(not custom)
+        self.variant_combo.setToolTip(str(weights) if custom else "")
         if not custom:
             self.model_info.setText("")
 
@@ -1246,7 +1283,7 @@ class TrainTab(QWidget):
             )
 
     def _on_import_weights(self) -> None:
-        """自定义权重区：重新选择权重文件（取消则保持原文件）。"""
+        """导入按钮：选权重文件并作为下拉里的一项加入（取消则不变）。"""
         path = self._pick_weights_file()
         if path:
             self._apply_weights(path)
@@ -1260,17 +1297,28 @@ class TrainTab(QWidget):
     def _on_variant_changed(self, _index: int) -> None:
         if self._syncing:
             return
+        custom = self._selected_custom()
+        if custom:
+            # 选中导入的权重：变体不参与训练（只作为兜底名），只写权重路径
+            self._apply_weights(custom)
+            return
         key = str(self.variant_combo.currentData() or "")
         if not key:
             return
         if self._model_vm is not None:
             self._model_vm.select_variant(key)
         self._update_variant_desc(key)
-        # 变体只影响预训练权重来源：自定义权重模式下它是被忽略的兜底名
-        self._apply({"model_key": key})
+        # 选中官方变体 → 导入的权重退出（配置清空，变体生效）
+        self._apply({"model_key": key, "weights_path": ""})
 
     def _update_variant_desc(self, key: str) -> None:
-        """显示变体描述（key 可能带任务后缀，如分类的 yolo11n-cls）。"""
+        """显示变体描述（key 可能带任务后缀，如分类的 yolo11n-cls）。
+
+        下拉选中导入的权重时，下拉项文字就是文件名，不显示变体描述。
+        """
+        if self._selected_custom():
+            self.variant_desc.setText("")
+            return
         base = base_variant_key(key)
         variant = next((v for v in YOLO_MODEL_VARIANTS if v["key"] == base), None)
         self.variant_desc.setText(
@@ -1285,6 +1333,8 @@ class TrainTab(QWidget):
             return index
         base = base_variant_key(text)
         for i in range(self.variant_combo.count()):
+            if _custom_path(self.variant_combo.itemData(i)):
+                continue                    # 导入权重项不参与变体匹配
             if base_variant_key(str(self.variant_combo.itemData(i) or "")) == base:
                 return i
         return -1
@@ -1319,7 +1369,7 @@ class TrainTab(QWidget):
     def _collect(self) -> dict:
         """把界面上的全部参数收集为配置字典。"""
         values: dict = {
-            "model_key": str(self.variant_combo.currentData() or ""),
+            "model_key": self._current_model_key(),
             "weights_path": self._current_weights(),
             "optimizer": self.opt_combo.currentText(),
             "device": str(self.device_combo.currentData() or "auto"),
@@ -1349,11 +1399,16 @@ class TrainTab(QWidget):
         self._refresh()
 
     def sync_from_config(self) -> None:
-        """项目类型 / 配置变化后刷新界面（main_window 打开项目时调用）。"""
-        self._sync_widgets(self._vm.config)
+        """项目类型 / 配置变化后刷新界面（main_window 打开项目时调用）。
+
+        这里按配置**清掉与项目不符的导入权重项**：同一次会话里换项目时，上一
+        项目导入的文件不应残留在下拉里（会被误当当前来源）。同一项目内的参数
+        改动不走这里，导入过的项保留在列表中（改回官方变体后仍可选回）。
+        """
+        self._sync_widgets(self._vm.config, drop_stale=True)
         self._refresh()
 
-    def _sync_widgets(self, config) -> None:
+    def _sync_widgets(self, config, drop_stale: bool = False) -> None:
         self._syncing = True
         try:
             for key, spin in self._int_spins.items():
@@ -1380,19 +1435,20 @@ class TrainTab(QWidget):
             # 任务类型由项目类型决定：只切模型列表，不让用户改
             task = str(getattr(config, "task_type", "detect"))
             self._reload_variants(task)
-            key_index = self._variant_index(str(getattr(config, "model_key", "")))
-            if key_index >= 0:
-                self.variant_combo.setCurrentIndex(key_index)
-            self._update_variant_desc(str(getattr(config, "model_key", "")))
-            # 权重来源：有自定义权重 → 自定义模式（记住路径便于切回），
-            # 否则预训练模式（变体生效）
+            # 权重来源：配置里带导入权重 → 下拉选中该文件项，否则选中官方变体
             weights = str(getattr(config, "weights_path", ""))
-            if weights:
-                self._custom_weights = weights
             support = self._supports_custom_weights(task)
-            self.source_seg.setCurrentItem(
-                "custom" if (weights and support) else "pretrained"
-            )
+            keep = weights if support else ""
+            if drop_stale:
+                self._drop_stale_custom_items(keep)
+            if keep:
+                self._custom_weights = keep
+                index = self._ensure_custom_item(keep)
+            else:
+                index = self._variant_index(str(getattr(config, "model_key", "")))
+            if index >= 0:
+                self.variant_combo.setCurrentIndex(index)
+            self._update_variant_desc(self._current_model_key())
             self._update_source_ui(weights if support else "")
             self.anomaly_edit.setText(str(getattr(config, "anomaly_root", "")))
             self.anomaly_check.setChecked(
@@ -1407,7 +1463,7 @@ class TrainTab(QWidget):
         signature = str(task)
         if getattr(self, "_variant_task", "") == signature:
             return
-        previous = str(self.variant_combo.currentData() or "")
+        previous = self._current_model_key()
         self.variant_combo.clear()
         for candidate in backend_for_task(task).candidates(task):
             self.variant_combo.addItem(candidate["label"], userData=candidate["key"])
@@ -1418,7 +1474,7 @@ class TrainTab(QWidget):
     def _refresh(self) -> None:
         """刷新变体描述、数据集拆分图、模型卡片与训练记录。"""
         config = self._vm.config
-        if not self.variant_desc.text():
+        if not self.variant_desc.text() and not self._selected_custom():
             base = base_variant_key(str(config.model_key or ""))
             variant = next(
                 (v for v in YOLO_MODEL_VARIANTS if v["key"] == base), None

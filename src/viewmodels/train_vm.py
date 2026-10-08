@@ -130,23 +130,32 @@ class TrainViewModel(QObject):
         """打开 / 新建项目后把配置绑定到项目：后续修改直接进入项目并随保存落盘。
 
         项目类型会决定训练任务（分类 / 检测 / 旋转框 / 分割 / 异常检测）。
+
+        **活动模型的参数以活配置为准**：`project.training` 就是活动模型上一次
+        保存时的完整状态（切模型 / 开始训练前先 `_store_active`），而模型快照
+        只在「切模型 / 开始训练」时回写——改完参数直接保存的项目里，快照落后
+        于活配置。因此**不得**再用快照覆盖活配置，否则「导入权重 / 改超参后
+        保存，重开被抹回默认值」（历史故障，见《开发文档.md》§4.69）。
+        这里反向对齐：把活配置写回活动模型快照，两者立即一致。
         """
         self._config = project.training if project is not None else TrainingConfig()
         if project is not None:
+            # 任务类型由项目类型决定（模型快照里的旧值不得覆盖它——否则分类
+            # 项目里下拉会变回检测模型列表，历史故障）
             task = task_of(project.model_type)
             self._config.task_type = task
             # 模型 key 与任务后缀对齐（分类 → yolo11n-cls；检测无后缀）：
-            # 旧项目可能存着基础名，卡片与下拉显示不精确（历史故障）
+            # 旧项目可能存着基础名，卡片与下拉显示不精确（历史故障）。
+            # 快照（含非活动模型）与活配置都要对齐——活配置是活动模型的来源。
             self._normalize_project_model_keys(project, task)
-            # 训练模型：迁移旧数据（训练设置 / 单配置），把活动模型的参数
-            # 载入当前配置、产物目录指向其 model/<模型名>/（互不干扰）
+            self._config.model_key = normalize_model_key(
+                self._config.model_key, task
+            )
+            # 训练模型：迁移旧数据（训练设置 / 单配置），产物目录指向活动模型的
+            # model/<模型名>/（互不干扰）；活配置随即回写其快照
             active = self.active_model()
-            for key, value in self._model_payload(active).items():
-                setattr(self._config, key, value)
-            # 任务类型由项目决定：模型快照里的旧值（如创建于检测项目）不得
-            # 覆盖它——否则分类项目里下拉会变回检测模型列表（历史故障）
-            self._config.task_type = task
             if active:
+                self._store_active()
                 self._apply_model_dir(active)
         self.configChanged.emit(self._config)
         self.statusChanged.emit(self._config.status)

@@ -50,6 +50,7 @@ _NAMES: dict[str, str] = {
     "save-as": "mdi.content-save-outline",    # 另存为
     "reveal": "mdi.folder-open-outline",      # 打开所在位置
     "import": "mdi.file-import-outline",      # 导入文件（自定义权重等）
+    "export": "mdi.file-export-outline",      # 导出文件（评估报告 / 模型）
     "locked": "mdi.lock",                     # 锁定（被训练引用的拆分等）
     "cursor-mouse": "mdi.cursor-default-outline",  # 鼠标光标（选择 / 绘制）
     "cursor-hand": "mdi.hand",                     # 手掌光标（左键拖动图像）

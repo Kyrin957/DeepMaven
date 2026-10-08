@@ -16,7 +16,6 @@ from PySide6.QtCore import QUrl, Qt
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QFileDialog,
-    QFormLayout,
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
@@ -30,10 +29,11 @@ from qfluentwidgets import (
     CardWidget,
     CheckBox,
     ComboBox,
+    FluentIcon,
     LineEdit,
-    PrimaryPushButton,
     ProgressBar,
     PushButton,
+    ScrollArea,
     StrongBodyLabel,
     TableWidget,
 )
@@ -41,8 +41,9 @@ from qfluentwidgets import (
 from src.utils.constants import EXPORT_FORMATS, SPLIT_COLORS
 from src.viewmodels.export_vm import ExportViewModel
 from src.views.data_widgets import side_column
-from src.views.ui import SafeSpinBox
+from src.views.ui import FlowContainer, SafeSpinBox, ToolGroup, icon_button
 from src.views.ui import tokens as T
+from src.views.ui.icons import bind_icon, icon
 from src.views.widgets import LegendList, PieChart
 
 _REPORT_FORMATS = [
@@ -77,7 +78,7 @@ class ExportTab(QWidget):
         root.setContentsMargins(T.SPACE_XL, T.SPACE_LG, T.SPACE_XL, T.SPACE_LG)
         root.setSpacing(T.SPACE_LG)
         root.addWidget(self._build_side(), 0)
-        root.addLayout(self._build_center(), 1)
+        root.addWidget(self._build_center(), 1)
         root.addWidget(self._build_actions(), 0)
 
     def _card(self, title: str) -> tuple[CardWidget, QVBoxLayout]:
@@ -111,35 +112,32 @@ class ExportTab(QWidget):
         self.record_combo.currentIndexChanged.connect(self._on_record_picked)
         layout.addWidget(self.record_combo)
 
-        weights_row = QHBoxLayout()
-        self.weights_edit = LineEdit(card)
+        weights_row = QWidget(card)
+        weights_box = QHBoxLayout(weights_row)
+        weights_box.setContentsMargins(0, 0, 0, 0)
+        weights_box.setSpacing(T.SPACE_SM)
+        self.weights_edit = LineEdit(weights_row)
         self.weights_edit.setPlaceholderText("模型权重 (.pt)")
-        weights_row.addWidget(self.weights_edit, 1)
-        weights_btn = PushButton("浏览", card)
+        weights_box.addWidget(self.weights_edit, 1)
+        weights_btn = icon_button(FluentIcon.FOLDER, "选择模型权重文件", weights_row)
         weights_btn.clicked.connect(self._on_browse_weights)
-        weights_row.addWidget(weights_btn)
-        layout.addLayout(weights_row)
+        weights_box.addWidget(weights_btn)
+        layout.addWidget(weights_row)
 
-        form = QFormLayout()
-        form.setSpacing(T.SPACE_MD)
+        # 参数行：容器化 + 可换行（§1）。**不用 QFormLayout**——标签列 + 两个
+        # 宽步进器会把内容最小宽顶到 453px（侧栏 290px），右侧被裁掉（§4.71）
+        container = FlowContainer(card, spacing=T.SPACE_MD)
+        layout.addWidget(container)
+
         self.format_combo = ComboBox(card)
         for fmt in EXPORT_FORMATS:
             self.format_combo.addItem(fmt["label"], userData=fmt["key"])
         self.format_combo.currentIndexChanged.connect(self._on_format_changed)
         self.format_combo.setToolTip("ONNX 跨平台 / TorchScript 便于 C++")
-        form.addRow("导出格式", self.format_combo)
+        container.add(ToolGroup(
+            CaptionLabel("导出格式", card), self.format_combo, parent=card
+        ))
 
-        out_row = QHBoxLayout()
-        self.out_edit = LineEdit(card)
-        self.out_edit.setPlaceholderText("导出目录")
-        out_row.addWidget(self.out_edit, 1)
-        out_btn = PushButton("浏览", card)
-        out_btn.clicked.connect(self._on_browse_out)
-        out_row.addWidget(out_btn)
-        form.addRow("导出目录", out_row)
-
-        size_row = QHBoxLayout()
-        size_row.setSpacing(T.SPACE_MD)
         self.imgsz_spin = SafeSpinBox(card)
         self.imgsz_spin.setRange(64, 4096)
         self.imgsz_spin.setSingleStep(32)
@@ -147,17 +145,33 @@ class ExportTab(QWidget):
             T.field_width(self.imgsz_spin, T.STEPPER_CHARS_WIDE)
         )
         self.imgsz_spin.valueChanged.connect(self._on_params_changed)
-        size_row.addWidget(self.imgsz_spin)
         self.opset_spin = SafeSpinBox(card)
         self.opset_spin.setRange(9, 20)
         self.opset_spin.setFixedWidth(
             T.field_width(self.opset_spin, T.STEPPER_CHARS_NARROW)
         )
         self.opset_spin.valueChanged.connect(self._on_params_changed)
-        size_row.addWidget(self.opset_spin)
-        size_row.addStretch(1)
-        form.addRow("尺寸 / Opset", size_row)
-        layout.addLayout(form)
+        # 尺寸与 Opset **分成两组**：并成一组宽 386px > 侧栏 250px，会被顶出卡片
+        # 右缘（§1 分组整体折行，单个分组比容器还宽时就溢出了）
+        container.add(ToolGroup(
+            CaptionLabel("尺寸", card), self.imgsz_spin, parent=card
+        ))
+        container.add(ToolGroup(
+            CaptionLabel("Opset", card), self.opset_spin, parent=card
+        ))
+
+        out_row = QWidget(card)
+        out_box = QHBoxLayout(out_row)
+        out_box.setContentsMargins(0, 0, 0, 0)
+        out_box.setSpacing(T.SPACE_SM)
+        out_box.addWidget(CaptionLabel("导出目录", out_row))
+        self.out_edit = LineEdit(out_row)
+        self.out_edit.setPlaceholderText("导出目录")
+        out_box.addWidget(self.out_edit, 1)
+        out_btn = icon_button(FluentIcon.FOLDER, "选择导出目录", out_row)
+        out_btn.clicked.connect(self._on_browse_out)
+        out_box.addWidget(out_btn)
+        layout.addWidget(out_row)
 
         progress_card, progress_layout = self._card("导出进度")
         self.progress_bar = ProgressBar(progress_card)
@@ -170,16 +184,25 @@ class ExportTab(QWidget):
         self.open_btn.clicked.connect(self._on_open_dir)
         progress_layout.addWidget(self.open_btn)
 
-        return side_column(card, progress_card, width=310)
+        return side_column(card, progress_card, width=T.SIDE_W_WIDE)
 
     # --------------------------------------------------- 中央
-    def _build_center(self) -> QVBoxLayout:
-        column = QVBoxLayout()
+    def _build_center(self) -> QWidget:
+        """中央信息区：**自带滚动**（§5.5）——三张卡片最小高合计 ~682px，
+        窗口变矮时若不滚动就会被压到最小高以下（图表 / 表格互相叠压）。"""
+        body = QWidget(self)
+        column = QVBoxLayout(body)
+        column.setContentsMargins(0, 0, 0, 0)
         column.setSpacing(T.SPACE_ML)
         column.addWidget(self._build_model_card(), 0)
-        column.addWidget(self._build_split_card(), 1)
+        column.addWidget(self._build_split_card(), 0)
         column.addWidget(self._build_eval_card(), 1)
-        return column
+
+        area = ScrollArea(self)
+        area.setWidgetResizable(True)
+        area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        area.setWidget(body)
+        return area
 
     def _build_model_card(self) -> CardWidget:
         card, layout = self._card("模型概览")
@@ -260,8 +283,11 @@ class ExportTab(QWidget):
         self.half_check.stateChanged.connect(self._on_options_changed)
         export_layout.addWidget(self.half_check)
 
-        self.export_btn = PrimaryPushButton("导出模型", export_card)
-        self.export_btn.setMinimumHeight(36)
+        # 导出模型 = 「导入导出」类动作：图标按钮（§10，固定 32px 不随宽度拉伸）
+        self.export_btn = icon_button(
+            icon("export"), "导出模型", export_card, primary=True
+        )
+        bind_icon(self.export_btn, "export")
         export_layout.addWidget(self.export_btn)
         export_layout.addStretch(1)
 
@@ -271,7 +297,6 @@ class ExportTab(QWidget):
             self.report_combo.addItem(text, userData=key)
         report_layout.addWidget(self.report_combo)
         self.report_btn = PushButton("生成报告", report_card)
-        self.report_btn.setMinimumHeight(36)
         report_layout.addWidget(self.report_btn)
         report_layout.addStretch(1)
 
@@ -475,26 +500,40 @@ class ExportTab(QWidget):
         self._vm.set_format(str(self.format_combo.currentData()))
 
     def _on_params_changed(self, *_args) -> None:
-        """尺寸 / Opset 变化（回填配置时同步中则不回写，避免把项目标记为已修改）。"""
+        """尺寸 / Opset 变化（回填配置时同步中则不回写，避免把项目标记为已修改）。
+
+        **先把两个控件值读进局部变量，再写配置**：每次 `_emit` 都会同步触发
+        `_on_config` 把配置回填到控件，边写边读会让后写的那个（OPSET）被回填
+        成配置里的旧值（见《开发文档.md》§4.70）。
+        """
         if self._syncing:
             return
-        self._vm.set_imgsz(self.imgsz_spin.value())
-        self._vm.set_opset(self.opset_spin.value())
+        imgsz = self.imgsz_spin.value()
+        opset = self.opset_spin.value()
+        self._vm.set_imgsz(imgsz)
+        self._vm.set_opset(opset)
 
     def _on_options_changed(self, *_args) -> None:
-        """导出选项变化；「推断优化」与「API 优化」互斥（与 DLT 一致）。"""
+        """导出选项变化；「推断优化」与「API 优化」互斥（与 DLT 一致）。
+
+        同样先把三个勾选读进局部变量再写配置——否则后写的两项会被
+        `_on_config` 的回填重置成旧值（勾选改了不生效，§4.70）。
+        """
         if self._syncing:
             return
-        if self.inference_check.isChecked() and self.api_check.isChecked():
+        inference = self.inference_check.isChecked()
+        api = self.api_check.isChecked()
+        half = self.half_check.isChecked()
+        if inference and api:
             sender = self.sender()
             target = (
                 self.inference_check if sender is self.api_check else self.api_check
             )
             target.setChecked(False)
             return
-        self._vm.set_for_inference(self.inference_check.isChecked())
-        self._vm.set_for_api(self.api_check.isChecked())
-        self._vm.set_half(self.half_check.isChecked())
+        self._vm.set_for_inference(inference)
+        self._vm.set_for_api(api)
+        self._vm.set_half(half)
 
     def _on_record_picked(self, index: int) -> None:
         if self._syncing or index < 0:
@@ -521,9 +560,13 @@ class ExportTab(QWidget):
             self._vm.set_output_dir(directory)
 
     def _on_export(self) -> None:
-        self._vm.set_weights(self.weights_edit.text().strip())
-        self._vm.set_format(str(self.format_combo.currentData()))
-        self._vm.set_output_dir(self.out_edit.text().strip())
+        # 先读全部控件值再写配置（写配置会同步回填控件，边写边读会丢改动）
+        weights = self.weights_edit.text().strip()
+        fmt = str(self.format_combo.currentData())
+        output_dir = self.out_edit.text().strip()
+        self._vm.set_weights(weights)
+        self._vm.set_format(fmt)
+        self._vm.set_output_dir(output_dir)
         self._vm.export()
 
     def _on_report(self) -> None:
