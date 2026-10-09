@@ -35,6 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--imgsz", type=int, default=640)
+    parser.add_argument("--channels", type=int, default=3)
     parser.add_argument("--lr", type=float, default=0.01)
     parser.add_argument("--optimizer", default="auto")
     parser.add_argument("--weight-decay", type=float, default=0.0005)
@@ -53,6 +54,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--rect", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--dropout", type=float, default=0.0)
+    # 默认 None = 该项不适用于当前任务 / 模型系列（后端按能力决定是否传），
+    # 只有显式给出时才下发给 Ultralytics（避免"传了但被忽略"的参数进配置）
+    parser.add_argument("--dfl", type=float, default=None)
+    parser.add_argument("--cls-pw", type=float, default=None)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
@@ -205,11 +210,20 @@ def main(argv: list[str] | None = None) -> int:
         model.add_callback("on_train_batch_end", on_train_batch_end)
         model.add_callback("on_fit_epoch_end", on_fit_epoch_end)
 
+        # 只有后端确认"该任务 / 该模型系列会用到"的参数才下发：
+        # cls_pw 仅检测族损失消费；dfl 仅 YOLO11 系列（YOLO26 为 L1 回归）
+        extra: dict = {}
+        if args.cls_pw is not None:
+            extra["cls_pw"] = args.cls_pw
+        if args.dfl is not None:
+            extra["dfl"] = args.dfl
+
         model.train(
             data=args.data,
             epochs=total,
             batch=args.batch,
             imgsz=args.imgsz,
+            channels=args.channels,
             lr0=args.lr,
             optimizer=args.optimizer,
             weight_decay=args.weight_decay,
@@ -243,6 +257,7 @@ def main(argv: list[str] | None = None) -> int:
             hsv_v=args.hsv_v,
             mosaic=args.mosaic,
             mixup=args.mixup,
+            **extra,
         )
     except Exception as exc:  # noqa: BLE001 - 子进程需回报任何失败
         traceback.print_exc()

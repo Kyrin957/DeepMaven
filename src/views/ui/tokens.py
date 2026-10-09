@@ -176,6 +176,31 @@ def field_width(reference: QWidget, chars: int = STEPPER_CHARS) -> int:
     return max(STEPPER_MIN_W, text_w + stepper_chrome(reference))
 
 
+def label_width(reference: QWidget, texts, minimum: int = LABEL_MIN_W) -> int:
+    """一列字段的**统一标签宽**：按所列标签里最长的一个度量（字体 / 缩放自适应）。
+
+    为什么必须统一：字段行若是「标签各自宽度 + 控件」，同一栅格里各行的输入框
+    左边缘就参差不齐（「训练轮数」与「学习率」这类长短不一的标签尤其明显）。
+    给定同一宽度后，标签占位一致，输入框自然成列对齐。
+
+    参数
+    ----
+    reference : 字体度量基准控件（用它的 ``fontMetrics``，与标签同字体即可）。
+    texts     : 该列全部标签文本。
+    minimum   : 下限（默认 ``LABEL_MIN_W``），避免极短标签让整列过窄。
+
+    返回
+    ----
+    逻辑像素宽度 = 最长标签的文字宽 + 2px 容差（字体 hinting 会差 ~1px）。
+    """
+    fm = reference.fontMetrics()
+    texts = [str(text) for text in (texts or []) if str(text)]
+    if not texts:
+        return int(minimum)
+    widest = max(fm.horizontalAdvance(text) for text in texts)
+    return max(int(minimum), widest + 2)
+
+
 __all__ = [
     "SPACE_XXS", "SPACE_XS", "SPACE_SM", "SPACE_MD", "SPACE_ML", "SPACE_LG",
     "SPACE_XL", "SPACE_2XL", "SPACE_XXL",
@@ -192,5 +217,5 @@ __all__ = [
     "PANEL_W_WIDE", "PAGER_BTN_W",
     "RADIUS_SM", "RADIUS_MD", "RADIUS_LG",
     "CANVAS_BG", "GROUP_BORDER", "GROUP_BG",
-    "field_width", "stepper_chrome",
+    "field_width", "label_width", "stepper_chrome",
 ]

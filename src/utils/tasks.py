@@ -119,6 +119,16 @@ class TaskSpec:
     export_formats: tuple[str, ...] = DEFAULT_EXPORT_FORMATS
     pages: tuple[str, ...] = ALL_PAGES
     quick_fit: bool = False
+    # 训练集类别频次能否统计（检测族按标签框数、分类按类别目录图片数；
+    # 语义分割按像素标注、异常检测只有正常样本 → 都没有类别频次这个口径）
+    class_counts: bool = False
+    # 是否走 Ultralytics 的**检测族损失**（目标对齐 + 分类 BCE + 回归头），
+    # 对应检测 / 旋转框 / 实例分割。它决定两项能力：
+    #   * 类别失衡权重 `cls_pw`：逐类权重只乘在检测族的分类 BCE 上；
+    #   * `dfl` 回归损失增益：只有检测族模型有 DFL / L1 回归头。
+    # 分类任务（无权重 CrossEntropy、无回归头）、语义分割（自研 U-Net）、
+    # 异常检测（无监督）都为 False → 对应参数在界面与后端都不出现。
+    detection_family: bool = False
 
     def to_dict(self) -> dict:
         """旧 `constants.PROJECT_TYPES` 结构（新建项目对话框等按此读取）。"""
@@ -156,6 +166,7 @@ _TASKS: tuple[TaskSpec, ...] = (
         dataset_layout=LAYOUT_CLASSIFY,
         metrics=CLASSIFY_METRICS,
         eval_views=(VIEW_CLASSIFY,),
+        class_counts=True,             # 类别目录图片数（分类损失不带类别权重）
     ),
     TaskSpec(
         key="anomaly",
@@ -186,6 +197,8 @@ _TASKS: tuple[TaskSpec, ...] = (
         dataset_layout=LAYOUT_DETECT,
         metrics=DETECT_METRICS,
         eval_views=(VIEW_DETECT,),
+        class_counts=True,
+        detection_family=True,
     ),
     TaskSpec(
         key="obb",
@@ -199,6 +212,8 @@ _TASKS: tuple[TaskSpec, ...] = (
         dataset_layout=LAYOUT_DETECT,
         metrics=DETECT_METRICS,
         eval_views=(VIEW_DETECT,),
+        class_counts=True,
+        detection_family=True,
     ),
     TaskSpec(
         key="segment",
@@ -212,6 +227,8 @@ _TASKS: tuple[TaskSpec, ...] = (
         dataset_layout=LAYOUT_DETECT,
         metrics=DETECT_METRICS,
         eval_views=(VIEW_DETECT,),
+        class_counts=True,
+        detection_family=True,
     ),
     TaskSpec(
         key="semantic",
@@ -272,6 +289,22 @@ def task_of(key: str) -> str:
     if spec is None or not spec.supported:
         return DEFAULT_TASK
     return spec.key
+
+
+def is_detection_family(task: str) -> bool:
+    """该任务是否走 Ultralytics 检测族损失（检测 / 旋转框 / 实例分割）。
+
+    它同时决定「类别失衡权重 `cls_pw`」与「`dfl` 增益」是否可用：逐类权重只
+    乘在检测族的分类 BCE 上（`utils/loss.py` 的 `class_weights`），而 DFL 是
+    检测族回归头的损失。分类任务用无权重 CrossEntropy、也没有回归头；语义
+    分割是本项目自研 U-Net；异常检测无监督——都不是检测族损失。
+    """
+    return bool(task_spec(task).detection_family)
+
+
+def supports_class_counts(task: str) -> bool:
+    """该任务能否统计训练集类别频次（检测族按标签框数 / 分类按图片数）。"""
+    return bool(task_spec(task).class_counts)
 
 
 def annotation_mode(key: str) -> str:

@@ -23,6 +23,7 @@ class TrainingConfig:
     batch: int = 16
     lr: float = 0.01                   # 初始学习率
     imgsz: int = 640
+    channels: int = 3                  # 输入通道：1 灰度 / 3 RGB / 4 RGBA
     optimizer: str = "auto"
     weight_decay: float = 0.0005       # 权重衰减（Halcon DLT 的「权重先验」）
     momentum: float = 0.937            # SGD 动量
@@ -36,6 +37,10 @@ class TrainingConfig:
     single_cls: bool = False           # 全部视为单一类别
     rect: bool = False                 # 矩形训练（检测任务加速）
     dropout: float = 0.0               # 分类任务的 dropout
+    dfl: float = 1.5                   # DFL 回归损失增益（仅 YOLO11 系列生效）
+    # 类别失衡权重强度（Ultralytics `cls_pw`）：0 = 关闭，1 = 完全逆频次。
+    # 只有检测族（detect / segment / obb）的损失消费它，见 tasks.class_balance
+    cls_pw: float = 0.0
     device: str = "auto"               # auto / cpu / cuda:0 ...
     workers: int = 4
     seed: int = 0
@@ -43,7 +48,10 @@ class TrainingConfig:
     project_dir: str = ""              # 训练结果保存目录
 
     # 在线数据增强（Ultralytics 训练期增强）
-    augment: bool = True               # 启用图像增强
+    augment: bool = True               # 全局：启用图像增强
+    # 逐项启用开关：缺键时按「值 > 0」推断（旧项目兼容）。关掉的项**保留数值**
+    # 只在下发时按 0 处理，重新启用即可恢复（`augment_value`）。
+    augment_enabled: dict[str, bool] = field(default_factory=dict)
     hflip: float = 0.5                 # 水平翻转概率
     vflip: float = 0.0                 # 垂直翻转概率
     degrees: float = 0.0               # 旋转角度范围
@@ -54,8 +62,6 @@ class TrainingConfig:
     hsv_v: float = 0.4                 # 亮度变化
     mosaic: float = 1.0                # 马赛克概率
     mixup: float = 0.0                 # 混合概率
-    # 类别权重（参考值：按训练集频次平衡，见训练页「类别权重」卡片）
-    class_weights: dict[str, float] = field(default_factory=dict)
 
     # 异常检测（Anomalib）参数
     anomaly_root: str = ""             # 数据集根目录（含 normal/、abnormal/）
@@ -83,6 +89,25 @@ class TrainingConfig:
     # 历次训练记录（每完成一次追加一条，供训练页回看）
     history: list[dict] = field(default_factory=list)
 
+    # 逐项增强的键（界面按此顺序生成勾选 + 数值；非 dataclass 字段）
+    AUGMENT_KEYS = (
+        "hflip", "vflip", "degrees", "scale", "translate",
+        "hsv_h", "hsv_s", "hsv_v", "mosaic", "mixup",
+    )
+
+    def augment_enabled_for(self, key: str) -> bool:
+        """该增强项是否启用；未记录时按「值 > 0」推断（旧项目兼容）。"""
+        stored = self.augment_enabled.get(str(key))
+        if stored is None:
+            return float(getattr(self, key, 0.0) or 0.0) > 0.0
+        return bool(stored)
+
+    def augment_value(self, key: str) -> float:
+        """该增强项**实际下发**的数值：未启用一律 0（Ultralytics 里 0 = 关闭）。"""
+        if not self.augment_enabled_for(key):
+            return 0.0
+        return float(getattr(self, key, 0.0) or 0.0)
+
     def to_dict(self) -> dict:
         return {
             "task_type": self.task_type,
@@ -95,6 +120,7 @@ class TrainingConfig:
             "batch": self.batch,
             "lr": self.lr,
             "imgsz": self.imgsz,
+            "channels": self.channels,
             "optimizer": self.optimizer,
             "weight_decay": self.weight_decay,
             "momentum": self.momentum,
@@ -108,12 +134,15 @@ class TrainingConfig:
             "single_cls": self.single_cls,
             "rect": self.rect,
             "dropout": self.dropout,
+            "dfl": self.dfl,
+            "cls_pw": self.cls_pw,
             "device": self.device,
             "workers": self.workers,
             "seed": self.seed,
             "resume": self.resume,
             "project_dir": self.project_dir,
             "augment": self.augment,
+            "augment_enabled": dict(self.augment_enabled),
             "hflip": self.hflip,
             "vflip": self.vflip,
             "degrees": self.degrees,
@@ -124,7 +153,6 @@ class TrainingConfig:
             "hsv_v": self.hsv_v,
             "mosaic": self.mosaic,
             "mixup": self.mixup,
-            "class_weights": dict(self.class_weights),
             "anomaly_root": self.anomaly_root,
             "anomaly_normal_dir": self.anomaly_normal_dir,
             "anomaly_abnormal_dir": self.anomaly_abnormal_dir,
@@ -161,6 +189,7 @@ class TrainingConfig:
             batch=data.get("batch", 16),
             lr=data.get("lr", 0.01),
             imgsz=data.get("imgsz", 640),
+            channels=int(data.get("channels", 3) or 3),
             optimizer=data.get("optimizer", "auto"),
             weight_decay=data.get("weight_decay", data.get("decay", 0.0005)),
             momentum=data.get("momentum", 0.937),
@@ -174,12 +203,18 @@ class TrainingConfig:
             single_cls=data.get("single_cls", False),
             rect=data.get("rect", False),
             dropout=data.get("dropout", 0.0),
+            dfl=data.get("dfl", 1.5),
+            cls_pw=data.get("cls_pw", 0.0),
             device=data.get("device", "auto"),
             workers=data.get("workers", 4),
             seed=data.get("seed", 0),
             resume=data.get("resume", False),
             project_dir=data.get("project_dir", ""),
             augment=data.get("augment", True),
+            augment_enabled={
+                str(key): bool(value)
+                for key, value in (data.get("augment_enabled") or {}).items()
+            },
             hflip=data.get("hflip", 0.5),
             vflip=data.get("vflip", 0.0),
             degrees=data.get("degrees", 0.0),
@@ -190,7 +225,6 @@ class TrainingConfig:
             hsv_v=data.get("hsv_v", 0.4),
             mosaic=data.get("mosaic", 1.0),
             mixup=data.get("mixup", 0.0),
-            class_weights=dict(data.get("class_weights", {}) or {}),
             anomaly_root=data.get("anomaly_root", ""),
             anomaly_normal_dir=data.get("anomaly_normal_dir", "normal"),
             anomaly_abnormal_dir=data.get("anomaly_abnormal_dir", "abnormal"),

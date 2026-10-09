@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
 )
 
+from qfluentwidgets import CompactDoubleSpinBox as _QfwCompactDoubleSpinBox
 from qfluentwidgets import CompactSpinBox as _QfwCompactSpinBox
 from qfluentwidgets import DoubleSpinBox as _QfwDoubleSpinBox
 from qfluentwidgets import SpinBox as _QfwSpinBox
@@ -132,6 +133,9 @@ def _make_safe(cls):
 #: 设计系统统一使用的整型 / 浮点输入框（参数类控件请一律用这两个）
 SafeSpinBox = _make_safe(_QfwSpinBox)
 SafeDoubleSpinBox = _make_safe(_QfwDoubleSpinBox)
+#: 紧凑**浮点**步进器：窄栏里「勾选 + 数值」成对折行的场景（数据增强）用它，
+#: 与 `SafeCompactSpinBox` 同一口径，只是值类型为浮点
+SafeCompactDoubleSpinBox = _make_safe(_QfwCompactDoubleSpinBox)
 
 
 class SafeCompactSpinBox(_SelfGuardedSpin, _QfwCompactSpinBox):  # type: ignore[misc]

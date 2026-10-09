@@ -16,6 +16,7 @@ from pathlib import Path
 from PySide6.QtCore import QEvent, QPoint, QSize, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
+    QBoxLayout,
     QFileDialog,
     QFrame,
     QGraphicsOpacityEffect,
@@ -58,17 +59,24 @@ from src.utils.constants import (
     SPLIT_LABELS,
     YOLO_MODEL_VARIANTS,
     base_variant_key,
+    uses_dfl,
 )
-from src.utils.device import device_label, device_options
+from src.utils.device import device_help, device_label, device_options
+from src.utils.tasks import is_detection_family, supports_class_counts
 from src.viewmodels.dataset_vm import DatasetViewModel
 from src.viewmodels.model_vm import ModelViewModel
 from src.viewmodels.train_vm import TrainViewModel
 from src.views.data_widgets import side_column
 from src.views.dialogs import ImagePreviewDialog
 from src.views.ui import (
+    FieldRow,
+    FlowContainer,
     ParamGroup,
+    SafeCompactDoubleSpinBox,
+    SafeCompactSpinBox,
     SafeDoubleSpinBox,
     SafeSpinBox,
+    ToolGroup,
     icon_button,
 )
 from src.views.ui import tokens as T
@@ -76,23 +84,34 @@ from src.views.ui.icons import icon
 from src.views.widgets import LineChart, PieChart
 
 # ---------------------------------------------------------------
-# 参数表：(键, 标签, 最小值, 最大值, 默认值, 步长, 后缀)
+# 参数表：(键, 标签, 最小值, 最大值, 默认值, 步长, 后缀) / 浮点表末位是小数位
+# 分三处摆放：常用（每次训练都会看）/ 高级（默认收起）/ 图像设置
 # ---------------------------------------------------------------
-_INT_PARAMS = [
+_COMMON_INT_PARAMS = [
     ("epochs", "训练轮数", 1, 10000, 100, 1, ""),
     ("batch", "批次大小", 1, 512, 16, 1, ""),
-    ("imgsz", "图像尺寸", 32, 2048, 640, 32, " px"),
-    ("workers", "数据线程", 0, 32, 4, 1, ""),
     ("seed", "随机种子", 0, 99999, 0, 1, ""),
+]
+_COMMON_FLOAT_PARAMS = [
+    ("lr", "学习率", 0.00001, 1.0, 0.01, 0.001, 5),
+]
+# 高级：Ultralytics 的默认值在多数数据集上都够用，默认收起
+_ADV_INT_PARAMS = [
     ("patience", "早停耐心值", 0, 1000, 50, 1, " 轮"),
     ("close_mosaic", "末轮关增强", 0, 100, 10, 1, " 轮"),
+    ("workers", "数据线程", 0, 32, 4, 1, ""),
 ]
-_FLOAT_PARAMS = [
-    ("lr", "学习率", 0.00001, 1.0, 0.01, 0.001, 5),
+_ADV_FLOAT_PARAMS = [
     ("weight_decay", "权重衰减", 0.0, 1.0, 0.0005, 0.0001, 5),
     ("momentum", "动量", 0.0, 1.0, 0.937, 0.01, 3),
     ("warmup_epochs", "学习率预热", 0.0, 50.0, 3.0, 0.5, 1),
     ("dropout", "Dropout", 0.0, 0.9, 0.0, 0.05, 2),
+    ("dfl", "DFL 增益", 0.0, 20.0, 1.5, 0.5, 2),
+]
+# 图像设置：输入尺寸与通道（对应 Ultralytics 的 imgsz / channels）
+_IMAGE_INT_PARAMS = [
+    ("imgsz", "图像尺寸", 32, 2048, 640, 32, " px"),
+    ("channels", "通道", 1, 4, 3, 1, ""),
 ]
 _CHECK_PARAMS = [
     ("deterministic", "使用确定性算法"),
@@ -131,6 +150,24 @@ def _custom_path(data) -> str:
     if isinstance(data, tuple) and len(data) == 2 and data[0] == _CUSTOM_TAG:
         return str(data[1])
     return ""
+
+
+def _equal_width(widgets) -> None:
+    """把一组控件设为**等宽**（取其中最大宽度）。
+
+    同一个栅格里「下拉 + 步进器」长短不一，右边缘参差会显得散乱；统一宽度后
+    成列对齐（宽度本身仍由各自的内容决定，只做取齐）。
+    """
+    widths = [
+        widget.minimumWidth() or widget.sizeHint().width()
+        for widget in widgets if widget is not None
+    ]
+    if not widths:
+        return
+    target = max(widths)
+    for widget in widgets:
+        if widget is not None:
+            widget.setFixedWidth(target)
 
 
 def _duration(seconds: float) -> str:
@@ -378,7 +415,10 @@ class TrainTab(QWidget):
         self._int_spins: dict[str, SafeSpinBox] = {}
         self._float_spins: dict[str, SafeDoubleSpinBox] = {}
         self._checks: dict[str, CheckBox] = {}
-        self._aug_spins: dict[str, SafeDoubleSpinBox] = {}
+        self._aug_spins: dict[str, SafeCompactDoubleSpinBox] = {}
+        self._aug_checks: dict[str, CheckBox] = {}
+        # 参数键 → 字段行（按后端能力整行显隐，见 _apply_param_visibility）
+        self._param_rows: dict[str, QWidget] = {}
         self._tile_values: dict[str, BodyLabel] = {}
         self._weight_inputs_rendered: tuple = ()
         # 最近一次选定的自定义权重（切回「自定义权重」时免再弹一次对话框）
@@ -602,7 +642,9 @@ class TrainTab(QWidget):
         body = QWidget()
         # 无训练模型时整体禁用（参数属于所选模型，见 _refresh）
         self.settings_body = body
-        # 两列紧凑排布（参照 Halcon DLT）：左列 数据 / 模型，右列 参数 / 增强；
+        # 两列紧凑排布（参照 Halcon DLT）：
+        #   左列 数据（拆分 / 类别分布**并排**）→ 模型与权重 → 图像设置 → 设备
+        #   右列 训练参数（常用 + 可展开的高级）→ 数据增强
         # 卡片按内容自适应高度、控件按参数字符宽度收紧，不再一律纵向占满整行
         columns = QHBoxLayout(body)
         columns.setContentsMargins(T.SPACE_XXS, T.SPACE_XXS, T.SPACE_XXS, T.SPACE_XXS)
@@ -611,23 +653,62 @@ class TrainTab(QWidget):
         left.setSpacing(T.SPACE_ML)
         right = QVBoxLayout()
         right.setSpacing(T.SPACE_ML)
-        left.addWidget(self._build_split_card())
+
+        # 第一行：数据集拆分（半宽足够）+ 类别分布并排。拆分为 3 / 分布为 2：
+        # 拆分卡要容纳环形图 + 汇总表，分布卡只有几行文字
+        first = QHBoxLayout()
+        first.setSpacing(T.SPACE_ML)
+        first.addWidget(self._build_split_card(), 3)
+        first.addWidget(self._build_distribution_card(), 2)
+        left.addLayout(first)
+
         left.addWidget(self._build_model_card())
-        left.addWidget(self._build_weight_card())
+        left.addWidget(self._build_image_card())
+        left.addWidget(self._build_device_card())
         left.addStretch(1)
         right.addWidget(self._build_param_card())
         right.addWidget(self._build_aug_card())
         right.addStretch(1)
         columns.addLayout(left, 1)
         columns.addLayout(right, 1)
+        self._pane_columns = columns
+        self._pane_left = left
+        self._pane_right = right
+        self._reflow_settings()
         area.setWidget(body)
         return area
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        super().resizeEvent(event)
+        self._reflow_settings()
+
+    def _reflow_settings(self) -> None:
+        """放不下两列时设置页**改单列**（避免右栏被横向裁掉，§8）。
+
+        判据用**布局自身的最小宽**（随字体 / DPI 自动变化）与可用宽比较，
+        而不是写死窗口宽：`左列 + 间距 + 右列 ≤ 可用宽` 才用两列。
+        单列时卡片自上而下堆叠、由滚动区承接高度。
+        """
+        columns = getattr(self, "_pane_columns", None)
+        if columns is None:
+            return
+        need = (self._pane_left.minimumSize().width() + columns.spacing()
+                + self._pane_right.minimumSize().width())
+        available = self.width() - T.SIDE_W_WIDE - 4 * T.SPACE_XL
+        direction = (
+            QBoxLayout.Direction.LeftToRight if available >= need
+            else QBoxLayout.Direction.TopToBottom
+        )
+        if columns.direction() != direction:
+            columns.setDirection(direction)
 
     def _build_split_card(self) -> CardWidget:
         """数据集拆分：下拉选择 + 概览（环形图 + 汇总表）。
 
-        概览部分与「数据拆分页 → 拆分概览」**逐元素一致**（环形图固定宽 +
-        右侧汇总表：色块 / 名称 / 图像数 / 百分比 + 分隔线 + 合计行）；
+        概览部分与「数据拆分页 → 拆分概览」**逐元素一致**（环形图 + 汇总表：
+        色块 / 名称 / 图像数 / 百分比 + 分隔线 + 合计行）；本页与「类别分布」
+        并排、只占半宽，因此内部**竖排**（图在上、表在下）且环形图取
+        `T.CTRL_W_LG`（拆分页全宽时用 `T.CTRL_W_XL`）。
         刷新由数据集 / 拆分信号自动驱动，不设「刷新」按钮。
         """
         card, layout = self._card("数据集拆分")
@@ -639,11 +720,11 @@ class TrainTab(QWidget):
         pick_row.addWidget(self.split_combo, 1)
         layout.addLayout(pick_row)
 
-        body = QHBoxLayout()
-        body.setSpacing(T.SPACE_XL)
+        body = QVBoxLayout()
+        body.setSpacing(T.SPACE_MD)
         self.pie = PieChart(card)
-        self.pie.setFixedWidth(T.CTRL_W_XL)
-        body.addWidget(self.pie)
+        self.pie.setFixedWidth(T.CTRL_W_LG)
+        body.addWidget(self.pie, 0, Qt.AlignmentFlag.AlignHCenter)
 
         table = QGridLayout()
         table.setHorizontalSpacing(T.SPACE_MD)
@@ -703,8 +784,10 @@ class TrainTab(QWidget):
         table.addWidget(self.summary_total, 5, 2)
         table.addWidget(self.summary_percent, 5, 3)
 
-        body.addLayout(table)
-        body.addStretch(1)          # 内容靠左：不随卡片宽度铺散
+        table_holder = QWidget(card)
+        table_holder.setLayout(table)
+        # 靠左按内容宽度放置：拉满会把「图像 / 百分比」两列推到卡片两端
+        body.addWidget(table_holder, 0, Qt.AlignmentFlag.AlignLeft)
         layout.addLayout(body)
         return card
 
@@ -870,94 +953,96 @@ class TrainTab(QWidget):
         if not custom:
             self.model_info.setText("")
 
-    def _build_param_card(self) -> CardWidget:
-        """训练参数：模块化容器 + 紧凑步进器（参照 Halcon DLT 的设置分组）。
+    def _make_int_spins(
+        self, parent, table, chars: int, compact: bool = False
+    ) -> list[tuple[str, QWidget]]:
+        """按参数表建整型步进器；**同一组用同一字符宽度**（输入框等宽成列）。
 
-        旧实现用 ``QFormLayout.addRow(label, spin)``，输入框默认 ``Expanding``，
-        于是每个参数框都被拉成横贯整栏的"一条长线"——既不美观，也不利于快速
-        扫读。现在改为**分组容器**（优化器 / 超参数 / 训练选项），组内参数用
-        按字符宽度定宽的紧凑步进器、多列排布。
+        `compact`：用紧凑步进器（省 54px/个）——两列栅格要放进半栏宽卡片时用它。
         """
-        card, layout = self._card("训练参数")
-
-        # —— 分组 1：优化器与设备 ——
-        basics = ParamGroup("优化器与设备", card)
-        self.opt_combo = ComboBox(basics)
-        self.opt_combo.addItems(OPTIMIZERS)
-        self.opt_combo.currentIndexChanged.connect(self._on_param_changed)
-        basics.add_field("求解器", self.opt_combo)
-
-        device_row = QWidget(basics)
-        device_layout = QHBoxLayout(device_row)
-        device_layout.setContentsMargins(0, 0, 0, 0)
-        device_layout.setSpacing(T.SPACE_MD)
-        self.device_combo = ComboBox(device_row)
-        for option in device_options():
-            self.device_combo.addItem(option, userData=option.split(" (")[0])
-        self.device_combo.currentIndexChanged.connect(self._on_device_changed)
-        device_layout.addWidget(self.device_combo)
-        self.device_hint = CaptionLabel("", device_row)
-        device_layout.addWidget(self.device_hint)
-        device_layout.addStretch(1)
-        basics.add_field("设备", device_row)
-        layout.addWidget(basics)
-
-        # —— 分组 2：超参数（定宽步进器，两列排布）——
-        hyper = ParamGroup("超参数", card)
         fields: list[tuple[str, QWidget]] = []
-        for key, label, minimum, maximum, default, step, suffix in _INT_PARAMS:
-            spin = SafeSpinBox(hyper)
+        for key, label, minimum, maximum, default, step, suffix in table:
+            spin = SafeCompactSpinBox(parent) if compact else SafeSpinBox(parent)
             spin.setRange(minimum, maximum)
             spin.setSingleStep(step)
             spin.setValue(default)
             if suffix:
                 spin.setSuffix(suffix)
-            spin.setFixedWidth(T.field_width(
-                spin, T.STEPPER_CHARS_WIDE if suffix else T.STEPPER_CHARS
-            ))
+            spin.setFixedWidth(T.field_width(spin, chars))
             spin.valueChanged.connect(self._on_param_changed)
             self._int_spins[key] = spin
             fields.append((label, spin))
+        return fields
 
-        for key, label, minimum, maximum, default, step, decimals in _FLOAT_PARAMS:
-            spin = SafeDoubleSpinBox(hyper)
+    def _make_float_spins(
+        self, parent, table, chars: int, compact: bool = False
+    ) -> list[tuple[str, QWidget]]:
+        """按参数表建浮点步进器（同样按组统一字符宽度）。"""
+        fields: list[tuple[str, QWidget]] = []
+        for key, label, minimum, maximum, default, step, decimals in table:
+            spin = (
+                SafeCompactDoubleSpinBox(parent) if compact
+                else SafeDoubleSpinBox(parent)
+            )
             spin.setRange(minimum, maximum)
             spin.setSingleStep(step)
             spin.setDecimals(decimals)
             spin.setValue(default)
-            spin.setFixedWidth(T.field_width(spin, T.STEPPER_CHARS))
+            spin.setFixedWidth(T.field_width(spin, chars))
             spin.valueChanged.connect(self._on_param_changed)
             self._float_spins[key] = spin
             fields.append((label, spin))
+        return fields
 
-        hyper.add_grid(fields, columns=2)
-        layout.addWidget(hyper)
+    def _build_param_card(self) -> CardWidget:
+        """训练参数：**常用**直接可见，**高级**默认收起。
 
-        # —— 分组 3：训练选项 ——
-        options = ParamGroup("训练选项", card)
-        check_grid = QGridLayout()
-        check_grid.setContentsMargins(0, 0, 0, 0)
-        check_grid.setHorizontalSpacing(T.SPACE_LG)
-        check_grid.setVerticalSpacing(T.SPACE_SM)
-        for index, (key, label) in enumerate(_CHECK_PARAMS):
-            box = CheckBox(label, options)
-            box.stateChanged.connect(self._on_param_changed)
-            check_grid.addWidget(box, index // 3, index % 3)
-            self._checks[key] = box
-        for column in range(3):
-            check_grid.setColumnStretch(column, 1)
-        options.add_layout(check_grid)
-        layout.addWidget(options)
+        分层的口径（按 Ultralytics 的默认值强度）：
+          * 常用：求解器与轮数 / 批次 / 学习率——几乎每次训练都要看或调；
+          * 高级（默认收起）：早停、末轮关增强、数据线程、随机种子、权重衰减、
+            动量、学习率预热、Dropout、DFL 增益，以及训练选项勾选——这些在多数
+            数据集上默认值即可用，收起来避免"一屏几十个参数"。
+        组内标签列宽与输入框宽度**统一**（`T.label_width` + 同字符数），两列
+        输入框成列对齐。
+        """
+        card, layout = self._card("训练参数")
 
-        # 异常检测专属参数
+        # —— 常用 ——
+        common = ParamGroup("常用", card)
+        self.opt_combo = ComboBox(common)
+        self.opt_combo.addItems(OPTIMIZERS)
+        self.opt_combo.currentIndexChanged.connect(self._on_param_changed)
+        common_fields: list[tuple[str, QWidget]] = [("求解器", self.opt_combo)]
+        common_fields += self._make_int_spins(
+            common, _COMMON_INT_PARAMS, T.STEPPER_CHARS_NARROW, compact=True
+        )
+        # 学习率小数位多（0.01000 = 7 字符）：按 8 字符定宽，`_equal_width`
+        # 会把同组其余控件一起取齐
+        common_fields += self._make_float_spins(
+            common, _COMMON_FLOAT_PARAMS, T.STEPPER_CHARS, compact=True
+        )
+        # 同组控件等宽：下拉与步进器长短不一会在两列栅格里显得散乱
+        _equal_width([control for _label, control in common_fields])
+        common_rows = common.add_grid(common_fields, columns=2)
+        self._param_rows.update(dict(zip(
+            ["optimizer"]
+            + [key for key, *_rest in _COMMON_INT_PARAMS]
+            + [key for key, *_rest in _COMMON_FLOAT_PARAMS],
+            common_rows,
+        )))
+        layout.addWidget(common)
+
+        # 异常检测专属参数（仅异常任务显示，放在常用之后，不必展开高级）
         self.anomaly_row = QWidget(card)
         anomaly_layout = QHBoxLayout(self.anomaly_row)
         anomaly_layout.setContentsMargins(0, 0, 0, 0)
-        anomaly_layout.setSpacing(T.SPACE_MD)
+        anomaly_layout.setSpacing(T.SPACE_SM)
         self.anomaly_edit = LineEdit(self.anomaly_row)
         self.anomaly_edit.setPlaceholderText("含 normal/ 与 abnormal/ 的目录")
         anomaly_layout.addWidget(self.anomaly_edit, 1)
-        anomaly_btn = PushButton("浏览", self.anomaly_row)
+        anomaly_btn = icon_button(
+            FluentIcon.FOLDER, "选择异常检测数据目录", self.anomaly_row
+        )
         anomaly_btn.clicked.connect(self._on_browse_anomaly)
         anomaly_layout.addWidget(anomaly_btn)
         self.anomaly_check = CheckBox("预训练权重", self.anomaly_row)
@@ -965,51 +1050,185 @@ class TrainTab(QWidget):
         anomaly_layout.addWidget(self.anomaly_check)
         layout.addWidget(self.anomaly_row)
 
-        # 训练参数预览：按当前 imgsz 与增强参数生成拼图（letterbox + 增强示意）
-        preview_row = QHBoxLayout()
-        preview_row.setSpacing(T.SPACE_MD)
-        preview_btn = PushButton("预览参数", card)
-        preview_btn.setToolTip(
-            "按当前图像尺寸与增强参数生成预览拼图（letterbox + 增强示意）"
+        # —— 高级（默认收起）——
+        self.advanced_btn = PushButton("高级训练参数", card)
+        self.advanced_btn.setCheckable(True)
+        self.advanced_btn.setToolTip(
+            "展开算法内置默认值已够用的一组参数与训练选项"
         )
-        preview_btn.clicked.connect(self._on_preview_params)
-        preview_row.addWidget(preview_btn)
+        self.advanced_btn.toggled.connect(self._on_advanced_toggled)
+        self.advanced_bar = QWidget(card)
+        advanced_bar = QHBoxLayout(self.advanced_bar)
+        advanced_bar.setContentsMargins(0, 0, 0, 0)
+        advanced_bar.addWidget(self.advanced_btn)
+        advanced_bar.addStretch(1)
+        layout.addWidget(self.advanced_bar)
+
+        self.advanced_holder = QWidget(card)
+        advanced_box = QVBoxLayout(self.advanced_holder)
+        advanced_box.setContentsMargins(0, 0, 0, 0)
+        advanced_box.setSpacing(T.SPACE_ML)
+
+        advanced = ParamGroup("高级", self.advanced_holder)
+        # 权重衰减要显示 0.00050（7 字符）→ 整组按 8 字符定宽（同组等宽）
+        advanced_fields: list[tuple[str, QWidget]] = []
+        advanced_fields += self._make_int_spins(
+            advanced, _ADV_INT_PARAMS, T.STEPPER_CHARS, compact=True
+        )
+        advanced_fields += self._make_float_spins(
+            advanced, _ADV_FLOAT_PARAMS, T.STEPPER_CHARS, compact=True
+        )
+        adv_keys = [key for key, *_rest in _ADV_INT_PARAMS + _ADV_FLOAT_PARAMS]
+        # DFL 留在栅格外单独一行：方便按系列（YOLO11 / 26）整行显隐
+        dfl_index = adv_keys.index("dfl")
+        dfl_label, dfl_control = advanced_fields.pop(dfl_index)
+        adv_keys.pop(dfl_index)
+        advanced_rows = advanced.add_grid(advanced_fields, columns=2)
+        self._param_rows.update(dict(zip(adv_keys, advanced_rows)))
+        advanced.align_labels(
+            [label for label, _ in advanced_fields] + [dfl_label]
+        )
+        self.dfl_spin = self._float_spins["dfl"]
+        self.dfl_row = advanced.add_field(dfl_label, dfl_control)
+        self._param_rows["dfl"] = self.dfl_row
+        self.advanced_group = advanced
+        advanced_box.addWidget(advanced)
+
+        options = ParamGroup("训练选项", self.advanced_holder)
+        container = FlowContainer(options, spacing=T.SPACE_LG)
+        for key, label in _CHECK_PARAMS:
+            box = CheckBox(label, options)
+            box.stateChanged.connect(self._on_param_changed)
+            container.add(box)
+            self._checks[key] = box
+        options.add_widget(container)
+        self.options_group = options
+        advanced_box.addWidget(options)
+
+        self.advanced_holder.setVisible(False)
+        layout.addWidget(self.advanced_holder)
+        return card
+
+    def _on_advanced_toggled(self, expanded: bool) -> None:
+        """展开 / 收起高级训练参数（纯视图状态，不进项目配置）。"""
+        self.advanced_holder.setVisible(bool(expanded))
+
+    def _build_image_card(self) -> CardWidget:
+        """图像设置：输入尺寸、通道与「图像预览」（letterbox + 增强示意）。
+
+        尺寸与通道是图像侧的输入规格（Ultralytics 的 `imgsz` / `channels`），
+        每次训练前通常要看一眼，因此独立成卡、与数据区放在一起。
+        """
+        card, layout = self._card("图像设置")
+        self.image_card = card
+        fields = self._make_int_spins(
+            card, _IMAGE_INT_PARAMS, T.STEPPER_CHARS, compact=True
+        )
+        holder = QWidget(card)
+        grid = QGridLayout(holder)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(T.SPACE_LG)
+        grid.setVerticalSpacing(T.SPACE_MD)
+        label_w = T.label_width(card, [label for label, _ in fields])
+        rows = []
+        for index, (label, control) in enumerate(fields):
+            row = FieldRow(label, control, holder, label_width=label_w)
+            grid.addWidget(row, index // 2, index % 2)
+            rows.append(row)
+        for column in range(2):
+            grid.setColumnStretch(column, 1)
+        self._param_rows.update(dict(zip(
+            [key for key, *_rest in _IMAGE_INT_PARAMS], rows
+        )))
+        layout.addWidget(holder)
+
+        preview_row = QHBoxLayout()
+        preview_row.setSpacing(T.SPACE_SM)
+        self.preview_btn = icon_button(
+            FluentIcon.VIEW, "图像预览（letterbox + 增强示意）", card
+        )
+        self.preview_btn.clicked.connect(self._on_preview_params)
+        preview_row.addWidget(self.preview_btn)
         self.preview_hint = CaptionLabel("", card)
         self.preview_hint.setWordWrap(True)
         preview_row.addWidget(self.preview_hint, 1)
         layout.addLayout(preview_row)
         return card
 
-    def _build_weight_card(self) -> CardWidget:
-        """类别权重（参考）：按训练集频次平衡，便于判断数据是否均衡。"""
-        card, layout = self._card("类别权重")
-        self.weight_hint = CaptionLabel("", card)
-        self.weight_hint.setWordWrap(True)
-        layout.addWidget(self.weight_hint)
+    def _build_device_card(self) -> CardWidget:
+        """设备配置：训练设备（auto / cpu / cuda:n）。
 
-        self.weight_holder = QWidget(card)
-        self.weight_grid = QGridLayout(self.weight_holder)
-        self.weight_grid.setContentsMargins(0, 0, 0, 0)
-        self.weight_grid.setSpacing(T.SPACE_XS)
-        layout.addWidget(self.weight_holder)
-
-        buttons = QHBoxLayout()
-        balance_btn = PushButton("平衡 (BALANCE)", card)
-        balance_btn.setToolTip(
-            "按训练集各类别频次生成逆频次权重（均值归一化为 1）"
-        )
-        balance_btn.clicked.connect(self._on_balance_weights)
-        buttons.addWidget(balance_btn)
-        reset_btn = PushButton("重置", card)
-        reset_btn.setToolTip("清除类别权重")
-        reset_btn.clicked.connect(self._on_reset_weights)
-        buttons.addWidget(reset_btn)
-        buttons.addStretch(1)
-        layout.addLayout(buttons)
+        提示文字单独一行：显卡名可能很长，与下拉挤在一行会把下拉压窄
+        （§1 一行最多两个默认控件）。
+        """
+        card, layout = self._card("设备配置")
+        row = QHBoxLayout()
+        row.setSpacing(T.SPACE_MD)
+        row.addWidget(CaptionLabel("设备", card))
+        self.device_combo = ComboBox(card)
+        for option in device_options():
+            self.device_combo.addItem(option, userData=option.split(" (")[0])
+        self.device_combo.currentIndexChanged.connect(self._on_device_changed)
+        row.addWidget(self.device_combo)
+        row.addStretch(1)
+        layout.addLayout(row)
+        self.device_hint = CaptionLabel("", card)
+        self.device_hint.setWordWrap(True)
+        layout.addWidget(self.device_hint)
         return card
 
-    def _fill_weights(self) -> None:
-        """刷新类别权重卡（数量 / 权重 / 是否已应用）。
+    def _build_distribution_card(self) -> CardWidget:
+        """类别分布（**只读**）+ 类别失衡权重强度（`cls_pw`）。
+
+        卡片只陈述训练集事实：各类别的数量与占比（检测族按标签框数、分类按
+        类别目录图片数），便于判断数据是否均衡。原先还展示「逆频次权重」并可
+        写进配置，那份字典没有任何后端消费（Ultralytics 的失衡处理是内部的
+        `cls_pw` 幂次），属误导性设置，已删除。
+
+        真正生效的开关是 `cls_pw`（0 = 关闭，1 = 完全逆频次）：权重由
+        Ultralytics 在训练开始时按训练集频次自行生成，**只有检测族**
+        （检测 / 实例分割 / 旋转框）的损失消费它，其它任务整组隐藏（§23）。
+        """
+        card, layout = self._card("类别分布")
+        self.dist_card = card
+        self.dist_hint = CaptionLabel("", card)
+        self.dist_hint.setWordWrap(True)
+        layout.addWidget(self.dist_hint)
+
+        self.dist_holder = QWidget(card)
+        self.dist_grid = QGridLayout(self.dist_holder)
+        self.dist_grid.setContentsMargins(0, 0, 0, 0)
+        self.dist_grid.setSpacing(T.SPACE_XS)
+        layout.addWidget(self.dist_holder)
+
+        # 失衡权重强度：Ultralytics `cls_pw`（训练开始时按训练集频次自动生成
+        # 逆频次权重），仅检测族显示——见 `_apply_param_visibility`
+        self.balance_row = QWidget(card)
+        balance_box = QHBoxLayout(self.balance_row)
+        balance_box.setContentsMargins(0, 0, 0, 0)
+        balance_box.setSpacing(T.SPACE_MD)
+        balance_box.addWidget(CaptionLabel("失衡权重", self.balance_row))
+        self.cls_pw_spin = SafeDoubleSpinBox(self.balance_row)
+        self.cls_pw_spin.setRange(0.0, 1.0)
+        self.cls_pw_spin.setSingleStep(0.05)
+        self.cls_pw_spin.setDecimals(2)
+        self.cls_pw_spin.setValue(0.0)
+        self.cls_pw_spin.setFixedWidth(
+            T.field_width(self.cls_pw_spin, T.STEPPER_CHARS_NARROW)
+        )
+        self.cls_pw_spin.setToolTip(
+            "类别失衡权重强度：训练开始时按训练集类别频次生成逆频次权重，"
+            "1 = 完全逆频次，0 = 关闭"
+        )
+        self.cls_pw_spin.valueChanged.connect(self._on_param_changed)
+        self._float_spins["cls_pw"] = self.cls_pw_spin
+        balance_box.addWidget(self.cls_pw_spin)
+        balance_box.addStretch(1)
+        layout.addWidget(self.balance_row)
+        return card
+
+    def _fill_distribution(self) -> None:
+        """刷新类别分布卡（数量 / 占比 / 悬殊比）。
 
         统计要扫训练集标签，而刷新链路会被参数改动频繁触发——用输入签名
         挡掉无变化的重算重绘。**切换拆分 / 重新分配拆分必须跟着刷新**
@@ -1020,43 +1239,40 @@ class TrainTab(QWidget):
         if signature == self._weight_inputs_rendered:
             return
         self._weight_inputs_rendered = signature
-        while self.weight_grid.count():
-            item = self.weight_grid.takeAt(0)
+        while self.dist_grid.count():
+            item = self.dist_grid.takeAt(0)
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
-        rows = self._vm.class_weight_rows()
+        rows = self._vm.class_distribution()
         if not rows:
-            self.weight_hint.setText("暂无可统计的训练集")
+            self.dist_hint.setText("暂无可统计的训练集")
             return
         for index, row in enumerate(rows):
-            self.weight_grid.addWidget(
+            self.dist_grid.addWidget(
                 CaptionLabel(
-                    f"{row['name']} · {row['count']} 个 · 权重 {row['weight']:.2f}",
-                    self.weight_holder,
+                    f"{row['name']} · {row['count']}（{row['share']:.0f}%）",
+                    self.dist_holder,
                 ),
                 index // 2, index % 2,
             )
-        applied = all(row["applied"] for row in rows)
-        self.weight_hint.setText(
-            "已应用逆频次权重" if applied else "建议权重（未写入训练配置）"
+        counts = [row["count"] for row in rows]
+        fewest = min(counts)
+        self.dist_hint.setText(
+            "各类别数量一致" if fewest <= 0 or max(counts) == fewest
+            else f"最悬殊 1:{max(counts) / fewest:.0f}"
         )
 
     def _weight_inputs(self) -> tuple:
-        """权重卡的输入签名：训练集统计只依赖这些（不含磁盘内容）。"""
+        """类别分布卡的输入签名：训练集统计只依赖这些（不含磁盘内容）。"""
         config = self._vm.config
         split = (
             self._dataset_vm.active_split()
             if self._dataset_vm is not None else None
         )
-        stored = dict(getattr(config, "class_weights", {}) or {})
         return (
             int(getattr(config, "split_id", 0) or 0),
             str(getattr(config, "task_type", "") or ""),
-            str(getattr(config, "anomaly_root", "") or ""),
-            tuple(sorted(
-                (str(key), float(value)) for key, value in stored.items()
-            )),
             0 if split is None else int(split.split_id),
             0 if split is None else int(split.total()),
         )
@@ -1074,47 +1290,93 @@ class TrainTab(QWidget):
             " · 每格为 letterbox 后的训练输入示意（mosaic / mixup 未体现）",
         ).exec()
 
-    def _on_balance_weights(self) -> None:
-        self._vm.balance_class_weights()
-        self._fill_weights()
+    def _apply_param_visibility(self) -> None:
+        """按**后端能力** + 任务 + 模型系列显隐参数：设了不生效就不显示（§23）。
 
-    def _on_reset_weights(self) -> None:
-        self._vm.reset_class_weights()
-        self._fill_weights()
+        三条口径：
+        1. **后端消费范围**（`BackendAdapter.train_param_keys`）：自研 U-Net
+           只吃轮数 / 批次 / 尺寸 / 学习率 / 种子，Anomalib 只吃轮数 / 批次 /
+           种子——名单外的字段整行隐藏，整组都不支持时连组与「高级」入口一起
+           隐藏（`build_args` 同样只传这些）；
+        2. **检测族**（`is_detection_family`）：「失衡权重」`cls_pw` 与
+           「DFL 增益」只在这类任务的损失里生效（分类是无权重 CrossEntropy）；
+        3. **模型系列**：YOLO26 是 `reg_max=1` 的 L1 回归，`dfl` 被忽略。
+        """
+        task = str(self._vm.config.task_type or "detect")
+        backend = backend_for_task(task)
+        detection = is_detection_family(task)
+
+        for key, row in self._param_rows.items():
+            row.setVisible(backend.supports_train_param(key))
+        self.options_group.setVisible(backend.supports_train_param("deterministic"))
+        self.aug_card.setVisible(backend.supports_train_param("augment"))
+        self.image_card.setVisible(
+            backend.supports_train_param("imgsz")
+            or backend.supports_train_param("channels")
+        )
+        advanced_any = any(
+            backend.supports_train_param(key)
+            for key in ("patience", "close_mosaic", "workers", "weight_decay",
+                        "momentum", "warmup_epochs", "dropout", "dfl")
+        )
+        self.advanced_bar.setVisible(advanced_any)
+        if not advanced_any:
+            self.advanced_holder.setVisible(False)
+
+        self.balance_row.setVisible(detection)
+        self.dist_card.setVisible(supports_class_counts(task))
+        self.dfl_row.setVisible(
+            detection and uses_dfl(self._current_model_key())
+            and backend.supports_train_param("dfl")
+        )
 
     def _build_aug_card(self) -> CardWidget:
+        """数据增强：全局开关 + **逐项启用**开关 + 数值。
+
+        每项 = 「勾选（是否启用）+ 数值（概率 / 幅度）」：取消勾选时该项按 0
+        下发（Ultralytics 里 0 = 关闭），**数值本身保留在配置里**，重新勾选
+        即恢复——不会因为试一次就丢掉调好的概率。
+        """
         card, layout = self._card("数据增强")
+        self.aug_card = card
         self.augment_check = CheckBox("启用图像增强", card)
         self.augment_check.setChecked(True)
         self.augment_check.stateChanged.connect(self._on_augment_toggled)
         layout.addWidget(self.augment_check)
 
-        self.aug_holder = QWidget(card)
-        grid = QGridLayout(self.aug_holder)
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setSpacing(T.SPACE_MD)
-        for index, (key, label, minimum, maximum, default, step) in enumerate(
-            _AUG_PARAMS
-        ):
-            box = QWidget(self.aug_holder)
-            row = QHBoxLayout(box)
-            row.setContentsMargins(0, 0, 0, 0)
-            row.setSpacing(T.SPACE_SM)
-            row.addWidget(CaptionLabel(label, box))
-            spin = SafeDoubleSpinBox(box)
+        # 每项 = 一个逻辑分组（勾选 + 数值），容器化后按宽度折行：窄侧栏 /
+        # 大字体下不会把标签压没（§1，实测三列栅格会把勾选文字整段挤掉）
+        self.aug_holder = FlowContainer(
+            card, spacing=T.SPACE_MD, margins=(0, 0, 0, 0)
+        )
+        for key, label, minimum, maximum, default, step in _AUG_PARAMS:
+            box_check = CheckBox(label, card)
+            box_check.setToolTip(f"启用「{label}」")
+            box_check.toggled.connect(self._on_augment_item_toggled)
+            # 紧凑步进器：省 54px/个，「勾选 + 数值」才能两列并排而不撐破卡片
+            spin = SafeCompactDoubleSpinBox(card)
             spin.setRange(minimum, maximum)
             spin.setSingleStep(step)
             spin.setDecimals(3 if step < 0.01 else 2)
             spin.setValue(default)
-            # 定宽步进器：不再拉伸填满栅格
             spin.setFixedWidth(T.field_width(spin, T.STEPPER_CHARS_NARROW))
             spin.valueChanged.connect(self._on_param_changed)
-            row.addWidget(spin)
-            row.addStretch(1)
-            grid.addWidget(box, index // 3, index % 3)
+            self.aug_holder.add(ToolGroup(box_check, spin, parent=card))
             self._aug_spins[key] = spin
+            self._aug_checks[key] = box_check
         layout.addWidget(self.aug_holder)
         return card
+
+    def _on_augment_item_toggled(self, _checked: bool) -> None:
+        """某一项增强的启用开关：联动数值框可用性与配置中的启用标记。"""
+        if self._syncing:
+            return
+        sender = self.sender()
+        for key, box in self._aug_checks.items():
+            if box is sender:
+                self._aug_spins[key].setEnabled(box.isChecked())
+                break
+        self._on_param_changed()
 
     # --------------------------------------------------- 结果页
     def _build_results_pane(self) -> QWidget:
@@ -1310,6 +1572,7 @@ class TrainTab(QWidget):
         self._update_variant_desc(key)
         # 选中官方变体 → 导入的权重退出（配置清空，变体生效）
         self._apply({"model_key": key, "weights_path": ""})
+        self._apply_param_visibility()      # 换系列后 DFL 等项显隐跟着变
 
     def _update_variant_desc(self, key: str) -> None:
         """显示变体描述（key 可能带任务后缀，如分类的 yolo11n-cls）。
@@ -1344,9 +1607,16 @@ class TrainTab(QWidget):
         self._on_param_changed()
 
     def _update_device_hint(self) -> None:
-        """显示当前实际会用的设备（一眼确认有没有走 GPU）。"""
+        """显示当前实际会用的设备（一眼确认有没有走 GPU）。
+
+        用不到 GPU 时文字里带**原因**（CPU 版 PyTorch / 无可用 CUDA），
+        下一步操作（装 CUDA 版 PyTorch 的命令）放在 tooltip（§10）。
+        """
         device = str(self.device_combo.currentData() or "auto")
         self.device_hint.setText(device_label(device))
+        help_text = device_help()
+        self.device_hint.setToolTip(help_text)
+        self.device_combo.setToolTip(help_text)
 
     def _on_augment_toggled(self, _state: int) -> None:
         enabled = self.augment_check.isChecked()
@@ -1376,6 +1646,11 @@ class TrainTab(QWidget):
             "anomaly_root": self.anomaly_edit.text().strip(),
             "anomaly_pretrained": self.anomaly_check.isChecked(),
             "augment": self.augment_check.isChecked(),
+            # 逐项启用标记：取消勾选的项按 0 下发（见 TrainingConfig.augment_value），
+            # 数值本身仍原样保存，重新勾选即恢复
+            "augment_enabled": {
+                key: box.isChecked() for key, box in self._aug_checks.items()
+            },
         }
         for key, spin in self._int_spins.items():
             values[key] = spin.value()
@@ -1421,6 +1696,15 @@ class TrainTab(QWidget):
                 spin.setValue(float(getattr(config, key, spin.value()) or 0.0))
             self.augment_check.setChecked(bool(getattr(config, "augment", True)))
             self.aug_holder.setEnabled(self.augment_check.isChecked())
+            # 逐项启用：旧项目没这个标记 → 按「值 > 0」推断
+            for key, box in self._aug_checks.items():
+                enabled = (
+                    config.augment_enabled_for(key)
+                    if hasattr(config, "augment_enabled_for")
+                    else float(getattr(config, key, 0.0) or 0.0) > 0.0
+                )
+                box.setChecked(bool(enabled))
+                self._aug_spins[key].setEnabled(bool(enabled))
 
             index = self.opt_combo.findText(str(getattr(config, "optimizer", "auto")))
             self.opt_combo.setCurrentIndex(max(0, index))
@@ -1455,6 +1739,7 @@ class TrainTab(QWidget):
                 bool(getattr(config, "anomaly_pretrained", True))
             )
             self.anomaly_row.setVisible(config.task_type == "anomaly")
+            self._apply_param_visibility()
         finally:
             self._syncing = False
 
@@ -1492,7 +1777,7 @@ class TrainTab(QWidget):
     def _refresh_split(self) -> None:
         """拆分下拉 + 占比图（一个项目可有多套拆分，训练前先选一套）。"""
         # 类别权重按当前拆分的训练集统计：拆分切换 / 重新分配后一并刷新
-        self._fill_weights()
+        self._fill_distribution()
         config = self._vm.config
         splits = (
             self._dataset_vm.splits_ready() if self._dataset_vm is not None else []

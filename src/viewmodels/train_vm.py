@@ -30,7 +30,7 @@ from src.utils.constants import (
 )
 from src.utils.image_ops import build_param_preview
 from src.utils.logger import get_logger
-from src.utils.tasks import task_metrics, task_of
+from src.utils.tasks import supports_class_counts, task_metrics, task_of
 from src.viewmodels.project_vm import ProjectViewModel
 
 logger = get_logger("train_vm")
@@ -706,28 +706,22 @@ class TrainViewModel(QObject):
         return written
 
     # -----------------------------------------------------------
-    # 类别权重（参考：按训练集频次平衡）
+    # 类别分布（只读：按当前拆分的训练集统计）
     # -----------------------------------------------------------
     def train_class_counts(self) -> dict[str, int]:
-        """训练集各类别的样本数。
+        """训练集各类别的样本数（只统计有类别频次口径的任务）。
 
-        分类任务按类别目录里的图片数统计；检测 / 分割按标签文件里的**框数**
-        统计（更贴近损失里的类别占比）；异常检测按 normal / abnormal 两个目录。
+        分类任务按类别目录里的图片数统计；检测 / 分割 / 旋转框按标签文件里的
+        **框数**统计（更贴近损失里的类别占比）。语义分割按像素掩码标注、异常
+        检测只有正常样本，都没有「类别频次」这个口径（`tasks.class_counts`）
+        → 返回空，界面整卡隐藏。
         """
         project = self._project_vm.project if self._project_vm else None
         if project is None:
             return {}
         config = self._config
-        if str(config.task_type) == "anomaly":
-            root = str(config.anomaly_root or "")
-            if not root:
-                return {}
-            counts = {}
-            for name in ("normal", "abnormal"):
-                folder = Path(root) / name
-                if folder.is_dir():
-                    counts[name] = len(DatasetService.scan_images(folder))
-            return counts
+        if not supports_class_counts(str(config.task_type)):
+            return {}
         split = project.split_by_id(int(config.split_id)) or project.active_split()
         if split is None or not split.ready:
             return {}
@@ -763,62 +757,25 @@ class TrainViewModel(QObject):
                 counts[name] = counts.get(name, 0) + 1
         return {name: value for name, value in counts.items() if name}
 
-    def suggest_class_weights(self) -> dict[str, float]:
-        """按逆频次给出建议权重，再做均值归一化（平均权重 = 1）。
+    def class_distribution(self) -> list[dict]:
+        """类别分布（**只读**）：名称 / 数量 / 占比，供界面展示。
 
-        逆频次保证「样本少的类别权重高」；再做一次均值归一化，保证整体损失
-        量级不变（平均权重 1.0），便于横向比较不同数据集。频次为 0 的类别
-        给 1.0（不干预）。
+        原先这里还额外算了「逆频次权重」并可写进配置，但没有任何后端消费那份
+        字典（Ultralytics 的类别失衡是内部的 `cls_pw` 幂次，见 §4.72）——
+        误导性设置已删除，只留数据本身的分布事实。
         """
         counts = self.train_class_counts()
         total = sum(counts.values())
         if not counts or total <= 0:
-            return {}
-        average = total / len(counts)
-        raw = {
-            name: (average / count if count else 1.0)
+            return []
+        return [
+            {
+                "name": name,
+                "count": int(count),
+                "share": float(count) / total * 100.0,
+            }
             for name, count in counts.items()
-        }
-        mean = sum(raw.values()) / len(raw)
-        if mean <= 0:
-            return {}
-        return {name: round(value / mean, 4) for name, value in raw.items()}
-
-    def class_weights(self) -> dict[str, float]:
-        """当前类别权重（未设置时给出建议值，仅用于展示）。"""
-        stored = dict(getattr(self._config, "class_weights", {}) or {})
-        return stored or self.suggest_class_weights()
-
-    def class_weight_rows(self) -> list[dict]:
-        """「类别 → 数量 / 权重」列表（供界面展示）。"""
-        counts = self.train_class_counts()
-        stored = dict(getattr(self._config, "class_weights", {}) or {})
-        weights = stored or self.suggest_class_weights()
-        rows = []
-        for name, count in counts.items():
-            rows.append({
-                "name": name, "count": int(count),
-                "weight": float(weights.get(name, 1.0) or 1.0),
-                "applied": name in stored,
-            })
-        return rows
-
-    def balance_class_weights(self) -> dict[str, float]:
-        """一键平衡（BALANCE）：按训练集频次生成逆频次权重。"""
-        weights = self.suggest_class_weights()
-        if not weights:
-            self.message.emit("warning", "没有可用的训练集统计，无法平衡类别权重")
-            return {}
-        self.update_config(class_weights=weights)
-        self.message.emit("success", f"已按训练集频次平衡 {len(weights)} 个类别")
-        return weights
-
-    def reset_class_weights(self) -> None:
-        """清除类别权重（回到不干预）。"""
-        if not dict(getattr(self._config, "class_weights", {}) or {}):
-            return
-        self.update_config(class_weights={})
-        self.message.emit("success", "已清除类别权重")
+        ]
 
     def set_task_type(self, task_type: str) -> None:
         self.update_config(task_type=task_type)

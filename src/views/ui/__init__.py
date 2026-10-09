@@ -29,6 +29,7 @@ from src.views.ui.flow_layout import FlowContainer, FlowLayout
 from src.views.ui.icons import bind_icon, icon, refresh_icons
 from src.views.ui.wheel_guard import (
     ALLOW_WHEEL_ATTR,
+    SafeCompactDoubleSpinBox,
     SafeCompactSpinBox,
     SafeDoubleSpinBox,
     SafeSpinBox,
@@ -45,6 +46,7 @@ __all__ = [
     "SafeSpinBox",
     "SafeDoubleSpinBox",
     "SafeCompactSpinBox",
+    "SafeCompactDoubleSpinBox",
     "ALLOW_WHEEL_ATTR",
     "ParamGroup",
     "ToolGroup",

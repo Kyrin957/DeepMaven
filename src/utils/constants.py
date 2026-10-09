@@ -86,6 +86,21 @@ def base_variant_key(key: str) -> str:
             return text[: -len(suffix)]
     return text
 
+
+# 无 DFL 的模型系列：YOLO26 的 yaml 是 `reg_max: 1`（直接 L1 回归），
+# YOLO11 是 `reg_max: 16`（DFL 分布回归）——`dfl` 增益对 26 不生效
+_NO_DFL_SERIES = ("yolo26",)
+
+
+def uses_dfl(key: str) -> bool:
+    """该模型变体是否使用 DFL 回归头（决定「DFL 增益」是否可设置）。
+
+    依据 Ultralytics 模型 yaml：`yolo26*.yaml` 为 `reg_max: 1` → 回归走 L1
+    （损失名 `l1_loss`），`dfl` 参数被忽略；`yolo11*.yaml` 为 `reg_max: 16`
+    → DFL 生效。**设了不生效的参数一律不在界面上显示**（UI 规则 §23）。
+    """
+    return not base_variant_key(key).startswith(_NO_DFL_SERIES)
+
 # ---------------------------------------------------------------
 # 项目类型（深度学习任务）——定义在任务注册表 src/utils/tasks.py
 # 每个类型的能力（标注方式 / 模型后缀 / 支持状态 / 数据布局 / 指标 /
@@ -107,8 +122,11 @@ def project_type(key: str) -> dict:
 ANOMALY_NORMAL_DIR = "normal"
 ANOMALY_ABNORMAL_DIR = "abnormal"
 
-# 优化器
-OPTIMIZERS = ["auto", "SGD", "Adam", "AdamW", "RMSProp"]
+# 优化器（与 Ultralytics `engine/trainer.py::build_optimizer` 的注册表一致：
+# auto 在迭代数 > 10000 时选 MuSGD，否则 AdamW）
+OPTIMIZERS = [
+    "auto", "MuSGD", "SGD", "Adam", "AdamW", "Adamax", "NAdam", "RAdam", "RMSProp",
+]
 
 # 划分比例（训练/验证/测试）
 DEFAULT_SPLIT = (0.7, 0.2, 0.1)

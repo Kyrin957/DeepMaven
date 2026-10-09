@@ -32,6 +32,12 @@ class UnetBackend(BackendAdapter):
     label = "U-Net"
     tasks = ("semantic",)
 
+    # 自研 U-Net 的 worker 只吃这些：求解器固定 Adam、无增强 / 无 DFL / 无通道选择
+    # （界面据此隐藏其余字段，避免"设了不生效"，见 §4.72）
+    train_param_keys = frozenset({
+        "epochs", "batch", "imgsz", "lr", "seed", "device",
+    })
+
     # -----------------------------------------------------------
     # 环境
     # -----------------------------------------------------------

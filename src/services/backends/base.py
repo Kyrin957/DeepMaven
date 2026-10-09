@@ -138,6 +138,18 @@ class BackendAdapter:
         """构造子进程命令行参数（模块入口 + 参数）。"""
         raise NotImplementedError
 
+    # -----------------------------------------------------------
+    # 训练参数的适用范围（界面据此显隐，见 §4.72 / §27）
+    # -----------------------------------------------------------
+    #: 该后端**真正消费**的训练参数键；``None`` = 全部适用（YOLO 系）。
+    #: 子类给白名单后，界面把不在名单里的字段整行隐藏——不显示"设了不生效"的项。
+    train_param_keys: frozenset[str] | None = None
+
+    def supports_train_param(self, key: str) -> bool:
+        """该后端是否消费这个训练参数（界面显隐与后端 `build_args` 同源）。"""
+        keys = self.train_param_keys
+        return keys is None or str(key) in keys
+
     def candidates(self, task: str) -> list[dict]:
         """该任务的模型候选（[{"key": 权重名或变体 key, "label": 显示名}]）。"""
         return []

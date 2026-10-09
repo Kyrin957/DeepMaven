@@ -30,6 +30,13 @@ class AnomalibBackend(BackendAdapter):
     label = "Anomalib"
     tasks = ("anomaly",)
 
+    # 无监督训练：只用轮数 / 批次 / 种子 + 数据目录与算法（学习率、输入尺寸、
+    # 增强等由算法内部决定，界面据此隐藏，见 §4.72）
+    train_param_keys = frozenset({
+        "epochs", "batch", "seed", "device",
+        "anomaly_root", "anomaly_pretrained",
+    })
+
     # -----------------------------------------------------------
     # 环境
     # -----------------------------------------------------------

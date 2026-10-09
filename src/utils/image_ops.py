@@ -96,8 +96,19 @@ def _letterbox(image, size: int, pad: int = LETTERBOX_PAD):
     return board
 
 
+def _augment_value(config, key: str) -> float:
+    """该增强项的生效值：配置提供 `augment_value` 时按**逐项启用**取（0 = 关）。"""
+    helper = getattr(config, "augment_value", None)
+    if callable(helper):
+        return float(helper(key) or 0.0)
+    return float(getattr(config, key, 0.0) or 0.0)
+
+
 def augment_preview_image(image, config, rng):
     """按训练增强参数处理一张图（**示意**：翻转 / 旋转 / 缩放 / HSV）。
+
+    取的是**生效值**（`TrainingConfig.augment_value`）：界面上关掉的增强项
+    在这里不会被应用，预览与真正下发给训练的参数一致。
 
     Returns:
         (处理后的 PIL 图像, 生效的增强说明列表)。mosaic / mixup 需要多张图
@@ -108,13 +119,15 @@ def augment_preview_image(image, config, rng):
     import numpy as np
 
     applied: list[str] = []
-    if float(getattr(config, "hflip", 0.0) or 0.0) > 0 and rng.random() < float(config.hflip):
+    hflip = _augment_value(config, "hflip")
+    if hflip > 0 and rng.random() < hflip:
         image = image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
         applied.append("水平翻转")
-    if float(getattr(config, "vflip", 0.0) or 0.0) > 0 and rng.random() < float(config.vflip):
+    vflip = _augment_value(config, "vflip")
+    if vflip > 0 and rng.random() < vflip:
         image = image.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
         applied.append("垂直翻转")
-    degrees = float(getattr(config, "degrees", 0.0) or 0.0)
+    degrees = _augment_value(config, "degrees")
     if degrees > 0:
         angle = rng.uniform(-degrees, degrees)
         if abs(angle) > 0.05:
@@ -123,7 +136,7 @@ def augment_preview_image(image, config, rng):
                 fillcolor=(LETTERBOX_PAD, LETTERBOX_PAD, LETTERBOX_PAD),
             )
             applied.append(f"旋转 {angle:+.0f}°")
-    scale = float(getattr(config, "scale", 0.0) or 0.0)
+    scale = _augment_value(config, "scale")
     if scale > 0:
         factor = 1.0 + rng.uniform(-scale, scale)
         width, height = image.size
@@ -141,7 +154,7 @@ def augment_preview_image(image, config, rng):
     for key, label, span in (
         ("hsv_h", "色调", 0.5), ("hsv_s", "饱和", 1.0), ("hsv_v", "亮度", 1.0),
     ):
-        value = float(getattr(config, key, 0.0) or 0.0)
+        value = _augment_value(config, key)
         if value <= 0:
             continue
         gain = 1.0 + rng.uniform(-value, value) * span

@@ -24,9 +24,11 @@ from src.utils.constants import (
     PROJECT_ROOT,
     TASK_MODEL_SUFFIX,
     YOLO_MODEL_VARIANTS,
+    uses_dfl,
 )
 from src.utils.device import normalize_device
 from src.utils.pretrained import resolve_pretrained
+from src.utils.tasks import is_detection_family
 
 
 class YoloBackend(BackendAdapter):
@@ -77,6 +79,7 @@ class YoloBackend(BackendAdapter):
             "--epochs", str(config.epochs),
             "--batch", str(config.batch),
             "--imgsz", str(config.imgsz),
+            "--channels", str(config.channels),
             "--lr", str(config.lr),
             "--optimizer", config.optimizer,
             "--weight-decay", str(config.weight_decay),
@@ -97,18 +100,30 @@ class YoloBackend(BackendAdapter):
             "--project", config.project_dir or str(PROJECT_ROOT / "runs"),
             "--name", config.model_key,
             "--augment" if config.augment else "--no-augment",
-            "--hflip", str(config.hflip),
-            "--vflip", str(config.vflip),
-            "--degrees", str(config.degrees),
-            "--scale", str(config.scale),
-            "--translate", str(config.translate),
-            "--hsv-h", str(config.hsv_h),
-            "--hsv-s", str(config.hsv_s),
-            "--hsv-v", str(config.hsv_v),
-            "--mosaic", str(config.mosaic),
-            "--mixup", str(config.mixup),
+            # 增强逐项生效值：未启用的项按 0 下发（Ultralytics 里 0 = 关闭），
+            # 数值本身保留在配置里，重新启用即可恢复
+            "--hflip", str(config.augment_value("hflip")),
+            "--vflip", str(config.augment_value("vflip")),
+            "--degrees", str(config.augment_value("degrees")),
+            "--scale", str(config.augment_value("scale")),
+            "--translate", str(config.augment_value("translate")),
+            "--hsv-h", str(config.augment_value("hsv_h")),
+            "--hsv-s", str(config.augment_value("hsv_s")),
+            "--hsv-v", str(config.augment_value("hsv_v")),
+            "--mosaic", str(config.augment_value("mosaic")),
+            "--mixup", str(config.augment_value("mixup")),
             "--pause-file", str(pause_file(config)),
         ]
+        # 检测族专属参数：分类任务（无权重 CrossEntropy、无回归头）、语义分割
+        # （自研 U-Net）、异常检测（无监督）都不适用 —— **不传**，界面同样不
+        # 显示（避免"设了不生效"）
+        if is_detection_family(config.task_type):
+            # 类别失衡权重强度（Ultralytics `cls_pw`：0 = 关闭，1 = 完全逆频次）
+            args += ["--cls-pw", str(config.cls_pw)]
+            # DFL 增益：仅 YOLO11 系列（reg_max=16）；YOLO26 是 reg_max=1 的
+            # L1 回归，该参数被 Ultralytics 忽略，因此不传
+            if uses_dfl(config.model_key):
+                args += ["--dfl", str(config.dfl)]
         if config.resume:
             args.append("--resume")
         return args

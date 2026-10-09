@@ -114,6 +114,15 @@ class ParamGroup(QFrame):
     # -----------------------------------------------------------
     # 添加内容
     # -----------------------------------------------------------
+    def align_labels(self, labels) -> int:
+        """把本组的标签列宽统一为所列标签里最长的一个（字体度量，见 §2）。
+
+        批量添加字段（``add_fields`` / ``add_grid``）会自动调用；单独
+        ``add_field`` 想和同组其它行对齐时也可显式调用一次。
+        """
+        self._label_width = T.label_width(self, labels)
+        return self._label_width
+
     def add_field(self, label: str, control: QWidget) -> FieldRow:
         """添加一行「标签 + 控件」并把控件限制为有界宽度。"""
         row = FieldRow(label, control, self, label_width=self._label_width)
@@ -127,22 +136,38 @@ class ParamGroup(QFrame):
         self._body.addLayout(layout)
 
     def add_fields(self, fields: list[tuple[str, QWidget]]) -> None:
-        """批量添加字段；两列以上的情况见 ``add_grid``。"""
+        """批量添加字段；两列以上的情况见 ``add_grid``。
+
+        同一批字段的标签列宽**统一**（取最长标签），控件成列对齐。
+        """
+        self.align_labels([label for label, _ in fields])
         for label, control in fields:
             self.add_field(label, control)
 
-    def add_grid(self, fields: list[tuple[str, QWidget]], columns: int = 2) -> None:
-        """以网格排布字段（窄容器里的紧凑排法）。"""
+    def add_grid(
+        self, fields: list[tuple[str, QWidget]], columns: int = 2
+    ) -> list[FieldRow]:
+        """以网格排布字段（窄容器里的紧凑排法），返回各字段的行控件。
+
+        栅格里每一行的标签列宽**统一**（取最长标签）——否则「训练轮数」与
+        「学习率」这类长短不一的标签会让两列输入框参差不齐。
+
+        返回行控件便于调用方按能力**整行显隐**（如某后端不消费该参数）。
+        """
+        self.align_labels([label for label, _ in fields])
         grid = QGridLayout()
         grid.setContentsMargins(0, 0, 0, 0)
         grid.setHorizontalSpacing(T.SPACE_LG)
         grid.setVerticalSpacing(T.SPACE_SM)
+        rows: list[FieldRow] = []
         for index, (label, control) in enumerate(fields):
             holder = FieldRow(label, control, self, label_width=self._label_width)
             grid.addWidget(holder, index // columns, index % columns)
+            rows.append(holder)
         for column in range(columns):
             grid.setColumnStretch(column, 1)
         self._body.addLayout(grid)
+        return rows
 
     def add_stretch(self) -> None:
         self._body.addStretch(1)
