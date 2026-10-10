@@ -270,6 +270,24 @@ class CategoryService:
             return _pick(colors, used_upper, spare=BAD_COLORS)
         return _pick(NEUTRAL_COLORS, used_upper)
 
+    @staticmethod
+    def kind_for_name(name: str) -> str:
+        """按名称语义推荐**异常检测的类别类型**：``normal`` / ``abnormal`` / ``""``。
+
+        与类别配色**共用同一套判定**（`_semantic_group`），保证「颜色是绿的」
+        与「类型是良好」永远同一个结论：
+
+        * 良品族（良品 / 合格 / OK / NORMAL / PASS…）→ ``"normal"``；
+        * 不良与具体缺陷名（异常 / 缺陷 / NG / DEFECT / 划痕 / 脏污…）→ ``"abnormal"``；
+        * 判不出来（如 ``dataset_1`` / ``part``）→ 空串，由调用方决定兜底
+          （导入弹窗保留「良好」）。
+
+        用于「导入图像」弹窗的类别类型默认值：文件夹 / 类别名自带语义时，
+        `abnormal/` 目录不必人工逐行切换。
+        """
+        group, _tier = _semantic_group(str(name or ""), "")
+        return {"good": "normal", "bad": "abnormal"}.get(group, "")
+
     # -----------------------------------------------------------
     # 增删改
     # -----------------------------------------------------------

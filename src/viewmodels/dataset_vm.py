@@ -1785,18 +1785,29 @@ class DatasetViewModel(QObject):
             "all": len(images),
         }
 
-    def anomaly_allocation(self) -> dict[str, dict[str, int]]:
-        """当前拆分按类别的分配数量（行和恒等于该类图片数）。
+    def anomaly_allocation(
+        self, stored: dict | None = None, ratios: tuple | None = None
+    ) -> dict[str, dict[str, int]]:
+        """按类别（良好 / 异常）的分配数量（行和恒等于该类图片数）。
 
-        未配置过时给一份按当前比例的建议值；异常图的训练数量恒为 0
-        （异常检测只用正常样本训练，异常图进验证 / 测试）。
+        Args:
+            stored: 已保存的分配 ``{kind: {子集: 数量}}``；缺省取**当前拆分**的
+                `Split.anomaly_counts`，为空时按 `ratios` 给建议值。
+            ratios: 建议值的比例（缺省取数据集当前比例）。
+
+        异常图的训练数量恒为 0（异常检测只用正常样本训练，异常图进验证 /
+        测试）——与 `DatasetService._allocate_by_kind` 同一约定。
         """
-        stored = getattr(self.active_split(), "anomaly_counts", None) or {}
+        stored = (
+            (getattr(self.active_split(), "anomaly_counts", None) or {})
+            if stored is None else (stored or {})
+        )
         totals = self.anomaly_totals()
         dataset = self._dataset
-        ratio = (
-            dataset.split_train, dataset.split_val, dataset.split_test
-        ) if dataset is not None else (0.7, 0.2, 0.1)
+        ratio = ratios or (
+            (dataset.split_train, dataset.split_val, dataset.split_test)
+            if dataset is not None else (0.7, 0.2, 0.1)
+        )
         plan: dict[str, dict[str, int]] = {}
         for kind in ("normal", "abnormal"):
             weights = {

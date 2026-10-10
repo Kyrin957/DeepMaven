@@ -6,8 +6,13 @@
     创建：取消 / 创建拆分并执行分配
     编辑：取消 / 保存拆分并重新分配
 
-联动规则与拆分页一致：**改动项精确定值**，其余两项按各自当前值比例
-吸收剩余（数量模式合计 = 总数、百分比模式合计 = 100）；输出比例以
+**异常检测项目走单独的分配表**（`anomaly=` 给出时）：训练只用良好图像，
+所以按类别分成两组——「良好图像 (n)」与「异常图像 (m)」，每组的训练 / 验证 /
+测试各自「数量 ↔ 百分比」联动；异常图的训练格固定 0 并禁用（约束用控件可用性
+表达，说明走 tooltip）。环形图按**合并口径**预览（训练 / 验证 / 测试）。
+
+联动规则与拆分页一致：**改动项精确定值**，同一类别内其余项按各自当前值比例
+吸收剩余（数量模式合计 = 该类总数、百分比模式合计 = 100）；输出比例以
 数量口径为准（数量 / 总数）——「设 100 张」划分即 100 张。
 """
 
@@ -15,6 +20,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -26,6 +32,7 @@ from qfluentwidgets import (
     CheckBox,
     LineEdit,
     MessageBoxBase,
+    StrongBodyLabel,
     SubtitleLabel,
 )
 
@@ -44,6 +51,9 @@ CANCEL = ""
 CREATE_APPLY = "create_apply"
 SAVE_APPLY = "save_apply"
 
+# 异常检测的分组标题（类型键 → 显示名）
+_KIND_LABELS = {"normal": "良好图像", "abnormal": "异常图像"}
+
 
 class SplitEditDialog(MessageBoxBase):
     """拆分创建 / 编辑弹窗。"""
@@ -58,14 +68,32 @@ class SplitEditDialog(MessageBoxBase):
         ratios: tuple = (0.7, 0.2, 0.1),
         seed: int = 0,
         stratified: bool = True,
+        anomaly: dict | None = None,
     ):
+        """`anomaly` 给出时走**异常检测的按类别分配表**。
+
+        Args:
+            anomaly: ``{"totals": {"normal": n, "abnormal": m},
+                "plan": {kind: {子集: 数量}}}``——totals 决定每组的分母，
+                plan 为初值（缺省时按 `ratios` 建议）。
+        """
         super().__init__(parent)
         self._mode = mode
         self._total = max(0, int(total))
         self._syncing = False
         self._choice = CANCEL
+        self._anomaly = anomaly or None
+        self._anomaly_totals: dict[str, int] = dict(
+            (self._anomaly or {}).get("totals") or {}
+        )
+        self._anomaly_plan: dict[str, dict[str, int]] = {
+            kind: {sub: max(0, int(value)) for sub, value in (rows or {}).items()}
+            for kind, rows in ((self._anomaly or {}).get("plan") or {}).items()
+        }
 
-        self.widget.setMinimumWidth(T.CTRL_W_XL * 3)
+        self.widget.setMinimumWidth(
+            T.CTRL_W_XL * (4 if self._anomaly else 3)
+        )
         self.titleLabel = SubtitleLabel(
             "创建拆分" if mode == MODE_CREATE else "编辑拆分", self
         )
@@ -82,7 +110,9 @@ class SplitEditDialog(MessageBoxBase):
         self.pie = PieChart(self)
         self.pie.setFixedWidth(T.CTRL_W_XL)
         body.addWidget(self.pie, 0, Qt.AlignmentFlag.AlignTop)
-        body.addLayout(self._build_table(), 1)
+        body.addLayout(
+            self._build_anomaly_table() if self._anomaly else self._build_table(), 1
+        )
         self.viewLayout.addLayout(body)
 
         # 自定义随机种子（勾选后才生效；不勾选 = 保持现有 / 默认 0）
@@ -104,8 +134,11 @@ class SplitEditDialog(MessageBoxBase):
         seed_row.addStretch(1)
         self.viewLayout.addLayout(seed_row)
 
+        # 分层抽样只对「按比例 + 分层」的常规拆分有意义：异常检测按类别分配
+        # （服务端 `_allocate_by_kind` 不看 stratified），故不显示该勾选
         self.stratified_check = CheckBox("按类别分层抽样（推荐）", self)
         self.stratified_check.setChecked(bool(stratified))
+        self.stratified_check.setVisible(not self._anomaly)
         self.viewLayout.addWidget(self.stratified_check)
 
         # 按钮组仅两个（左 → 右）：取消 / 确认——确认即执行拆分
@@ -121,7 +154,13 @@ class SplitEditDialog(MessageBoxBase):
             0, self.cancelButton, 1, Qt.AlignmentFlag.AlignVCenter
         )
 
-        self._apply_ratios(tuple(ratios))
+        if self._anomaly:
+            # 已保存的分配优先（编辑既有拆分）；没有才按比例给建议值
+            self._apply_anomaly_values(
+                self._anomaly_plan or self._suggest_plan(tuple(ratios))
+            )
+        else:
+            self._apply_ratios(tuple(ratios))
 
     # -----------------------------------------------------------
     # 表格
@@ -185,6 +224,200 @@ class SplitEditDialog(MessageBoxBase):
             self.ratio_spins[key] = percent
             self.count_spins[key] = count
         return table
+
+    # -----------------------------------------------------------
+    # 异常检测：良好 / 异常两组分配表
+    # -----------------------------------------------------------
+    def _build_anomaly_table(self) -> QGridLayout:
+        """两组列：「良好图像 (n)」与「异常图像 (m)」各带数量 / 百分比。
+
+        训练只用良好图像（异常图的训练格固定 0 并禁用，约束用控件可用性表达）；
+        两组之间一条竖分隔线，行的名称列与常规弹窗一致（色块 + 训练 / 验证 /
+        测试）。
+        """
+        table = QGridLayout()
+        table.setHorizontalSpacing(T.SPACE_LG)
+        table.setVerticalSpacing(T.SPACE_SM)
+
+        labeled = int(self._anomaly_totals.get("labeled", 0))
+        known = int(self._anomaly_totals.get("all", 0))
+        hint = CaptionLabel(f"已标注 / 全部：{labeled} / {known}", self)
+        hint.setToolTip(
+            "只有标注了「良好 / 异常」的图片参与分配：在导入弹窗里按文件夹语义"
+            "选择，或在标注页修改类别类型"
+        )
+        table.addWidget(hint, 0, 0, 1, 6)
+
+        self.anomaly_count_spins: dict[tuple, SafeCompactSpinBox] = {}
+        self.anomaly_percent_spins: dict[tuple, SafeCompactSpinBox] = {}
+        for index, kind in enumerate(("normal", "abnormal")):
+            column = 1 + index * 3            # 数量列（百分比列 = column + 1）
+            title = StrongBodyLabel(
+                f"{_KIND_LABELS[kind]}（{int(self._anomaly_totals.get(kind, 0))}）",
+                self,
+            )
+            table.addWidget(
+                title, 1, column, 1, 2, Qt.AlignmentFlag.AlignHCenter
+            )
+            for offset, text in ((0, "数量"), (1, "百分比")):
+                head = CaptionLabel(text, self)
+                head.setAlignment(
+                    Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter
+                )
+                if offset == 1:
+                    head.setToolTip("按该类图片数折算，改一项其余项按比例吸收")
+                table.addWidget(head, 2, column + offset)
+
+        # 两组之间的竖分隔线（颜色走令牌，明暗主题都可见）
+        line = QFrame(self)
+        line.setFrameShape(QFrame.Shape.VLine)
+        line.setStyleSheet(f"color: {T.GROUP_BORDER};")
+        table.addWidget(line, 1, 4, 4, 1)
+
+        for row, sub in enumerate(("train", "val", "test"), start=3):
+            holder = QWidget(self)
+            name_row = QHBoxLayout(holder)
+            name_row.setContentsMargins(0, 0, 0, 0)
+            name_row.setSpacing(T.SPACE_MD)
+            chip = QLabel(holder)
+            chip.setFixedSize(12, 12)
+            chip.setStyleSheet(
+                f"background: {SPLIT_COLORS[sub]}; border-radius: 2px;"
+            )
+            name_row.addWidget(chip)
+            name_row.addWidget(BodyLabel(SPLIT_LABELS[sub], holder))
+            name_row.addStretch(1)
+            table.addWidget(holder, row, 0)
+
+            for index, kind in enumerate(("normal", "abnormal")):
+                column = 1 + index * 3
+                count = SafeCompactSpinBox(self)
+                count.setRange(0, 999999)
+                count.setFixedWidth(T.field_width(count, T.STEPPER_CHARS_NARROW))
+                count.valueChanged.connect(
+                    lambda _v, k=kind, s=sub: self._on_anomaly_edited(k, s, "count")
+                )
+                table.addWidget(count, row, column, Qt.AlignmentFlag.AlignHCenter)
+
+                percent = SafeCompactSpinBox(self)
+                percent.setRange(0, 100)
+                percent.setSuffix(" %")
+                percent.setFixedWidth(
+                    T.field_width(percent, T.STEPPER_CHARS_NARROW)
+                )
+                percent.valueChanged.connect(
+                    lambda _v, k=kind, s=sub: self._on_anomaly_edited(
+                        k, s, "percent"
+                    )
+                )
+                table.addWidget(
+                    percent, row, column + 1, Qt.AlignmentFlag.AlignHCenter
+                )
+                if kind == "abnormal" and sub == "train":
+                    count.setToolTip("异常图像不参与训练：只进验证 / 测试")
+                    percent.setToolTip("异常图像不参与训练：只进验证 / 测试")
+                self.anomaly_count_spins[(kind, sub)] = count
+                self.anomaly_percent_spins[(kind, sub)] = percent
+        return table
+
+    def _suggest_plan(self, ratios: tuple) -> dict[str, dict[str, int]]:
+        """按比例给一份建议分配（异常图训练恒 0，按剩余比例归一化）。
+
+        权重取**千分整数**（`_proportional_sizes` 内部 `int()` 取整，浮点比例
+        会被归零——历史故障）。
+        """
+        plan: dict[str, dict[str, int]] = {}
+        for kind in ("normal", "abnormal"):
+            total = int(self._anomaly_totals.get(kind, 0))
+            weights = {
+                sub: max(0, int(round(float(ratios[index]) * 1000)))
+                for index, sub in enumerate(("train", "val", "test"))
+            }
+            if kind == "abnormal":
+                weights["train"] = 0
+            sizes = DatasetService._proportional_sizes(total, weights)
+            plan[kind] = {sub: int(sizes.get(sub, 0)) for sub in weights}
+        return plan
+
+    def _apply_anomaly_values(self, plan: dict) -> None:
+        """把分配写回两组输入框（屏蔽信号）并刷新环形图。"""
+        self._syncing = True
+        try:
+            for kind in ("normal", "abnormal"):
+                rows = plan.get(kind) or {}
+                total = int(self._anomaly_totals.get(kind, 0))
+                for sub in ("train", "val", "test"):
+                    value = max(0, int(rows.get(sub, 0)))
+                    self.anomaly_count_spins[(kind, sub)].setValue(value)
+                    self.anomaly_percent_spins[(kind, sub)].setValue(
+                        int(round(value * 100 / total)) if total else 0
+                    )
+                    self._set_anomaly_enabled(kind, sub, total)
+        finally:
+            self._syncing = False
+        self._anomaly_plan = {
+            kind: {
+                sub: int(self.anomaly_count_spins[(kind, sub)].value())
+                for sub in ("train", "val", "test")
+            }
+            for kind in ("normal", "abnormal")
+        }
+        self._refresh_anomaly_pie()
+
+    def _set_anomaly_enabled(self, kind: str, sub: str, total: int) -> None:
+        """可编辑性：异常图的训练格恒禁用；该类没有图片时整组禁用。"""
+        editable = total > 0 and not (kind == "abnormal" and sub == "train")
+        self.anomaly_count_spins[(kind, sub)].setEnabled(editable)
+        self.anomaly_percent_spins[(kind, sub)].setEnabled(editable)
+
+    def _refresh_anomaly_pie(self) -> None:
+        """环形图按**合并口径**预览（训练 / 验证 / 测试）。"""
+        combined = {
+            sub: sum(
+                int(self._anomaly_plan.get(kind, {}).get(sub, 0))
+                for kind in ("normal", "abnormal")
+            )
+            for sub in ("train", "val", "test")
+        }
+        segments = [
+            (SPLIT_LABELS[sub], combined[sub], SPLIT_COLORS[sub])
+            for sub in ("train", "val", "test")
+        ]
+        total = sum(combined.values()) or self._total
+        self.pie.set_data(segments, str(total))
+
+    def _rebalance_kind(self, kind: str, changed: str, value: int) -> dict:
+        """改一格后重排**同类别**其余行，使行和恒等于该类图片数。"""
+        total = int(self._anomaly_totals.get(kind, 0))
+        if kind == "abnormal" and changed == "train":
+            value = 0
+        value = max(0, min(total, int(value)))
+        others = [sub for sub in ("train", "val", "test") if sub != changed]
+        if kind == "abnormal":
+            others = [sub for sub in others if sub != "train"]
+        current = self._anomaly_plan.get(kind) or {}
+        weights = {sub: max(0, int(current.get(sub, 0))) for sub in others}
+        if not any(weights.values()):
+            weights = {sub: 1 for sub in others}
+        sizes = DatasetService._proportional_sizes(total - value, weights)
+        rows = {sub: 0 for sub in ("train", "val", "test")}
+        rows[changed] = value
+        rows.update({sub: int(sizes.get(sub, 0)) for sub in others})
+        return rows
+
+    def _on_anomaly_edited(self, kind: str, sub: str, mode: str) -> None:
+        """改数量或百分比：同类别其余行按比例吸收差额后写回。"""
+        if self._syncing:
+            return
+        total = int(self._anomaly_totals.get(kind, 0))
+        if mode == "count":
+            value = int(self.anomaly_count_spins[(kind, sub)].value())
+        else:
+            percent = int(self.anomaly_percent_spins[(kind, sub)].value())
+            value = int(round(total * percent / 100))
+        plan = {k: dict(rows) for k, rows in self._anomaly_plan.items()}
+        plan[kind] = self._rebalance_kind(kind, sub, value)
+        self._apply_anomaly_values(plan)
 
     # -----------------------------------------------------------
     # 联动
@@ -276,7 +509,46 @@ class SplitEditDialog(MessageBoxBase):
         return CANCEL
 
     def values(self) -> dict:
-        """弹窗内容：名称 / 比例（数量口径）/ 数量 / 种子（None = 不改）/ 分层。"""
+        """弹窗内容：名称 / 比例（数量口径）/ 数量 / 种子（None = 不改）/ 分层。
+
+        异常检测模式额外给出 ``anomaly_counts``（按类别的分配）；比例按**合并**
+        口径折算（真正落库时 `DatasetViewModel.set_anomaly_allocation` 会再按
+        分配结果重算比例）。
+        """
+        data = {
+            "name": self.name_edit.text().strip(),
+            "seed": (
+                int(self.seed_spin.value()) if self.seed_check.isChecked()
+                else None
+            ),
+            "stratified": bool(self.stratified_check.isChecked()),
+        }
+        if self._anomaly:
+            plan = {
+                kind: {
+                    sub: int(self.anomaly_count_spins[(kind, sub)].value())
+                    for sub in ("train", "val", "test")
+                }
+                for kind in ("normal", "abnormal")
+            }
+            combined = {
+                sub: sum(plan[kind][sub] for kind in ("normal", "abnormal"))
+                for sub in ("train", "val", "test")
+            }
+            total = sum(combined.values()) or self._total
+            data.update({
+                "anomaly_counts": plan,
+                "counts": combined,
+                "percents": {
+                    sub: int(round(combined[sub] * 100 / total)) if total else 0
+                    for sub in ("train", "val", "test")
+                },
+                "ratios": tuple(
+                    combined[sub] / total if total else 0.0
+                    for sub in ("train", "val", "test")
+                ),
+            })
+            return data
         keys = ("train", "val", "test")
         counts = {key: int(self.count_spins[key].value()) for key in keys}
         percents = {key: int(self.ratio_spins[key].value()) for key in keys}
@@ -285,17 +557,10 @@ class SplitEditDialog(MessageBoxBase):
             ratios = tuple(counts[key] / total for key in keys)
         else:
             ratios = tuple(percents[key] / 100 for key in keys)
-        return {
-            "name": self.name_edit.text().strip(),
-            "ratios": ratios,
-            "counts": counts,
-            "percents": percents,
-            "seed": (
-                int(self.seed_spin.value()) if self.seed_check.isChecked()
-                else None
-            ),
-            "stratified": bool(self.stratified_check.isChecked()),
-        }
+        data.update({
+            "ratios": ratios, "counts": counts, "percents": percents,
+        })
+        return data
 
     def _on_primary(self) -> None:
         # accept 由 MessageBoxBase 处理，这里只记录选择

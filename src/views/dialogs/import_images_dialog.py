@@ -5,7 +5,10 @@
     * **文件夹层级 → 类别名**：按「左侧（顶层）N 级 / 右侧（底层）N 级」组合
       所选文件夹的相对路径生成类别名，可设反向顺序与定界符；
       每个含图文件夹可双击改名，**留空即「无标签」**
-    * **类别类型**（异常检测项目）：每个类别可设为「良好 / 异常」
+    * **类别类型**（异常检测项目）：每个类别可设为「良好 / 异常」——默认值按
+      「本次改过 > 同名类别已有类型 > **文件夹 / 类别名的语义** > 良好」推断，
+      语义判定与类别配色同源（`CategoryService.kind_for_name`），因此
+      ``abnormal/``、``NG/``、``缺陷/`` 等目录会自动落成「异常」
     * 底部二选一：**导入并标注图像** / **导入图像时不进行标注**
 
 用法：
@@ -41,6 +44,7 @@ from qfluentwidgets import (
     TreeWidget,
 )
 
+from src.services.category_service import CategoryService
 from src.services.dataset_service import DatasetService
 from src.views.ui import SafeSpinBox
 from src.views.ui import tokens as T
@@ -131,7 +135,7 @@ class ImportImagesDialog(MessageBoxBase):
         initial: 初始选择（文件夹路径或图片文件路径列表）。
         is_anomaly: 项目是否为异常检测（决定是否显示「类别类型」列）。
         existing_kinds: 已有类别的类型 {类别名: "normal" / "abnormal"}，
-            作为「类别类型」的默认值（用户不动就不改写）。
+            优先于名称语义作为默认值（用户不动就不改写已有类别）。
     """
 
     def __init__(
@@ -506,11 +510,20 @@ class ImportImagesDialog(MessageBoxBase):
         self._update_preview()
 
     def _default_kind(self, folder: str) -> str:
-        """「类别类型」的初始值：本次改过 > 同名类别已有类型 > 良好。"""
+        """「类别类型」的初始值：本次改过 > 同名类别已有类型 > **名称语义** > 良好。
+
+        名称语义与类别配色**同源**（`CategoryService.kind_for_name`）：文件夹 /
+        类别名带 良品 / OK / NORMAL 判为良好，带 异常 / 缺陷 / NG / DEFECT /
+        划痕 等判为异常——异常项目导入 ``normal/`` 与 ``abnormal/`` 两个目录时
+        不必逐行切换（历史缺陷：一律默认「良好」，异常集会被算进正常集）。
+        """
         if folder in self._kinds:
             return self._kinds[folder]
         name = self._label_of(folder).strip()
-        return self._existing_kinds.get(name, KIND_NORMAL)
+        stored = self._existing_kinds.get(name)
+        if stored is not None:
+            return stored
+        return CategoryService.kind_for_name(name) or KIND_NORMAL
 
     def _apply_default_kind(self, folder: str) -> None:
         """类别名变化后，未手工改过类型的行跟随新的默认类型。"""
@@ -638,11 +651,18 @@ class ImportImagesDialog(MessageBoxBase):
             data["label_map"] = {
                 folder: self._label_of(folder) for folder in selected
             }
+            # 「显示什么就落库什么」：手工切换过的优先，其余按默认（含名称语义
+            # 推断）。只记手工改过的行会留下坑——界面显示「异常」、存下来却是
+            # 未指定，而异常集判定只认 `kind == "abnormal"`，图片会被算进正常集
             kinds: dict[str, str] = {}
             for folder in selected:
                 name = self._label_of(folder).strip()
                 if name and folder in self._kinds:
                     kinds[name] = self._kinds[folder]
+            for folder in selected:
+                name = self._label_of(folder).strip()
+                if name:
+                    kinds.setdefault(name, self._default_kind(folder))
             if kinds:
                 data["class_kinds"] = kinds
         return data

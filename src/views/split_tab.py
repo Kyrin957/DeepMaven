@@ -31,7 +31,6 @@ from qfluentwidgets import (
     StrongBodyLabel,
 )
 
-from src.services.dataset_service import DatasetService
 from src.utils.constants import SPLIT_COLORS, SPLIT_LABELS, UNLABELED_LABEL
 from src.viewmodels.category_vm import CategoryViewModel
 from src.viewmodels.dataset_vm import DatasetViewModel
@@ -43,13 +42,9 @@ from src.views.dialogs import (
     SAVE_APPLY,
     SplitEditDialog,
 )
-from src.views.ui import SafeCompactSpinBox
 from src.views.ui import tokens as T
 from src.views.ui.icons import icon
 from src.views.widgets import PieChart, StackedBarChart
-
-# 异常检测的类别显示名（对应 ClassDef.kind）
-_KIND_LABELS = {"normal": "良好图像", "abnormal": "异常图像"}
 
 # 拆分列表行数据：锁定原因（"" / running / used）——被训练引用的拆分
 # 在行右端绘制锁图标（见 _SplitListDelegate），按钮同步禁用
@@ -87,9 +82,6 @@ class SplitTab(QWidget):
         self._vm = dataset_vm
         self._category_vm = category_vm
         self._syncing = False
-        # 异常检测的按类别分配（表格数据源）
-        self._anomaly_totals: dict[str, int] = {}
-        self._anomaly_plan: dict[str, dict[str, int]] = {}
         self._build_ui()
         self._bind()
         self.refresh()
@@ -135,157 +127,11 @@ class SplitTab(QWidget):
             tools.addWidget(button)
         list_layout.addLayout(tools)
 
-        # 异常检测：按类别分配（良好 / 异常 × 训练 / 验证 / 测试）——
-        # 参数编辑自成一张卡、仅异常任务可见；拆分信息（名称 / 比例 / 张数）
-        # 都在列表行里，不再另设「当前拆分」信息卡
-        self.anomaly_card = CardWidget(self)
-        anomaly_layout = QVBoxLayout(self.anomaly_card)
-        anomaly_layout.setContentsMargins(
-            T.CARD_PAD_H, T.CARD_PAD_V, T.CARD_PAD_H, T.CARD_PAD_V
-        )
-        anomaly_layout.setSpacing(T.SPACE_SM)
-        anomaly_layout.addWidget(StrongBodyLabel("类别分配", self.anomaly_card))
-        anomaly_layout.addWidget(self._build_anomaly_card())
-
-        # 左栏只做「拆分管理」：拆分列表（+ 异常任务的类别分配）；
+        # 左栏只做「拆分管理」：拆分列表——**所有任务类型一致**（异常检测的
+        # 良好 / 异常分配在「新建 / 编辑拆分」弹窗里做，不另设左栏卡片；
+        # 历史实现曾在此放「类别分配」表，与其它任务的左栏结构不一致）
         # 拆分概览 / 类别分布等信息卡在右侧主区（见 _build_main）
-        return side_column(
-            self.list_card, self.anomaly_card, width=T.SIDE_W_WIDER
-        )
-
-    # -----------------------------------------------------------
-    # 异常检测：按类别分配表（参照 DLT 的创建拆分）
-    # -----------------------------------------------------------
-    def _build_anomaly_card(self) -> QWidget:
-        """良好 / 异常 × 训练 / 验证 / 测试 的数量与百分比。
-
-        异常图的「训练」格禁用：异常检测只用正常样本训练，异常图进验证 /
-        测试。约束用控件可用性表达，不写说明文字。
-
-        窄侧栏（~270px）塞不下「4 个数值列并排」：行内步进器光按钮就占 71px/
-        个，4 列要 300px 以上，硬塞的结果是数值被按钮挤没（历史故障）。这里
-        按类别分块竖排，数值框改用**紧凑步进器**（省 54px/个）并按字体度量
-        定宽（``tokens.field_width()``），字体 / 缩放变化时数字仍然完整可见。
-        """
-        holder = QWidget(self.anomaly_card)
-        grid = QGridLayout(holder)
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setHorizontalSpacing(T.SPACE_MD)
-        grid.setVerticalSpacing(T.SPACE_SM)
-
-        # 列头：数量 / 百分比（两类共用，避免每类重复一行表头）
-        grid.addWidget(CaptionLabel("数量", holder), 0, 1)
-        grid.addWidget(CaptionLabel("百分比", holder), 0, 2)
-
-        self.anomaly_titles: dict[str, StrongBodyLabel] = {}
-        self.anomaly_spins: dict[tuple, SafeCompactSpinBox] = {}
-        row = 1
-        for kind in ("normal", "abnormal"):
-            title = StrongBodyLabel(_KIND_LABELS[kind], holder)
-            grid.addWidget(title, row, 0, 1, 3)
-            self.anomaly_titles[kind] = title
-            row += 1
-            for sub in ("train", "val", "test"):
-                editable = not (kind == "abnormal" and sub == "train")
-                grid.addWidget(CaptionLabel(SPLIT_LABELS[sub], holder), row, 0)
-                count = SafeCompactSpinBox(holder)
-                count.setRange(0, 999999)
-                count.setFixedWidth(
-                    T.field_width(count, T.STEPPER_CHARS_NARROW)
-                )
-                count.valueChanged.connect(
-                    lambda _v, k=kind, s=sub: self._on_anomaly_edited(k, s, "count")
-                )
-                grid.addWidget(count, row, 1)
-                percent = SafeCompactSpinBox(holder)
-                percent.setRange(0, 100)
-                percent.setSuffix(" %")
-                percent.setFixedWidth(
-                    T.field_width(percent, T.STEPPER_CHARS_NARROW)
-                )
-                percent.valueChanged.connect(
-                    lambda _v, k=kind, s=sub: self._on_anomaly_edited(
-                        k, s, "percent"
-                    )
-                )
-                grid.addWidget(percent, row, 2)
-                count.setEnabled(editable)
-                percent.setEnabled(editable)
-                self.anomaly_spins[(kind, sub, "count")] = count
-                self.anomaly_spins[(kind, sub, "percent")] = percent
-                row += 1
-
-        grid.setColumnStretch(3, 1)          # 右列留白：数值框左对齐，不拉伸
-        self.anomaly_hint = CaptionLabel("", holder)
-        grid.addWidget(self.anomaly_hint, row, 0, 1, 4)
-        return holder
-
-    def _refresh_anomaly_card(self) -> None:
-        """按任务显示：异常检测显示类别分配表，其余任务隐藏（参数在弹窗）。"""
-        is_anomaly = self._vm.is_anomaly()
-        self.anomaly_card.setVisible(is_anomaly)
-        if not is_anomaly:
-            return
-        self._anomaly_totals = self._vm.anomaly_totals()
-        self._anomaly_plan = self._vm.anomaly_allocation()
-        for kind in ("normal", "abnormal"):
-            self.anomaly_titles[kind].setText(
-                f"{_KIND_LABELS[kind]} {int(self._anomaly_totals.get(kind, 0))}"
-            )
-        self.anomaly_hint.setText(
-            f"已标注 / 全部：{int(self._anomaly_totals.get('labeled', 0))} / "
-            f"{int(self._anomaly_totals.get('all', 0))}"
-        )
-        self._apply_anomaly_plan()
-
-    def _apply_anomaly_plan(self) -> None:
-        """把当前分配写回表格（期间屏蔽信号）。"""
-        self._syncing = True
-        try:
-            for kind in ("normal", "abnormal"):
-                total = int(self._anomaly_totals.get(kind, 0))
-                rows = self._anomaly_plan.get(kind) or {}
-                for sub in ("train", "val", "test"):
-                    value = int(rows.get(sub, 0))
-                    self.anomaly_spins[(kind, sub, "count")].setValue(value)
-                    self.anomaly_spins[(kind, sub, "percent")].setValue(
-                        int(round(value * 100 / total)) if total else 0
-                    )
-        finally:
-            self._syncing = False
-
-    def _rebalance(self, kind: str, changed: str, value: int) -> dict[str, int]:
-        """改一格后重排同类其余行，使行和恒等于该类图片数。"""
-        total = int(self._anomaly_totals.get(kind, 0))
-        if kind == "abnormal" and changed == "train":
-            value = 0
-        value = max(0, min(total, int(value)))
-        others = [sub for sub in ("train", "val", "test") if sub != changed]
-        if kind == "abnormal":
-            others = [sub for sub in others if sub != "train"]
-        current = self._anomaly_plan.get(kind) or {}
-        weights = {sub: max(0, int(current.get(sub, 0))) for sub in others}
-        if not any(weights.values()):
-            weights = {sub: 1 for sub in others}
-        sizes = DatasetService._proportional_sizes(total - value, weights)
-        rows = {sub: 0 for sub in ("train", "val", "test")}
-        rows[changed] = value
-        rows.update({sub: int(sizes.get(sub, 0)) for sub in others})
-        return rows
-
-    def _on_anomaly_edited(self, kind: str, sub: str, mode: str) -> None:
-        """改数量或百分比：同类其余行按比例吸收差额后写回拆分。"""
-        if self._syncing:
-            return
-        total = int(self._anomaly_totals.get(kind, 0))
-        if mode == "count":
-            value = int(self.anomaly_spins[(kind, sub, "count")].value())
-        else:
-            percent = int(self.anomaly_spins[(kind, sub, "percent")].value())
-            value = int(round(total * percent / 100))
-        self._anomaly_plan[kind] = self._rebalance(kind, sub, value)
-        self._apply_anomaly_plan()
-        self._vm.set_anomaly_allocation(self._anomaly_plan)
+        return side_column(self.list_card, width=T.SIDE_W_WIDER)
 
     def _build_main(self) -> QWidget:
         """右侧信息区（滚动 + 卡片式）：拆分概览 / 类别分布。
@@ -431,7 +277,6 @@ class SplitTab(QWidget):
         self._refresh_splits()
         self._apply_lock_state()
         self._refresh_preview()
-        self._refresh_anomaly_card()
 
     # -----------------------------------------------------------
     # 拆分列表（一个项目可有多套）
@@ -495,6 +340,16 @@ class SplitTab(QWidget):
         self._vm.select_split(split_id)
         self.refresh()
 
+    def _anomaly_payload(self, ratios: tuple, plan=None) -> dict | None:
+        """异常检测弹窗的入参（非异常任务返回 None → 常规按比例弹窗）。
+
+        `plan` 为空时由弹窗按 `ratios` 给建议值——新建拆分不该继承别的拆分的
+        分配；编辑时把该拆分已保存的分配传进去。
+        """
+        if not self._vm.is_anomaly():
+            return None
+        return {"totals": self._vm.anomaly_totals(), "plan": plan or {}}
+
     def _on_add_split(self) -> None:
         """新建拆分：弹窗确认名称 / 分配，可一键创建并执行拆分。"""
         dialog = SplitEditDialog(
@@ -505,6 +360,7 @@ class SplitTab(QWidget):
             ratios=(0.7, 0.2, 0.1),
             seed=0,
             stratified=True,
+            anomaly=self._anomaly_payload((0.7, 0.2, 0.1)),
         )
         choice = dialog.exec_choice()
         if not choice:
@@ -540,6 +396,11 @@ class SplitTab(QWidget):
             ratios=(split.train, split.val, split.test),
             seed=int(split.seed),
             stratified=bool(split.stratified),
+            # 编辑：带该拆分已保存的良好 / 异常分配（未配置过时弹窗给建议值）
+            anomaly=self._anomaly_payload(
+                (split.train, split.val, split.test),
+                self._vm.anomaly_allocation(),
+            ),
         )
         choice = dialog.exec_choice()
         if not choice:
@@ -551,12 +412,18 @@ class SplitTab(QWidget):
             self._vm.apply_split()
 
     def _apply_split_values(self, split_id: int, values: dict) -> None:
-        """把弹窗结果写入拆分（名称 / 比例 / 自定义种子 / 分层）。"""
+        """把弹窗结果写入拆分（名称 / 比例 / 自定义种子 / 分层 / 按类别分配）。
+
+        异常检测的 `anomaly_counts` **最后**写：`set_anomaly_allocation` 会按
+        分配结果重算 train / val / test 比例（弹窗给的合并比例只是预览值）。
+        """
         self._vm.rename_split(split_id, values["name"])
         self._vm.set_split(*values["ratios"], quiet=True)
         if values.get("seed") is not None:
             self._vm.set_seed(values["seed"], quiet=True)
         self._vm.set_stratified(values["stratified"])
+        if values.get("anomaly_counts"):
+            self._vm.set_anomaly_allocation(values["anomaly_counts"])
 
     def _on_duplicate_split(self) -> None:
         active = self._vm.active_split()
