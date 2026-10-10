@@ -26,6 +26,7 @@ from qfluentwidgets import (
     SubtitleLabel,
 )
 
+from src.utils import automation
 from src.views.ui import tokens as T
 
 BACKUP = "backup"
@@ -87,5 +88,12 @@ class BackupVersionDialog(MessageBoxBase):
 
 
 def ask_backup_version(parent, info: dict) -> str:
-    """询问用哪个版本作为项目文件；返回值同 ``exec_choice``。"""
+    """询问用哪个版本作为项目文件；返回值同 ``exec_choice``。
+
+    无人值守模式（`utils/automation`）下不弹窗，固定选**较新的一份**——自检
+    脚本打开"带残留备份的项目"时不会卡住。
+    """
+    auto = automation.backup_choice(info)
+    if auto is not None:
+        return auto
     return BackupVersionDialog(parent, info).exec_choice()

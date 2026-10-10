@@ -25,6 +25,7 @@ from src.services.project_service import ProjectService
 from src.services.train_service import TrainService
 from src.utils.constants import (
     DATA_DIR,
+    PLOT_COLORS,
     TASK_MODEL_SUFFIX,
     base_variant_key,
 )
@@ -756,6 +757,21 @@ class TrainViewModel(QObject):
                 name = names[class_id] if 0 <= class_id < len(names) else str(class_id)
                 counts[name] = counts.get(name, 0) + 1
         return {name: value for name, value in counts.items() if name}
+
+    def class_colors(self, names: list) -> list[str]:
+        """类别名 → 颜色（优先用项目里定义的类别颜色，与标注 / 图库同色）。
+
+        与 `EvaluateViewModel.class_colors` 同一口径：项目里定义过颜色就用它，
+        否则按图表配色循环——保证同一类别在各页面的颜色一致。
+        """
+        project = self._project_vm.project if self._project_vm else None
+        palette: dict[str, str] = {}
+        if project is not None:
+            palette = {str(item.name): str(item.color) for item in project.classes}
+        return [
+            palette.get(str(name)) or PLOT_COLORS[index % len(PLOT_COLORS)]
+            for index, name in enumerate(names)
+        ]
 
     def class_distribution(self) -> list[dict]:
         """类别分布（**只读**）：名称 / 数量 / 占比，供界面展示。

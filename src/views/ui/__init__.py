@@ -26,6 +26,7 @@ from src.views.ui.containers import (
 )
 from src.views.ui.display_dock import DisplayDock
 from src.views.ui.flow_layout import FlowContainer, FlowLayout
+from src.views.ui.help import HelpEntry, ParamHelpDialog, card_title_row, help_button
 from src.views.ui.icons import bind_icon, icon, refresh_icons
 from src.views.ui.wheel_guard import (
     ALLOW_WHEEL_ATTR,
@@ -53,6 +54,10 @@ __all__ = [
     "FieldRow",
     "tool_separator",
     "icon_button",
+    "HelpEntry",
+    "ParamHelpDialog",
+    "card_title_row",
+    "help_button",
     "icon",
     "bind_icon",
     "refresh_icons",

@@ -68,20 +68,29 @@ from src.viewmodels.model_vm import ModelViewModel
 from src.viewmodels.train_vm import TrainViewModel
 from src.views.data_widgets import side_column
 from src.views.dialogs import ImagePreviewDialog
+from src.views.train_help import (
+    AUGMENT_HELP,
+    DEVICE_HELP,
+    DISTRIBUTION_HELP,
+    IMAGE_HELP,
+    MODEL_HELP,
+    MODELS_HELP,
+    PARAM_HELP,
+    SPLIT_HELP,
+)
 from src.views.ui import (
     FieldRow,
-    FlowContainer,
     ParamGroup,
     SafeCompactDoubleSpinBox,
     SafeCompactSpinBox,
     SafeDoubleSpinBox,
     SafeSpinBox,
-    ToolGroup,
+    card_title_row,
     icon_button,
 )
 from src.views.ui import tokens as T
 from src.views.ui.icons import icon
-from src.views.widgets import LineChart, PieChart
+from src.views.widgets import BarChart, LineChart, PieChart
 
 # ---------------------------------------------------------------
 # 参数表：(键, 标签, 最小值, 最大值, 默认值, 步长, 后缀) / 浮点表末位是小数位
@@ -153,18 +162,20 @@ def _custom_path(data) -> str:
 
 
 def _equal_width(widgets) -> None:
-    """把一组控件设为**等宽**（取其中最大宽度）。
+    """把一组控件设为**等宽**（取各自"已声明宽度"的最大值）。
 
     同一个栅格里「下拉 + 步进器」长短不一，右边缘参差会显得散乱；统一宽度后
-    成列对齐（宽度本身仍由各自的内容决定，只做取齐）。
+    成列对齐。取齐基准是 `setFixedWidth` / `setMinimumWidth` **声明的宽度**
+    （即 `field_width()` 算出来的字符宽度），**不看 `sizeHint()`**——下拉的
+    sizeHint 会随当前项文字变化，拿它当基准会把整组一起撑宽。
     """
-    widths = [
-        widget.minimumWidth() or widget.sizeHint().width()
-        for widget in widgets if widget is not None
+    declared = [
+        widget.minimumWidth() for widget in widgets if widget is not None
     ]
-    if not widths:
+    declared = [value for value in declared if value > 0]
+    if not declared:
         return
-    target = max(widths)
+    target = max(declared)
     for widget in widgets:
         if widget is not None:
             widget.setFixedWidth(target)
@@ -438,18 +449,21 @@ class TrainTab(QWidget):
         root.addWidget(self._build_side(), 0)
         root.addLayout(self._build_main(), 1)
 
-    def _card(self, title: str) -> tuple[CardWidget, QVBoxLayout]:
+    def _card(
+        self, title: str, help_entries=None
+    ) -> tuple[CardWidget, QVBoxLayout]:
+        """建卡片：标题行 = `标题 + [?]`（给了说明条目才出现帮助按钮）。"""
         card = CardWidget(self)
         layout = QVBoxLayout(card)
         layout.setContentsMargins(T.SPACE_2XL, T.SPACE_XL, T.SPACE_2XL, T.SPACE_XL)
         layout.setSpacing(T.SPACE_ML)
         if title:
-            layout.addWidget(StrongBodyLabel(title, card))
+            layout.addWidget(card_title_row(card, title, help_entries))
         return card, layout
 
     # --------------------------------------------------- 左侧（训练模型管理）
     def _build_side(self) -> QWidget:
-        models_card, models_layout = self._card("训练模型")
+        models_card, models_layout = self._card("训练模型", MODELS_HELP)
         self.new_model_btn = PushButton("新建模型", models_card)
         self.new_model_btn.clicked.connect(self._on_model_create)
         models_layout.addWidget(self.new_model_btn)
@@ -643,8 +657,9 @@ class TrainTab(QWidget):
         # 无训练模型时整体禁用（参数属于所选模型，见 _refresh）
         self.settings_body = body
         # 两列紧凑排布（参照 Halcon DLT）：
-        #   左列 数据（拆分 / 类别分布**并排**）→ 模型与权重 → 图像设置 → 设备
-        #   右列 训练参数（常用 + 可展开的高级）→ 数据增强
+        #   左列 数据集拆分（环形图 ｜ 汇总表）→ 模型与权重 → 图像设置 → 设备配置
+        #   右列 类别分布（条形图，需整列宽）→ 训练参数（常用 / 高级 / 训练选项）
+        #        → 数据增强
         # 卡片按内容自适应高度、控件按参数字符宽度收紧，不再一律纵向占满整行
         columns = QHBoxLayout(body)
         columns.setContentsMargins(T.SPACE_XXS, T.SPACE_XXS, T.SPACE_XXS, T.SPACE_XXS)
@@ -654,18 +669,15 @@ class TrainTab(QWidget):
         right = QVBoxLayout()
         right.setSpacing(T.SPACE_ML)
 
-        # 第一行：数据集拆分（半宽足够）+ 类别分布并排。拆分为 3 / 分布为 2：
-        # 拆分卡要容纳环形图 + 汇总表，分布卡只有几行文字
-        first = QHBoxLayout()
-        first.setSpacing(T.SPACE_ML)
-        first.addWidget(self._build_split_card(), 3)
-        first.addWidget(self._build_distribution_card(), 2)
-        left.addLayout(first)
-
+        # 左列：数据与输入侧（拆分卡内部「环形图 ｜ 汇总表」左右排列）
+        left.addWidget(self._build_split_card())
         left.addWidget(self._build_model_card())
         left.addWidget(self._build_image_card())
         left.addWidget(self._build_device_card())
         left.addStretch(1)
+        # 右列：先看数据体检（类别分布图），再调训练参数与增强——图表要整列宽
+        # 才舒展（并排时只剩 ~120px，类别名与「数量（占比）」都会被省略号吃掉）
+        right.addWidget(self._build_distribution_card())
         right.addWidget(self._build_param_card())
         right.addWidget(self._build_aug_card())
         right.addStretch(1)
@@ -703,15 +715,15 @@ class TrainTab(QWidget):
             columns.setDirection(direction)
 
     def _build_split_card(self) -> CardWidget:
-        """数据集拆分：下拉选择 + 概览（环形图 + 汇总表）。
+        """数据集拆分：下拉选择 + 概览（环形图 | 汇总表 **左右排列**）。
 
-        概览部分与「数据拆分页 → 拆分概览」**逐元素一致**（环形图 + 汇总表：
-        色块 / 名称 / 图像数 / 百分比 + 分隔线 + 合计行）；本页与「类别分布」
-        并排、只占半宽，因此内部**竖排**（图在上、表在下）且环形图取
-        `T.CTRL_W_LG`（拆分页全宽时用 `T.CTRL_W_XL`）。
+        概览元素与「数据拆分页 → 拆分概览」**逐元素一致**（环形图 + 汇总表：
+        色块 / 名称 / 图像数 / 百分比 + 分隔线 + 合计行），但本页只占半栏宽，
+        因此内部改为**左右两列**（图在左、表在右），比竖排更省高度、也更容易
+        一眼比对张数与占比；环形图取 `T.CTRL_W_LG`（拆分页全宽用 `XL`）。
         刷新由数据集 / 拆分信号自动驱动，不设「刷新」按钮。
         """
-        card, layout = self._card("数据集拆分")
+        card, layout = self._card("数据集拆分", SPLIT_HELP)
         # 一个项目可以有多套拆分：训练前选择用哪一套
         pick_row = QHBoxLayout()
         pick_row.addWidget(CaptionLabel("拆分", card))
@@ -720,11 +732,13 @@ class TrainTab(QWidget):
         pick_row.addWidget(self.split_combo, 1)
         layout.addLayout(pick_row)
 
-        body = QVBoxLayout()
-        body.setSpacing(T.SPACE_MD)
+        body = QHBoxLayout()
+        body.setSpacing(T.SPACE_LG)
         self.pie = PieChart(card)
+        # 与汇总表左右并排（整列宽，用大号环形图）
         self.pie.setFixedWidth(T.CTRL_W_LG)
-        body.addWidget(self.pie, 0, Qt.AlignmentFlag.AlignHCenter)
+        body.addWidget(self.pie, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.pie.setToolTip("训练 / 验证 / 测试的占比")
 
         table = QGridLayout()
         table.setHorizontalSpacing(T.SPACE_MD)
@@ -771,7 +785,8 @@ class TrainTab(QWidget):
         divider.setStyleSheet(f"background: {T.GROUP_BORDER};")
         table.addWidget(divider, 4, 0, 1, 4)
 
-        total_name = StrongBodyLabel("拆分中的图像", card)
+        total_name = StrongBodyLabel("合计", card)
+        total_name.setToolTip("拆分中的图像（训练 + 验证 + 测试）")
         self.summary_total = CaptionLabel("0", card)
         self.summary_total.setAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
@@ -786,8 +801,8 @@ class TrainTab(QWidget):
 
         table_holder = QWidget(card)
         table_holder.setLayout(table)
-        # 靠左按内容宽度放置：拉满会把「图像 / 百分比」两列推到卡片两端
-        body.addWidget(table_holder, 0, Qt.AlignmentFlag.AlignLeft)
+        # 表在右列、按内容宽度放置：拉满会把「图像 / 百分比」两列推到卡片两端
+        body.addWidget(table_holder, 1, Qt.AlignmentFlag.AlignVCenter)
         layout.addLayout(body)
         return card
 
@@ -802,7 +817,7 @@ class TrainTab(QWidget):
         其它任务（U-Net / 异常检测 / OCR）训练不用自定义权重，只显示变体、
         不显示导入按钮。
         """
-        card, layout = self._card("模型与权重")
+        card, layout = self._card("模型与权重", MODEL_HELP)
 
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
@@ -995,17 +1010,16 @@ class TrainTab(QWidget):
         return fields
 
     def _build_param_card(self) -> CardWidget:
-        """训练参数：**常用**直接可见，**高级**默认收起。
+        """训练参数：分组（常用 / 高级 / 训练选项）**全部直接显示**。
 
-        分层的口径（按 Ultralytics 的默认值强度）：
-          * 常用：求解器与轮数 / 批次 / 学习率——几乎每次训练都要看或调；
-          * 高级（默认收起）：早停、末轮关增强、数据线程、随机种子、权重衰减、
-            动量、学习率预热、Dropout、DFL 增益，以及训练选项勾选——这些在多数
-            数据集上默认值即可用，收起来避免"一屏几十个参数"。
-        组内标签列宽与输入框宽度**统一**（`T.label_width` + 同字符数），两列
-        输入框成列对齐。
+        分组的依据是「多久调一次」：常用 = 求解器与轮数 / 批次 / 学习率；高级 =
+        早停、末轮关增强、数据线程、权重衰减、动量、预热、Dropout、DFL 与训练
+        选项——这些默认值在多数数据集上就够用，但**不隐藏**（折叠会让"设了什么"
+        看不全，也挡住按任务 / 系列整行显隐）。组内标签列宽与输入框宽度**统一**
+        （`T.label_width` + 同字符数），两列输入框成列对齐；每个参数的含义与调试
+        方法在标题旁的「?」里（`train_help.PARAM_HELP`）。
         """
-        card, layout = self._card("训练参数")
+        card, layout = self._card("训练参数", PARAM_HELP)
 
         # —— 常用 ——
         common = ParamGroup("常用", card)
@@ -1050,26 +1064,10 @@ class TrainTab(QWidget):
         anomaly_layout.addWidget(self.anomaly_check)
         layout.addWidget(self.anomaly_row)
 
-        # —— 高级（默认收起）——
-        self.advanced_btn = PushButton("高级训练参数", card)
-        self.advanced_btn.setCheckable(True)
-        self.advanced_btn.setToolTip(
-            "展开算法内置默认值已够用的一组参数与训练选项"
-        )
-        self.advanced_btn.toggled.connect(self._on_advanced_toggled)
-        self.advanced_bar = QWidget(card)
-        advanced_bar = QHBoxLayout(self.advanced_bar)
-        advanced_bar.setContentsMargins(0, 0, 0, 0)
-        advanced_bar.addWidget(self.advanced_btn)
-        advanced_bar.addStretch(1)
-        layout.addWidget(self.advanced_bar)
-
-        self.advanced_holder = QWidget(card)
-        advanced_box = QVBoxLayout(self.advanced_holder)
-        advanced_box.setContentsMargins(0, 0, 0, 0)
-        advanced_box.setSpacing(T.SPACE_ML)
-
-        advanced = ParamGroup("高级", self.advanced_holder)
+        # —— 高级：**直接显示**（不折叠）——
+        # 折叠会让"设了什么"看不全，也挡住按系列 / 任务的整行显隐；改为与常用
+        # 同列排布，靠分组标题区分层级。
+        advanced = ParamGroup("高级", card)
         # 权重衰减要显示 0.00050（7 字符）→ 整组按 8 字符定宽（同组等宽）
         advanced_fields: list[tuple[str, QWidget]] = []
         advanced_fields += self._make_int_spins(
@@ -1092,26 +1090,25 @@ class TrainTab(QWidget):
         self.dfl_row = advanced.add_field(dfl_label, dfl_control)
         self._param_rows["dfl"] = self.dfl_row
         self.advanced_group = advanced
-        advanced_box.addWidget(advanced)
+        layout.addWidget(advanced)
 
-        options = ParamGroup("训练选项", self.advanced_holder)
-        container = FlowContainer(options, spacing=T.SPACE_LG)
-        for key, label in _CHECK_PARAMS:
+        # 训练选项：两列栅格（成列对齐，比流式折行整齐）
+        options = ParamGroup("训练选项", card)
+        check_grid = QGridLayout()
+        check_grid.setContentsMargins(0, 0, 0, 0)
+        check_grid.setHorizontalSpacing(T.SPACE_LG)
+        check_grid.setVerticalSpacing(T.SPACE_SM)
+        for index, (key, label) in enumerate(_CHECK_PARAMS):
             box = CheckBox(label, options)
             box.stateChanged.connect(self._on_param_changed)
-            container.add(box)
+            check_grid.addWidget(box, index // 2, index % 2)
             self._checks[key] = box
-        options.add_widget(container)
+        for column in range(2):
+            check_grid.setColumnStretch(column, 1)
+        options.add_layout(check_grid)
         self.options_group = options
-        advanced_box.addWidget(options)
-
-        self.advanced_holder.setVisible(False)
-        layout.addWidget(self.advanced_holder)
+        layout.addWidget(options)
         return card
-
-    def _on_advanced_toggled(self, expanded: bool) -> None:
-        """展开 / 收起高级训练参数（纯视图状态，不进项目配置）。"""
-        self.advanced_holder.setVisible(bool(expanded))
 
     def _build_image_card(self) -> CardWidget:
         """图像设置：输入尺寸、通道与「图像预览」（letterbox + 增强示意）。
@@ -1119,7 +1116,7 @@ class TrainTab(QWidget):
         尺寸与通道是图像侧的输入规格（Ultralytics 的 `imgsz` / `channels`），
         每次训练前通常要看一眼，因此独立成卡、与数据区放在一起。
         """
-        card, layout = self._card("图像设置")
+        card, layout = self._card("图像设置", IMAGE_HELP)
         self.image_card = card
         fields = self._make_int_spins(
             card, _IMAGE_INT_PARAMS, T.STEPPER_CHARS, compact=True
@@ -1161,7 +1158,7 @@ class TrainTab(QWidget):
         提示文字单独一行：显卡名可能很长，与下拉挤在一行会把下拉压窄
         （§1 一行最多两个默认控件）。
         """
-        card, layout = self._card("设备配置")
+        card, layout = self._card("设备配置", DEVICE_HELP)
         row = QHBoxLayout()
         row.setSpacing(T.SPACE_MD)
         row.addWidget(CaptionLabel("设备", card))
@@ -1178,28 +1175,23 @@ class TrainTab(QWidget):
         return card
 
     def _build_distribution_card(self) -> CardWidget:
-        """类别分布（**只读**）+ 类别失衡权重强度（`cls_pw`）。
+        """类别分布（**只读**，条形图）+ 类别失衡权重强度（`cls_pw`）。
 
-        卡片只陈述训练集事实：各类别的数量与占比（检测族按标签框数、分类按
-        类别目录图片数），便于判断数据是否均衡。原先还展示「逆频次权重」并可
-        写进配置，那份字典没有任何后端消费（Ultralytics 的失衡处理是内部的
-        `cls_pw` 幂次），属误导性设置，已删除。
+        用**条形图**表达每个类别的样本量（条长 = 相对最多类，右侧标注「数量
+        （占比）」）：文字栅格在窄卡片里会参差不齐，图更直观也更像成品软件。
+        统计口径：检测 / 旋转框 / 实例分割按标签**框数**、分类按类别目录图片数。
 
         真正生效的开关是 `cls_pw`（0 = 关闭，1 = 完全逆频次）：权重由
         Ultralytics 在训练开始时按训练集频次自行生成，**只有检测族**
         （检测 / 实例分割 / 旋转框）的损失消费它，其它任务整组隐藏（§23）。
         """
-        card, layout = self._card("类别分布")
+        card, layout = self._card("类别分布", DISTRIBUTION_HELP)
         self.dist_card = card
+        self.dist_chart = BarChart(card)
+        layout.addWidget(self.dist_chart)
         self.dist_hint = CaptionLabel("", card)
         self.dist_hint.setWordWrap(True)
         layout.addWidget(self.dist_hint)
-
-        self.dist_holder = QWidget(card)
-        self.dist_grid = QGridLayout(self.dist_holder)
-        self.dist_grid.setContentsMargins(0, 0, 0, 0)
-        self.dist_grid.setSpacing(T.SPACE_XS)
-        layout.addWidget(self.dist_holder)
 
         # 失衡权重强度：Ultralytics `cls_pw`（训练开始时按训练集频次自动生成
         # 逆频次权重），仅检测族显示——见 `_apply_param_visibility`
@@ -1208,7 +1200,8 @@ class TrainTab(QWidget):
         balance_box.setContentsMargins(0, 0, 0, 0)
         balance_box.setSpacing(T.SPACE_MD)
         balance_box.addWidget(CaptionLabel("失衡权重", self.balance_row))
-        self.cls_pw_spin = SafeDoubleSpinBox(self.balance_row)
+        # 紧凑步进器：半栏宽卡片里与图表并排，省 54px
+        self.cls_pw_spin = SafeCompactDoubleSpinBox(self.balance_row)
         self.cls_pw_spin.setRange(0.0, 1.0)
         self.cls_pw_spin.setSingleStep(0.05)
         self.cls_pw_spin.setDecimals(2)
@@ -1228,7 +1221,7 @@ class TrainTab(QWidget):
         return card
 
     def _fill_distribution(self) -> None:
-        """刷新类别分布卡（数量 / 占比 / 悬殊比）。
+        """刷新类别分布卡（条形图 + 一行状态）。
 
         统计要扫训练集标签，而刷新链路会被参数改动频繁触发——用输入签名
         挡掉无变化的重算重绘。**切换拆分 / 重新分配拆分必须跟着刷新**
@@ -1239,24 +1232,23 @@ class TrainTab(QWidget):
         if signature == self._weight_inputs_rendered:
             return
         self._weight_inputs_rendered = signature
-        while self.dist_grid.count():
-            item = self.dist_grid.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
         rows = self._vm.class_distribution()
         if not rows:
+            self.dist_chart.set_data([])
             self.dist_hint.setText("暂无可统计的训练集")
             return
-        for index, row in enumerate(rows):
-            self.dist_grid.addWidget(
-                CaptionLabel(
-                    f"{row['name']} · {row['count']}（{row['share']:.0f}%）",
-                    self.dist_holder,
-                ),
-                index // 2, index % 2,
-            )
+        # 条长相对**最多类**（类别之间可比）；颜色取项目里定义的类别颜色，
+        # 与标注 / 图库同色，右侧同时给出数量与占比
         counts = [row["count"] for row in rows]
+        peak = float(max(counts) or 1)
+        colors = self._vm.class_colors([row["name"] for row in rows])
+        self.dist_chart.set_data([
+            (
+                str(row["name"]), float(row["count"]), peak, colors[index],
+                f"{row['count']}（{row['share']:.0f}%）",
+            )
+            for index, row in enumerate(rows)
+        ])
         fewest = min(counts)
         self.dist_hint.setText(
             "各类别数量一致" if fewest <= 0 or max(counts) == fewest
@@ -1314,14 +1306,13 @@ class TrainTab(QWidget):
             backend.supports_train_param("imgsz")
             or backend.supports_train_param("channels")
         )
+        # 高级组整组都无适用项时隐藏（U-Net / Anomalib 只保留常用与设备）
         advanced_any = any(
             backend.supports_train_param(key)
             for key in ("patience", "close_mosaic", "workers", "weight_decay",
                         "momentum", "warmup_epochs", "dropout", "dfl")
         )
-        self.advanced_bar.setVisible(advanced_any)
-        if not advanced_any:
-            self.advanced_holder.setVisible(False)
+        self.advanced_group.setVisible(advanced_any)
 
         self.balance_row.setVisible(detection)
         self.dist_card.setVisible(supports_class_counts(task))
@@ -1331,39 +1322,56 @@ class TrainTab(QWidget):
         )
 
     def _build_aug_card(self) -> CardWidget:
-        """数据增强：全局开关 + **逐项启用**开关 + 数值。
+        """数据增强：全局开关 + **逐项启用**开关 + 数值（两列栅格）。
 
-        每项 = 「勾选（是否启用）+ 数值（概率 / 幅度）」：取消勾选时该项按 0
-        下发（Ultralytics 里 0 = 关闭），**数值本身保留在配置里**，重新勾选
-        即恢复——不会因为试一次就丢掉调好的概率。
+        每项 = 「勾选（是否启用）+ 数值（概率 / 幅度）」，两列排布：勾选列与
+        数值列各自按最长内容**取齐**，一眼能顺着列往下看（比流式折行整齐，也
+        不会把勾选文字压没，§1/§2）。取消勾选时该项按 0 下发（Ultralytics 里
+        0 = 关闭），**数值本身保留在配置里**，重新勾选即恢复——不会因为试一次
+        就丢掉调好的概率。
+
+        参数含义 / 调参顺序（一次只改一项、先看预览再跑）在标题旁的「?」里
+        （`train_help.AUGMENT_HELP`）。
         """
-        card, layout = self._card("数据增强")
+        card, layout = self._card("数据增强", AUGMENT_HELP)
         self.aug_card = card
         self.augment_check = CheckBox("启用图像增强", card)
         self.augment_check.setChecked(True)
         self.augment_check.stateChanged.connect(self._on_augment_toggled)
         layout.addWidget(self.augment_check)
 
-        # 每项 = 一个逻辑分组（勾选 + 数值），容器化后按宽度折行：窄侧栏 /
-        # 大字体下不会把标签压没（§1，实测三列栅格会把勾选文字整段挤掉）
-        self.aug_holder = FlowContainer(
-            card, spacing=T.SPACE_MD, margins=(0, 0, 0, 0)
-        )
+        self.aug_holder = QWidget(card)
+        grid = QGridLayout(self.aug_holder)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(T.SPACE_LG)
+        grid.setVerticalSpacing(T.SPACE_SM)
+        boxes: list[CheckBox] = []
+        spins: list[SafeCompactDoubleSpinBox] = []
         for key, label, minimum, maximum, default, step in _AUG_PARAMS:
-            box_check = CheckBox(label, card)
-            box_check.setToolTip(f"启用「{label}」")
-            box_check.toggled.connect(self._on_augment_item_toggled)
-            # 紧凑步进器：省 54px/个，「勾选 + 数值」才能两列并排而不撐破卡片
-            spin = SafeCompactDoubleSpinBox(card)
+            spin = SafeCompactDoubleSpinBox(self.aug_holder)
             spin.setRange(minimum, maximum)
             spin.setSingleStep(step)
             spin.setDecimals(3 if step < 0.01 else 2)
             spin.setValue(default)
             spin.setFixedWidth(T.field_width(spin, T.STEPPER_CHARS_NARROW))
             spin.valueChanged.connect(self._on_param_changed)
-            self.aug_holder.add(ToolGroup(box_check, spin, parent=card))
             self._aug_spins[key] = spin
+            spins.append(spin)
+
+            box_check = CheckBox(label, self.aug_holder)
+            box_check.setToolTip(f"启用「{label}」")
+            box_check.toggled.connect(self._on_augment_item_toggled)
             self._aug_checks[key] = box_check
+            boxes.append(box_check)
+        # 勾选列按最长标签取齐（数值框本身已等宽），两列成列对齐
+        label_width = T.label_width(self.aug_holder, [box.text() for box in boxes]) + 24
+        for index, (box_check, spin) in enumerate(zip(boxes, spins)):
+            box_check.setMinimumWidth(label_width)
+            column = (index % 2) * 2
+            grid.addWidget(box_check, index // 2, column)
+            grid.addWidget(spin, index // 2, column + 1)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
         layout.addWidget(self.aug_holder)
         return card
 

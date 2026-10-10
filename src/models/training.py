@@ -103,8 +103,14 @@ class TrainingConfig:
         return bool(stored)
 
     def augment_value(self, key: str) -> float:
-        """该增强项**实际下发**的数值：未启用一律 0（Ultralytics 里 0 = 关闭）。"""
-        if not self.augment_enabled_for(key):
+        """该增强项**实际下发**的数值：全局关闭或该项未启用 → 0。
+
+        Ultralytics 里 0 = 关闭；数值本身保留在配置里（重新启用即可恢复）。
+        注意 `augment` 在 Ultralytics 里是**预测期 TTA** 开关，训练期增强完全由
+        各增强项数值决定——所以全局总开关必须在这里生效，否则「关掉增强」训练时
+        照旧（历史缺陷，见《开发文档.md》§4.75）。
+        """
+        if not self.augment or not self.augment_enabled_for(key):
             return 0.0
         return float(getattr(self, key, 0.0) or 0.0)
 

@@ -124,11 +124,34 @@ class BarChart(QWidget):
         self.setMinimumHeight(self.ROW_HEIGHT * 3)
         _follow_theme(self)
 
-    def set_data(self, rows: list[tuple[str, float, float, str]]) -> None:
-        """rows 为 (名称, 数值, 参考总量, 颜色) 列表。"""
-        self._rows = list(rows)
+    def set_data(self, rows: list[tuple]) -> None:
+        """rows 为 (名称, 数值, 参考总量, 颜色[, 右侧文字]) 列表。
+
+        右侧文字缺省按整数数值绘制；给出第 5 项就原样绘制（如「12（33%）」），
+        便于在半栏宽卡片里同时表达数量与占比。
+        """
+        self._rows = [tuple(row) for row in rows]
         self.setMinimumHeight(max(self.ROW_HEIGHT * 3, self.ROW_HEIGHT * len(self._rows)))
         self.update()
+
+    def _column_widths(self, metrics) -> tuple[float, float, float]:
+        """列宽（名称 / 数值 / 轨道）：按控件宽度收敛，**名称列优先**。
+
+        半栏宽卡片（约 200px）里固定 120+64 会把轨道压没；反过来只按比例分，
+        长类别名又会被省略号吃掉（「scratch」→「scrat…」）。因此：
+        名称列按宽度占比（上限 120、下限 52）→ 数值列按文字需要（不超过剩余）
+        → 轨道吃掉剩下的（≥ 32px）。`paintEvent` 与自检共用这一份计算。
+        """
+        texts = [
+            str(row[4]) if len(row) > 4 else f"{int(row[1])}" for row in self._rows
+        ]
+        text_need = max(metrics.horizontalAdvance(t) for t in texts) + 12.0
+        label_width = min(120.0, max(52.0, self.width() * 0.42))
+        spare = max(48.0, self.width() - label_width - 8 - 32 - 8)
+        value_width = min(text_need, spare)
+        left = label_width + 8
+        right = max(left + 32, self.width() - value_width - 8)
+        return label_width, value_width, right - left
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         painter = QPainter(self)
@@ -139,18 +162,20 @@ class BarChart(QWidget):
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "暂无数据")
             return
 
-        label_width = 120.0
-        value_width = 64.0
-        left = label_width + 8
-        right = max(left + 40, self.width() - value_width - 8)
-        track_width = right - left
-
         font = QFont(self.font())
         font.setPointSizeF(max(7.5, font.pointSizeF()))
         painter.setFont(font)
         metrics = painter.fontMetrics()
 
-        for index, (name, value, reference, color) in enumerate(self._rows):
+        label_width, value_width, track_width = self._column_widths(metrics)
+        left = label_width + 8
+        right = left + track_width
+
+        for index, row in enumerate(self._rows):
+            name, value, reference, color = row[:4]
+            value_text = (
+                str(row[4]) if len(row) > 4 else f"{int(value)}"
+            )
             top = index * self.ROW_HEIGHT + 3
             bar_height = self.ROW_HEIGHT - 10
 
@@ -176,7 +201,9 @@ class BarChart(QWidget):
             painter.drawText(
                 QRectF(right + 6, top, value_width - 6, bar_height),
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
-                f"{int(value)}",
+                metrics.elidedText(
+                    value_text, Qt.TextElideMode.ElideRight, int(value_width) - 8
+                ),
             )
 
 

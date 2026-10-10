@@ -19,6 +19,8 @@ from __future__ import annotations
 from PySide6.QtCore import Qt
 from qfluentwidgets import BodyLabel, MessageBoxBase, PushButton, SubtitleLabel
 
+from src.utils import automation
+
 SAVE = "save"
 DISCARD = "discard"
 CANCEL = "cancel"
@@ -76,5 +78,12 @@ class UnsavedChangesDialog(MessageBoxBase):
 
 
 def ask_unsaved_changes(parent, action: str) -> str:
-    """询问未保存改动；返回值同 :meth:`UnsavedChangesDialog.exec_choice`。"""
+    """询问未保存改动；返回值同 :meth:`UnsavedChangesDialog.exec_choice`。
+
+    无人值守模式（`utils/automation`）下不弹窗，固定返回「保存」——自检脚本
+    在真机收尾关闭窗口时不会卡在事件循环里等人点击。
+    """
+    auto = automation.unsaved_choice()
+    if auto is not None:
+        return auto
     return UnsavedChangesDialog(parent, action).exec_choice()
