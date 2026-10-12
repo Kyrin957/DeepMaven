@@ -19,6 +19,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Signal
 
 from src.models.training import TrainingConfig
+from src.services.backends import for_task as backend_for_task
 from src.services.backends import resolve as resolve_backend
 from src.services.dataset_service import DatasetService
 from src.services.project_service import ProjectService
@@ -48,15 +49,46 @@ def normalize_model_key(key, task: str) -> str:
     原样保留。旧项目可能把 key 存成基础名（如分类项目里的 ``yolo11n``），
     卡片规格行与下拉都按 key 显示——必须规范成精确权重名，避免与检测变体
     混淆（历史故障：分类项目显示 ``YOLO11n``）。
+
+    注意后端**必须按任务查**（`for_task`）：`resolve()` 收的是训练配置，
+    传任务字符串会退回默认的 YOLO 后端（历史实现即如此），异常检测 / 语义
+    分割 / OCR 的 key 判断随之失真。
     """
     text = str(key or "")
     if not text:
         return ""
-    if resolve_backend(task).key != "yolo":
+    if backend_for_task(task).key != "yolo":
         return text
     base = base_variant_key(text)
     suffix = TASK_MODEL_SUFFIX.get(str(task or ""), "")
     return f"{base}{suffix}"
+
+
+def default_model_key(task: str) -> str:
+    """该任务在「模型与权重」下拉里的**默认选项**（下拉首项 = 默认选择）。
+
+    候选由任务对应的后端提供（`BackendAdapter.candidates`）：检测族是 YOLO
+    变体，异常检测是 anomalib 算法（``Padim``），语义分割是 U-Net 变体，
+    OCR 是 ``det``。界面下拉与新建模型的默认 key 必须**同源**——否则异常
+    检测项目会拿到 YOLO 的 key（§4.80：新项目自动建的模型卡片显示 YOLO11n）。
+    """
+    candidates = backend_for_task(task).candidates(task)
+    return str(candidates[0]["key"]) if candidates else ""
+
+
+def model_key_for_task(key, task: str) -> str:
+    """把模型 key 收敛到该任务的候选列表：不在列表里 → 该任务的默认项。
+
+    用于打开项目（活配置 + 各模型快照）与新建模型：**任务的候选表是唯一
+    判据**——写别的后端 / 别的任务的 key，训练时拼出的权重名根本不存在
+    （`yolo11n.pt` vs anomalib 算法名）。
+    """
+    candidates = backend_for_task(task).candidates(task)
+    keys = {str(item.get("key")) for item in candidates}
+    text = normalize_model_key(key, task)
+    if text and (not keys or text in keys):
+        return text
+    return str(candidates[0]["key"]) if candidates else text
 
 
 def _pick(metrics: dict, keys: tuple) -> float:
@@ -145,11 +177,13 @@ class TrainViewModel(QObject):
             # 项目里下拉会变回检测模型列表，历史故障）
             task = task_of(project.model_type)
             self._config.task_type = task
-            # 模型 key 与任务后缀对齐（分类 → yolo11n-cls；检测无后缀）：
-            # 旧项目可能存着基础名，卡片与下拉显示不精确（历史故障）。
+            # 模型 key 与任务对齐：后缀对齐（分类 → yolo11n-cls；检测无后缀）
+            # **且必须落在该任务的候选表里**——新项目的活配置是
+            # `TrainingConfig()` 的默认值（yolo11n），异常检测 / 语义分割 / OCR
+            # 直接用它会让卡片与下拉显示别的任务的模型（§4.80）。
             # 快照（含非活动模型）与活配置都要对齐——活配置是活动模型的来源。
             self._normalize_project_model_keys(project, task)
-            self._config.model_key = normalize_model_key(
+            self._config.model_key = model_key_for_task(
                 self._config.model_key, task
             )
             # 训练模型：迁移旧数据（训练设置 / 单配置），产物目录指向活动模型的
@@ -173,6 +207,8 @@ class TrainViewModel(QObject):
     def _normalize_project_model_keys(self, project, task: str) -> None:
         """把项目内所有训练模型的 model_key 与项目任务对齐（打开时迁移）。
 
+        口径见 `model_key_for_task`：后缀对齐 + 不在任务候选表里就换成该任务
+        的默认项（早期版本在异常检测项目里也建 YOLO 模型的遗留数据，见 §4.80）。
         仅在确有变化时回写并 `touch`（标记项目待保存 + 触发自动备份）。
         """
         raw = list(project.params.get("training_models") or [])
@@ -180,7 +216,7 @@ class TrainViewModel(QObject):
         for item in raw:
             config = dict(item.get("config") or {})
             current = str(config.get("model_key") or "")
-            fixed = normalize_model_key(current, task)
+            fixed = model_key_for_task(current, task)
             if fixed and fixed != current:
                 config["model_key"] = fixed
                 item["config"] = config
@@ -273,7 +309,12 @@ class TrainViewModel(QObject):
         )
 
     def create_model(self, name: str = "", copy_current: bool = True) -> int:
-        """新建训练模型（默认以当前参数为起点）——左侧模型管理的入口。"""
+        """新建训练模型（默认以当前参数为起点）——左侧模型管理的入口。
+
+        默认模型（权重来源）必须是**该任务下拉的默认项**：新项目的活配置是
+        `TrainingConfig()` 的默认值（``yolo11n``），异常检测 / 语义分割 / OCR
+        照抄会给出一张 YOLO 模型卡（§4.80）。
+        """
         project = self._project_vm.project if self._project_vm else None
         if project is None:
             self.message.emit("warning", "请先创建或打开项目")
@@ -283,10 +324,15 @@ class TrainViewModel(QObject):
         model_id = max(
             [int(item.get("model_id", 0) or 0) for item in raw] or [0]
         ) + 1
+        config = self._snapshot() if copy_current else {}
+        task = str(self._config.task_type or "detect")
+        config["model_key"] = model_key_for_task(
+            str(config.get("model_key") or ""), task
+        )
         raw.append(self._make_model(
             model_id,
             str(name).strip() or f"模型 {model_id}",
-            config=self._snapshot() if copy_current else {},
+            config=config,
             split_id=int(self._config.split_id or 0),
         ))
         project.params["training_models"] = raw
@@ -493,13 +539,19 @@ class TrainViewModel(QObject):
         }
 
     def _migrate_models(self, project) -> list[dict]:
-        """旧数据迁移：训练设置 / 单配置 → 训练模型列表。
+        """旧数据迁移：训练设置 / 训练记录 → 训练模型列表。
 
-        每套训练设置转为一个模型，指标从历史记录里按 setup_id 匹配最近
-        一条；没有训练设置的老项目则整体转为「模型 1」。
+        每套训练设置转为一个模型，指标从历史记录里按 setup_id 匹配最近一条。
+        **新建项目不得凭空出现模型**（与拆分一致：点「新建」之前列表为空，
+        RULE §18）：只有确有过训练（留有历史记录）的老项目才把最近一次训练
+        转成「模型 1」，其余显式落一个空列表并返回空。参数本身都还在活配置
+        里，用户点「新建模型」时原样带走，不会丢。
         """
         setups = project.params.get("training_setups")
-        records = list(getattr(self._config, "history", []) or [])
+        # 以**项目自己的配置**为准：项目切换的瞬间 `self._config` 可能还指向
+        # 上一个项目（信号先于 load_from_project 到达时），用它会看错训练痕迹
+        source = project.training
+        records = list(getattr(source, "history", []) or [])
         models: list[dict] = []
         active = 0
         if isinstance(setups, list) and setups:
@@ -521,14 +573,23 @@ class TrainViewModel(QObject):
                 self._apply_record(model, record)
                 models.append(model)
             active = int(project.params.get("active_setup_id", 0) or 0)
-        if not models:
+        if not models and records:
+            # 老项目：把最近一次训练转成「模型 1」，指标 / 产物目录一并带上
             model = self._make_model(
-                1, "模型 1", config=self._snapshot(),
-                split_id=int(self._config.split_id or 0),
+                1, "模型 1", config=self._snapshot_of(source),
+                split_id=int(getattr(source, "split_id", 0) or 0),
             )
-            self._apply_record(model, records[-1] if records else None)
+            self._apply_record(model, records[-1])
             models = [model]
             active = 1
+        if not models:
+            # 从未训练过（含新建项目）：**不补建模型**，也不标记未保存——
+            # 空态由左栏提示「暂无训练模型：点击「新建模型」创建」表达（§23）
+            project.params["training_models"] = []
+            project.params["active_model_id"] = 0
+            project.params.pop("training_setups", None)
+            project.params.pop("active_setup_id", None)
+            return []
         project.params["training_models"] = models
         project.params["active_model_id"] = active or int(models[0]["model_id"])
         project.params.pop("training_setups", None)
@@ -654,15 +715,20 @@ class TrainViewModel(QObject):
     })
 
     def _snapshot(self) -> dict:
-        """当前训练配置中**属于设置**的部分（去掉运行状态与历史）。
+        """当前训练配置中**属于设置**的部分（去掉运行状态与历史）。"""
+        return self._snapshot_of(self._config)
+
+    @classmethod
+    def _snapshot_of(cls, config) -> dict:
+        """把一份训练配置转成模型快照（去掉运行状态 / 历史 / `task_type`）。
 
         排除 `task_type`：任务类型由项目类型决定（打开项目时绑定），
         快照里存了它会在加载时覆盖项目任务（曾导致分类项目的模型下拉
         变回检测列表）。
         """
         payload = {
-            key: value for key, value in self._config.to_dict().items()
-            if key not in self._RUNTIME_KEYS
+            key: value for key, value in config.to_dict().items()
+            if key not in cls._RUNTIME_KEYS
         }
         payload.pop("task_type", None)
         return payload

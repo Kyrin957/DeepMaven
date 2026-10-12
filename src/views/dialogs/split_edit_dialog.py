@@ -11,9 +11,12 @@
 测试各自「数量 ↔ 百分比」联动；异常图的训练格固定 0 并禁用（约束用控件可用性
 表达，说明走 tooltip）。环形图按**合并口径**预览（训练 / 验证 / 测试）。
 
-联动规则与拆分页一致：**改动项精确定值**，同一类别内其余项按各自当前值比例
-吸收剩余（数量模式合计 = 该类总数、百分比模式合计 = 100）；输出比例以
-数量口径为准（数量 / 总数）——「设 100 张」划分即 100 张。
+联动规则（锚点，RULE §18）：**编辑项定值 → 上一个编辑项保持不变 → 差额只落在
+剩下那一个框**——连改两格之后前两格就稳住了，继续微调只动那一个框，能一路
+逼近目标数字（只有首次编辑 / 反复改同一格时，其余项才按当前值比例分摊）。
+异常检测按类别分组，联动只发生在同一组内（改良好不影响异常）。数量模式合计 =
+该类总数、百分比模式合计 = 100；输出比例以数量口径为准（数量 / 总数）——
+「设 100 张」划分即 100 张。
 """
 
 from __future__ import annotations
@@ -82,6 +85,11 @@ class SplitEditDialog(MessageBoxBase):
         self._total = max(0, int(total))
         self._syncing = False
         self._choice = CANCEL
+        # 联动锚点：最近编辑过的子集（最新在前，最多留两个）。规则是「编辑项
+        # 定值 → 上一个编辑项不动 → 差额只落在**剩下那一个**框」（`_rebalance`，
+        # RULE §18）——这样连改两格后前两格就稳住了，能一路逼近目标数字
+        self._edit_order: list[str] = []
+        self._anomaly_order: dict[str, list[str]] = {"normal": [], "abnormal": []}
         self._anomaly = anomaly or None
         self._anomaly_totals: dict[str, int] = dict(
             (self._anomaly or {}).get("totals") or {}
@@ -172,7 +180,10 @@ class SplitEditDialog(MessageBoxBase):
         table.setVerticalSpacing(T.SPACE_SM)
 
         head_count = CaptionLabel("图像数", self)
-        head_count.setToolTip("分层抽样会按类别微调实际张数")
+        head_count.setToolTip(
+            "各子集按这里的张数落位（分层抽样只决定各类别怎么分）；"
+            "小于 3 张的类别会整体进训练集"
+        )
         head_count.setAlignment(
             Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter
         )
@@ -387,26 +398,78 @@ class SplitEditDialog(MessageBoxBase):
         self.pie.set_data(segments, str(total))
 
     def _rebalance_kind(self, kind: str, changed: str, value: int) -> dict:
-        """改一格后重排**同类别**其余行，使行和恒等于该类图片数。"""
+        """改一格后重排**同类别**其余行（锚点规则与常规表一致）。
+
+        联动只在同一类别内发生；异常图的训练格恒 0（只进验证 / 测试），
+        不参与联动。
+        """
         total = int(self._anomaly_totals.get(kind, 0))
+        keys = ["val", "test"] if kind == "abnormal" else ["train", "val", "test"]
         if kind == "abnormal" and changed == "train":
             value = 0
-        value = max(0, min(total, int(value)))
-        others = [sub for sub in ("train", "val", "test") if sub != changed]
-        if kind == "abnormal":
-            others = [sub for sub in others if sub != "train"]
-        current = self._anomaly_plan.get(kind) or {}
-        weights = {sub: max(0, int(current.get(sub, 0))) for sub in others}
-        if not any(weights.values()):
-            weights = {sub: 1 for sub in others}
-        sizes = DatasetService._proportional_sizes(total - value, weights)
-        rows = {sub: 0 for sub in ("train", "val", "test")}
-        rows[changed] = value
-        rows.update({sub: int(sizes.get(sub, 0)) for sub in others})
+        current = {
+            key: int((self._anomaly_plan.get(kind) or {}).get(key, 0))
+            for key in keys
+        }
+        current[changed] = max(0, int(value))
+        rows, order = self._rebalance(
+            changed, keys, current, total, self._anomaly_order.get(kind) or []
+        )
+        self._anomaly_order[kind] = order
+        rows["train"] = int(rows.get("train", 0))
         return rows
 
+    @staticmethod
+    def _rebalance(
+        changed: str,
+        keys: list[str],
+        values: dict[str, int],
+        total: int,
+        order: list[str],
+    ) -> tuple[dict[str, int], list[str]]:
+        """改一格后的重排：**编辑项定值、上一个编辑项不动、差额只落在第三项**。
+
+        规则（RULE §18）：
+
+          1. 编辑项取输入值——钳到「其余项不为负」的可行上限，写回输入框，
+             用户看得见（不再有改不动的框）；
+          2. 锚点 = `order` 里最近的**另一个**已编辑项，值保持不变；
+          3. 有锚点时差额**只由剩下那一个框**吸收。**禁止**改回「其余项按各自
+             当前值比例一起摊」——两项同时跳，用户不知道什么时候能落到想要的
+             数字（实测反馈：改来改去跳来跳去）；
+          4. 没有锚点（首次编辑 / 只编辑过这一格）时，其余项按当前值比例摊。
+
+        返回（新的各键值, 新的编辑顺序）。``total`` 是合计口径：数量 = 该类
+        图片数、百分比 = 100。
+        """
+        keys = list(keys)
+        order = [key for key in order if key in keys and key != changed]
+        anchor = order[0] if order else ""
+        new_order = ([changed] + order)[:2]
+        rows = {key: max(0, int(values.get(key, 0))) for key in keys}
+        value = max(0, int(values.get(changed, 0)))
+        if anchor:
+            others = [key for key in keys if key not in (changed, anchor)]
+            value = min(value, max(0, int(total) - rows[anchor]))
+            rows[changed] = value
+            rest = max(0, int(total) - value - rows[anchor])
+            for index, key in enumerate(others):
+                rows[key] = rest if index == 0 else 0
+            return rows, new_order
+        others = [key for key in keys if key != changed]
+        rows[changed] = min(value, max(0, int(total)))
+        weights = {key: rows[key] for key in others}
+        if not any(weights.values()):
+            weights = {key: 1 for key in others}
+        rows.update(
+            DatasetService._proportional_sizes(
+                max(0, int(total) - rows[changed]), weights
+            )
+        )
+        return rows, new_order
+
     def _on_anomaly_edited(self, kind: str, sub: str, mode: str) -> None:
-        """改数量或百分比：同类别其余行按比例吸收差额后写回。"""
+        """改数量或百分比：同类别按锚点规则重排后写回。"""
         if self._syncing:
             return
         total = int(self._anomaly_totals.get(kind, 0))
@@ -423,63 +486,77 @@ class SplitEditDialog(MessageBoxBase):
     # 联动
     # -----------------------------------------------------------
     def _on_ratio_edited(self, changed: str, mode: str) -> None:
-        """图像数 / 百分比联动：改动项精确定值，其余两项吸收剩余。"""
+        """图像数 / 百分比联动：**编辑项定值、上一项不动、差额只落在第三项**。
+
+        锚点规则见 `_rebalance`（RULE §18）：连续改两格之后前两格就稳住了，
+        继续微调只动剩下的那一个框——不再「改来改去跳来跳去」。
+        """
         if self._syncing:
             return
         keys = ("train", "val", "test")
         total = self._total
-        others = [key for key in keys if key != changed]
         if mode == "count" and total > 0:
-            count = max(0, min(total, int(self.count_spins[changed].value())))
-            counts = {changed: count}
-            weights = {
-                key: max(0, int(self.count_spins[key].value())) for key in others
-            }
-            if not any(weights.values()):
-                weights = {key: 1 for key in others}
-            sizes = DatasetService._proportional_sizes(total - count, weights)
-            counts.update({key: int(sizes.get(key, 0)) for key in others})
+            values = {key: int(self.count_spins[key].value()) for key in keys}
+            counts, self._edit_order = self._rebalance(
+                changed, list(keys), values, total, self._edit_order
+            )
             percents = {
                 key: int(round(counts[key] * 100 / total)) for key in keys
             }
         else:
-            percent = max(0, min(100, int(self.ratio_spins[changed].value())))
-            percents = {changed: percent}
-            weights = {
-                key: max(0, int(self.ratio_spins[key].value()))
-                for key in others
-            }
-            if not any(weights.values()):
-                weights = {key: 1 for key in others}
-            sizes = DatasetService._proportional_sizes(100 - percent, weights)
-            percents.update({key: int(sizes.get(key, 0)) for key in others})
-            counts = {
-                key: (int(round(percents[key] * total / 100)) if total else 0)
-                for key in keys
-            }
-            if total > 0:
-                # 数量合计对齐总数：余数补到改动项
-                counts[changed] = max(
-                    0, counts[changed] + total - sum(counts.values())
-                )
+            values = {key: int(self.ratio_spins[key].value()) for key in keys}
+            percents, self._edit_order = self._rebalance(
+                changed, list(keys), values, 100, self._edit_order
+            )
+            counts = self._counts_from_percents(percents, total, changed)
         self._apply_values(percents, counts)
 
-    def _apply_ratios(self, ratios: tuple) -> None:
-        """按比例初值回写两组输入框（数量合计对齐总数）。"""
-        keys = ("train", "val", "test")
-        percents = {
-            key: int(round(float(ratios[index]) * 100))
-            for index, key in enumerate(keys)
-        }
-        total = self._total
+    @staticmethod
+    def _counts_from_percents(percents: dict, total: int, changed: str) -> dict:
+        """百分比 → 数量：按比例取整，差额补到**刚编辑的那一项**。
+
+        补到改动项是为了不扰动锚点（其余两项保持稳定）；合计恒等于图片总数。
+        """
+        if total <= 0:
+            return {key: 0 for key in percents}
         counts = {
-            key: (int(round(percents[key] * total / 100)) if total else 0)
-            for key in keys
+            key: int(round(int(value) * total / 100))
+            for key, value in percents.items()
         }
+        gap = int(total) - sum(counts.values())
+        if gap and changed in counts:
+            counts[changed] = max(0, counts[changed] + gap)
+        return counts
+
+    def _apply_ratios(self, ratios: tuple) -> None:
+        """按比例初值回写两组输入框（**数量走最大余数法**，与执行口径一致）。
+
+        数量**不得**用「比例 → 百分比 → 数量」两次取整折算：300/571 显示成
+        53 % 再折回 303 张，打开弹窗就与上次设的 300 差一张（历史缺陷：
+        往返取整把「100」变成 99）。与 `DatasetService._split_targets` 同口径
+        （比例 → 千分整数 → 最大余数法），保证「弹窗里的数 = 执行后的数」。
+        """
+        keys = ("train", "val", "test")
+        total = self._total
         if total > 0:
-            counts["train"] = max(
-                0, counts["train"] + total - sum(counts.values())
-            )
+            weights = {
+                key: max(0, int(round(float(ratios[index]) * 1000)))
+                for index, key in enumerate(keys)
+            }
+            sizes = DatasetService._proportional_sizes(total, weights)
+            counts = {key: int(sizes.get(key, 0)) for key in keys}
+            gap = total - sum(counts.values())
+            if gap:
+                counts["train"] = max(0, counts["train"] + gap)
+            percents = {
+                key: int(round(counts[key] * 100 / total)) for key in keys
+            }
+        else:
+            percents = {
+                key: int(round(float(ratios[index]) * 100))
+                for index, key in enumerate(keys)
+            }
+            counts = {key: 0 for key in keys}
         self._apply_values(percents, counts)
 
     def _apply_values(self, percents: dict, counts: dict) -> None:

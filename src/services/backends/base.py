@@ -150,6 +150,28 @@ class BackendAdapter:
         keys = self.train_param_keys
         return keys is None or str(key) in keys
 
+    #: 任务专属参数的适用范围（键 → 只在哪些任务里被库消费）；未列出的键全任务适用
+    task_only_params: dict[str, tuple[str, ...]] = {}
+
+    def supports_task_param(self, key: str, task: str) -> bool:
+        """该参数在**这个任务**里是否被库真正消费（任务专属表，§4.84）。
+
+        界面据它与 `supports_train_param` **一起**决定字段显隐，`build_args`
+        同样只传通过的项——「设了不生效就不显示、不下发」同一条口径。
+        """
+        allowed = self.task_only_params.get(str(key))
+        return allowed is None or str(task) in allowed
+
+    def augment_keys(self, task: str) -> tuple[str, ...]:
+        """该任务**真正消费**的数据增强项（界面按此建卡片，空 = 不显示增强卡）。
+
+        与 `train_param_keys` 同一口径：设了不生效的项一律不显示（§23）。
+        YOLO 系按任务分两套（检测族走 `v8_transforms`、分类走
+        `classify_augmentations`）；U-Net / Anomalib / OCR 的训练不吃增强参数，
+        保持空（见 §4.83）。
+        """
+        return ()
+
     def candidates(self, task: str) -> list[dict]:
         """该任务的模型候选（[{"key": 权重名或变体 key, "label": 显示名}]）。"""
         return []

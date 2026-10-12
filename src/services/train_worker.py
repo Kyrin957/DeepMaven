@@ -28,6 +28,96 @@ from src.utils.pretrained import apply_model_env
 _ITERATION_INTERVAL = 0.5
 
 
+def prepare_data_path(args) -> str:
+    """数据配置路径：`channels != 3` 时写一份带 `channels` 的**运行期副本**。
+
+    `channels` **不是**训练参数——它属于**数据集配置**：`YOLODataset` 从
+    `data.yaml` 读 `channels`（1 = 灰度 / 其余按彩色加载，见
+    `data/dataset.py`），而 `get_cfg` 会以 “'channels' is not a valid YOLO
+    argument” **直接拒绝**把 `channels=…` 传给 `model.train()`（历史缺陷
+    §4.84：参数透传非法，训练一启动就报错）。
+
+    因此需要改通道时：把通道写进 `<project>/<name>/data-ch<N>.yaml`（模型自己的
+    产物目录，不动拆分产物里的 data.yaml——多套模型可以各自选通道），并把该
+    副本交给 `model.train(data=…)`。
+    """
+    channels = int(getattr(args, "channels", 3) or 3)
+    if channels == 3:
+        return str(args.data)
+    import yaml
+
+    source = Path(str(args.data))
+    payload: dict = {}
+    try:
+        payload = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
+    except (OSError, ValueError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    payload["channels"] = channels
+    target_dir = Path(str(args.project)) / str(args.name)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"data-ch{channels}.yaml"
+    target.write_text(
+        yaml.safe_dump(payload, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    emit({"type": "log", "text": f"数据配置（{channels} 通道）：{target.name}"})
+    return str(target)
+
+
+def train_kwargs(args, total: int, extra: dict | None = None) -> dict:
+    """构造 `model.train(...)` 的关键字（**只放库真正接受的训练参数**）。
+
+    逐键核对过 Ultralytics `DEFAULT_CFG`：`channels` 不在其中（走
+    `prepare_data_path`），其余键都是合法训练参数（§4.84 的自检会逐个断言）。
+    """
+    kwargs = {
+        "data": prepare_data_path(args),
+        "epochs": total,
+        "batch": args.batch,
+        "imgsz": args.imgsz,
+        "lr0": args.lr,
+        "optimizer": args.optimizer,
+        "weight_decay": args.weight_decay,
+        "momentum": args.momentum,
+        "warmup_epochs": args.warmup_epochs,
+        "patience": args.patience,
+        "cos_lr": args.cos_lr,
+        "deterministic": args.deterministic,
+        "close_mosaic": args.close_mosaic,
+        "val": args.val,
+        "cache": args.cache,
+        "single_cls": args.single_cls,
+        "rect": args.rect,
+        "dropout": args.dropout,
+        "device": args.device,
+        "workers": args.workers,
+        "seed": args.seed,
+        "project": args.project,
+        "name": args.name,
+        "resume": args.resume,
+        "exist_ok": True,
+        # 在线数据增强
+        "augment": args.augment,
+        "fliplr": args.hflip,
+        "flipud": args.vflip,
+        "degrees": args.degrees,
+        "scale": args.scale,
+        "translate": args.translate,
+        "hsv_h": args.hsv_h,
+        "hsv_s": args.hsv_s,
+        "hsv_v": args.hsv_v,
+        "mosaic": args.mosaic,
+        "mixup": args.mixup,
+        # 分类专属：Ultralytics 接受 "none"/"randaugment"/"autoaugment"
+        "auto_augment": args.auto_augment,
+        "erasing": args.erasing,
+    }
+    kwargs.update(extra or {})
+    return kwargs
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="DeepMaven 训练子进程")
     parser.add_argument("--data", required=True, help="data.yaml 路径")
@@ -76,6 +166,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hsv-h", type=float, default=0.015)
     parser.add_argument("--hsv-s", type=float, default=0.7)
     parser.add_argument("--hsv-v", type=float, default=0.4)
+    # 分类专属（库默认值一致）：随机增强策略（none / randaugment / autoaugment）
+    # 与随机擦除概率；检测族不消费（列表外的任务不下发，见 yolo.augment_keys）
+    parser.add_argument("--auto-augment", default="randaugment")
+    parser.add_argument("--erasing", type=float, default=0.4)
     parser.add_argument("--mosaic", type=float, default=1.0)
     parser.add_argument("--mixup", type=float, default=0.0)
     return parser
@@ -218,47 +312,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.dfl is not None:
             extra["dfl"] = args.dfl
 
-        model.train(
-            data=args.data,
-            epochs=total,
-            batch=args.batch,
-            imgsz=args.imgsz,
-            channels=args.channels,
-            lr0=args.lr,
-            optimizer=args.optimizer,
-            weight_decay=args.weight_decay,
-            momentum=args.momentum,
-            warmup_epochs=args.warmup_epochs,
-            patience=args.patience,
-            cos_lr=args.cos_lr,
-            deterministic=args.deterministic,
-            close_mosaic=args.close_mosaic,
-            val=args.val,
-            cache=args.cache,
-            single_cls=args.single_cls,
-            rect=args.rect,
-            dropout=args.dropout,
-            device=args.device,
-            workers=args.workers,
-            seed=args.seed,
-            project=args.project,
-            name=args.name,
-            resume=args.resume,
-            exist_ok=True,
-            # 在线数据增强
-            augment=args.augment,
-            fliplr=args.hflip,
-            flipud=args.vflip,
-            degrees=args.degrees,
-            scale=args.scale,
-            translate=args.translate,
-            hsv_h=args.hsv_h,
-            hsv_s=args.hsv_s,
-            hsv_v=args.hsv_v,
-            mosaic=args.mosaic,
-            mixup=args.mixup,
-            **extra,
-        )
+        model.train(**train_kwargs(args, total, extra))
     except Exception as exc:  # noqa: BLE001 - 子进程需回报任何失败
         traceback.print_exc()
         emit({"type": "error", "text": f"{type(exc).__name__}: {exc}"})

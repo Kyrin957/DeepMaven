@@ -60,8 +60,13 @@ class TrainingConfig:
     hsv_h: float = 0.015               # 色调变化
     hsv_s: float = 0.7                 # 饱和度变化
     hsv_v: float = 0.4                 # 亮度变化
-    mosaic: float = 1.0                # 马赛克概率
-    mixup: float = 0.0                 # 混合概率
+    mosaic: float = 1.0                # 马赛克概率（检测族专属）
+    mixup: float = 0.0                 # 混合概率（检测族专属）
+    # 分类专属（Ultralytics 分类管线 `classify_augmentations`）：随机增强策略与
+    # 随机擦除概率。默认值与库一致（randaugment / 0.4）——**界面必须显示**，
+    # 否则「真在生效却看不见」（§4.83）。
+    auto_augment: str = "randaugment"  # none / randaugment / autoaugment
+    erasing: float = 0.4               # 随机擦除概率（分类专属）
 
     # 异常检测（Anomalib）参数
     anomaly_root: str = ""             # 数据集根目录（含 normal/、abnormal/）
@@ -89,18 +94,36 @@ class TrainingConfig:
     # 历次训练记录（每完成一次追加一条，供训练页回看）
     history: list[dict] = field(default_factory=list)
 
-    # 逐项增强的键（界面按此顺序生成勾选 + 数值；非 dataclass 字段）
+    # 全部增强键（**不是**界面顺序：显示哪些、按什么顺序由任务后端决定——
+    # `BackendAdapter.augment_keys(task)`，与训练真正消费的参数同源，§4.83）
     AUGMENT_KEYS = (
         "hflip", "vflip", "degrees", "scale", "translate",
         "hsv_h", "hsv_s", "hsv_v", "mosaic", "mixup",
+        "auto_augment", "erasing",
     )
+    # 字符串型增强项（值不是数值，不能按「> 0」推断启用）
+    AUGMENT_CHOICE_KEYS = ("auto_augment",)
+    AUGMENT_CHOICE_NONE = "none"
 
     def augment_enabled_for(self, key: str) -> bool:
-        """该增强项是否启用；未记录时按「值 > 0」推断（旧项目兼容）。"""
-        stored = self.augment_enabled.get(str(key))
+        """该增强项是否启用；未记录时按「值 > 0 / ≠ none」推断（旧项目兼容）。"""
+        key = str(key)
+        stored = self.augment_enabled.get(key)
         if stored is None:
+            if key in self.AUGMENT_CHOICE_KEYS:
+                return str(getattr(self, key, "") or "") not in ("", self.AUGMENT_CHOICE_NONE)
             return float(getattr(self, key, 0.0) or 0.0) > 0.0
         return bool(stored)
+
+    def augment_auto(self) -> str:
+        """`auto_augment` 的**实际下发值**：总开关或该项未启用 → ``"none"``。
+
+        它是字符串参数（Ultralytics 接受 randaugment / autoaugment / none），
+        因此不能走 `augment_value()`（那是数值项的口径）。
+        """
+        if not self.augment or not self.augment_enabled_for("auto_augment"):
+            return self.AUGMENT_CHOICE_NONE
+        return str(self.auto_augment or self.AUGMENT_CHOICE_NONE)
 
     def augment_value(self, key: str) -> float:
         """该增强项**实际下发**的数值：全局关闭或该项未启用 → 0。
@@ -159,6 +182,8 @@ class TrainingConfig:
             "hsv_v": self.hsv_v,
             "mosaic": self.mosaic,
             "mixup": self.mixup,
+            "auto_augment": self.auto_augment,
+            "erasing": self.erasing,
             "anomaly_root": self.anomaly_root,
             "anomaly_normal_dir": self.anomaly_normal_dir,
             "anomaly_abnormal_dir": self.anomaly_abnormal_dir,
@@ -231,6 +256,8 @@ class TrainingConfig:
             hsv_v=data.get("hsv_v", 0.4),
             mosaic=data.get("mosaic", 1.0),
             mixup=data.get("mixup", 0.0),
+            auto_augment=str(data.get("auto_augment", "randaugment") or "none"),
+            erasing=data.get("erasing", 0.4),
             anomaly_root=data.get("anomaly_root", ""),
             anomaly_normal_dir=data.get("anomaly_normal_dir", "normal"),
             anomaly_abnormal_dir=data.get("anomaly_abnormal_dir", "abnormal"),

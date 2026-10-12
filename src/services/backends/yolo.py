@@ -30,6 +30,35 @@ from src.utils.device import normalize_device
 from src.utils.pretrained import resolve_pretrained
 from src.utils.tasks import is_detection_family
 
+# 数据增强项：**按任务分两套**，与 Ultralytics 真正消费的参数一一对应
+#   * 检测族（detect / obb / segment）走 `v8_transforms`：几何 + HSV + 拼接全支持；
+#   * 分类走 `classify_augmentations(size, scale, hflip, vflip, auto_augment,
+#     hsv_h/s/v, erasing)`：**没有** degrees / translate / mosaic / mixup
+#     （分类管线不消费，设了不生效 → 界面不显示，§4.83），但多了随机增强与
+#     随机擦除（库里默认 randaugment / 0.4，真在生效，必须可见可调）。
+DETECT_AUGMENT_KEYS = (
+    "hflip", "vflip", "degrees", "translate", "scale",
+    "hsv_h", "hsv_s", "hsv_v", "mosaic", "mixup",
+)
+CLASSIFY_AUGMENT_KEYS = (
+    "hflip", "vflip", "scale",
+    "hsv_h", "hsv_s", "hsv_v", "auto_augment", "erasing",
+)
+
+# 任务专属训练参数：Ultralytics **只在特定任务里消费**（§4.84 —— 设了不生效的
+# 参数既不在界面显示、也不下发）：
+#   * dropout —— 库注释写死 “dropout for classification head (classify only)”，
+#     检测 / 旋转框 / 实例分割模型的头部不读它；
+#   * rect —— 检测族 dataloader 的矩形批次（`rect_shape`，与 mosaic 互斥），
+#     分类数据集不读；
+#   * close_mosaic —— 只有 `YOLODataset` 有 `close_mosaic`（分类数据集没有
+#     → `_close_dataloader_mosaic` 直接跳过，属无效项）。
+TASK_ONLY_PARAMS: dict[str, tuple[str, ...]] = {
+    "dropout": ("classify",),
+    "rect": ("detect", "obb", "segment"),
+    "close_mosaic": ("detect", "obb", "segment"),
+}
+
 
 class YoloBackend(BackendAdapter):
     """Ultralytics YOLO（检测 / 旋转框 / 分割 / 分类）。"""
@@ -37,6 +66,16 @@ class YoloBackend(BackendAdapter):
     key = "yolo"
     label = "Ultralytics YOLO"
     tasks = ("detect", "obb", "segment", "classify")
+
+    #: 任务专属参数的适用范围（见模块常量 `TASK_ONLY_PARAMS`）
+    task_only_params = TASK_ONLY_PARAMS
+
+    def augment_keys(self, task: str) -> tuple[str, ...]:
+        """该任务真正消费的增强项（分类与检测族是两套，见模块常量）。"""
+        return (
+            CLASSIFY_AUGMENT_KEYS if str(task) == "classify"
+            else DETECT_AUGMENT_KEYS
+        )
 
     # -----------------------------------------------------------
     # 环境
@@ -88,12 +127,9 @@ class YoloBackend(BackendAdapter):
             "--patience", str(config.patience),
             "--cos-lr" if config.cos_lr else "--no-cos-lr",
             "--deterministic" if config.deterministic else "--no-deterministic",
-            "--close-mosaic", str(config.close_mosaic),
             "--val" if config.val else "--no-val",
             "--cache" if config.cache else "--no-cache",
             "--single-cls" if config.single_cls else "--no-single-cls",
-            "--rect" if config.rect else "--no-rect",
-            "--dropout", str(config.dropout),
             "--device", normalize_device(config.device),
             "--workers", str(config.workers),
             "--seed", str(config.seed),
@@ -112,8 +148,21 @@ class YoloBackend(BackendAdapter):
             "--hsv-v", str(config.augment_value("hsv_v")),
             "--mosaic", str(config.augment_value("mosaic")),
             "--mixup", str(config.augment_value("mixup")),
+            # 分类专属（库默认 randaugment / 0.4）：字符串项走 `augment_auto()`，
+            # 关闭 / 未启用时下发 none、0——与数值项的「0 = 关」同一口径
+            "--auto-augment", str(config.augment_auto()),
+            "--erasing", str(config.augment_value("erasing")),
             "--pause-file", str(pause_file(config)),
         ]
+        # 任务专属参数（§4.84）：库只在对应任务里消费（dropout 分类专属、
+        # rect / close_mosaic 检测族专属），其余任务**不传**，界面也不显示
+        task = str(config.task_type or "detect")
+        if self.supports_task_param("dropout", task):
+            args += ["--dropout", str(config.dropout)]
+        if self.supports_task_param("rect", task):
+            args += ["--rect" if config.rect else "--no-rect"]
+        if self.supports_task_param("close_mosaic", task):
+            args += ["--close-mosaic", str(config.close_mosaic)]
         # 检测族专属参数：分类任务（无权重 CrossEntropy、无回归头）、语义分割
         # （自研 U-Net）、异常检测（无监督）都不适用 —— **不传**，界面同样不
         # 显示（避免"设了不生效"）

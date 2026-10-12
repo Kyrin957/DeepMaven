@@ -117,10 +117,13 @@ _ADV_FLOAT_PARAMS = [
     ("dropout", "Dropout", 0.0, 0.9, 0.0, 0.05, 2),
     ("dfl", "DFL 增益", 0.0, 20.0, 1.5, 0.5, 2),
 ]
-# 图像设置：输入尺寸与通道（对应 Ultralytics 的 imgsz / channels）
+# 图像设置：输入尺寸（`imgsz`）与通道数
+# 通道**不是**训练参数（`get_cfg` 会拒绝 `channels=`），它写进**数据配置**：
+# 数据集按 `channels` 加载图像——1 = 灰度（`cv2.IMREAD_GRAYSCALE`）、其余按
+# 彩色加载（见 §4.84）。因此只给 1 / 3 两档（步长 2），4 通道库并不支持。
 _IMAGE_INT_PARAMS = [
     ("imgsz", "图像尺寸", 32, 2048, 640, 32, " px"),
-    ("channels", "通道", 1, 4, 3, 1, ""),
+    ("channels", "通道", 1, 3, 3, 2, ""),
 ]
 _CHECK_PARAMS = [
     ("deterministic", "使用确定性算法"),
@@ -131,18 +134,94 @@ _CHECK_PARAMS = [
     ("single_cls", "视为单一类别"),
     ("resume", "断点续训"),
 ]
-_AUG_PARAMS = [
-    ("hflip", "水平翻转", 0.0, 1.0, 0.5, 0.05),
-    ("vflip", "垂直翻转", 0.0, 1.0, 0.0, 0.05),
-    ("degrees", "旋转角度", 0.0, 180.0, 0.0, 5.0),
-    ("scale", "缩放幅度", 0.0, 1.0, 0.5, 0.05),
-    ("translate", "平移幅度", 0.0, 1.0, 0.1, 0.05),
-    ("hsv_h", "色调变化", 0.0, 1.0, 0.015, 0.005),
-    ("hsv_s", "饱和度变化", 0.0, 1.0, 0.7, 0.05),
-    ("hsv_v", "亮度变化", 0.0, 1.0, 0.4, 0.05),
-    ("mosaic", "马赛克", 0.0, 1.0, 1.0, 0.1),
-    ("mixup", "混合", 0.0, 1.0, 0.0, 0.1),
-]
+# 求解器下拉的说明（Ultralytics `optimizer`，逐条对着库源码写）：
+#   * `build_optimizer` 注册表 = SGD / MuSGD / Adam / Adamax / AdamW / NAdam /
+#     RAdam / RMSprop / auto（大小写不敏感）；
+#   * `auto`：按**总迭代数**挑——> 10000 用 MuSGD，否则 AdamW，并**忽略**配置
+#     里的学习率与动量（库会打日志说明）；
+#   * MuSGD：随新一代模型引入的 Muon+SGD 混合求解器，库不按模型系列设限
+#     （YOLO11 也能跑通），但 YOLO26 一代推荐它。
+OPTIMIZER_TIP = (
+    "Ultralytics `optimizer`。auto：迭代数 > 10000 自动用 MuSGD，否则 AdamW，"
+    "并忽略学习率 / 动量（由库按类别数决定）。MuSGD 是新一代（YOLO26）推荐的 "
+    "Muon+SGD 混合求解器，库不限制模型系列，YOLO11 也能用，但更常用 auto / SGD / AdamW。"
+)
+# 数据增强项的规格（键 → 标签 / 范围 / 步进 / 显示形态）。
+# **显示哪些项、按什么顺序**由任务后端决定（`BackendAdapter.augment_keys`，
+# 与训练真正消费的参数同源，§4.83）：
+#   * kind="prob"   概率型——Ultralytics 里它们本来就是 0~1 的概率，界面按 **%**
+#                   显示（0.5 → 「50 %」）：翻转一类「是 / 否」语义的项不再让人
+#                   猜「0.50 是什么意思」；
+#   * kind="amount" 幅度型——按库参数原样显示（tooltip 写明是 ± 幅度与默认值）；
+#   * kind="choice" 字符串型（随机增强策略）——下拉。
+# 默认值与 Ultralytics 官方逐项一致（fliplr 0.5 / flipud 0 / degrees 0 /
+# translate 0.1 / scale 0.5 / hsv 0.015·0.7·0.4 / mosaic 1.0 / mixup 0 /
+# auto_augment randaugment / erasing 0.4）。
+_AUG_SPECS: dict[str, dict] = {
+    "hflip": {
+        "label": "水平翻转", "kind": "prob",
+        "tip": "Ultralytics fliplr：50 % = 一半图片被随机水平翻转（默认 50 %）",
+    },
+    "vflip": {
+        "label": "垂直翻转", "kind": "prob",
+        "tip": "Ultralytics flipud：仅当图像上下方向没有语义时使用（默认 0 %）",
+    },
+    "degrees": {
+        "label": "旋转角度", "kind": "amount", "maximum": 180.0,
+        "step": 5.0, "decimals": 0, "suffix": " °",
+        "tip": "Ultralytics degrees：在 ±角度内随机旋转（默认 0）",
+    },
+    "translate": {
+        "label": "平移幅度", "kind": "amount", "maximum": 1.0,
+        "step": 0.05, "decimals": 2,
+        "tip": "Ultralytics translate：随机平移画面比例（默认 0.1 = ±10 %）",
+    },
+    "scale": {
+        "label": "缩放幅度", "kind": "amount", "maximum": 1.0,
+        "step": 0.05, "decimals": 2,
+        "tip": "Ultralytics scale：在 ±幅度内随机缩放（默认 0.5 = ±50 %）",
+    },
+    "hsv_h": {
+        "label": "色调变化", "kind": "amount", "maximum": 1.0,
+        "step": 0.005, "decimals": 3,
+        "tip": "Ultralytics hsv_h：色调抖动幅度（默认 0.015）",
+    },
+    "hsv_s": {
+        "label": "饱和度变化", "kind": "amount", "maximum": 1.0,
+        "step": 0.05, "decimals": 2,
+        "tip": "Ultralytics hsv_s：饱和度抖动幅度（默认 0.7）",
+    },
+    "hsv_v": {
+        "label": "亮度变化", "kind": "amount", "maximum": 1.0,
+        "step": 0.05, "decimals": 2,
+        "tip": "Ultralytics hsv_v：亮度抖动幅度（默认 0.4）",
+    },
+    "mosaic": {
+        "label": "马赛克", "kind": "prob",
+        "tip": "Ultralytics mosaic：4 张图拼成 1 张（检测族专属；"
+               "开了「矩形训练」时库会强制关闭，默认 100 %）",
+    },
+    "mixup": {
+        "label": "混合", "kind": "prob",
+        "tip": "Ultralytics mixup：两张图按透明度叠加（检测族专属，默认 0 %）",
+    },
+    "auto_augment": {
+        "label": "随机增强", "kind": "choice",
+        "options": (
+            ("none", "关闭"),
+            ("randaugment", "RandAugment"),
+            ("autoaugment", "AutoAugment"),
+        ),
+        "tip": "Ultralytics auto_augment：分类专属的自动增强策略（库默认 RandAugment）",
+    },
+    "erasing": {
+        "label": "随机擦除", "kind": "prob",
+        "tip": "Ultralytics erasing：分类专属，随机遮住一块（默认 40 %）",
+    },
+}
+# 概率型项在界面上的取值范围（0~100 %；存配置时 /100）
+_AUG_PROB_PERCENT = 100.0
+_AUG_PROB_STEP = 5.0
 
 _LOSS_COLORS = {"训练损失": "#0F6CBD", "验证损失": "#0F7B0F"}
 _METRIC_COLORS = ("#0F6CBD", "#0F7B0F", "#C42B1C", "#B16CEA", "#E8A33D")
@@ -426,8 +505,11 @@ class TrainTab(QWidget):
         self._int_spins: dict[str, SafeSpinBox] = {}
         self._float_spins: dict[str, SafeDoubleSpinBox] = {}
         self._checks: dict[str, CheckBox] = {}
-        self._aug_spins: dict[str, SafeCompactDoubleSpinBox] = {}
+        # 数据增强项（按任务重建，见 `_ensure_aug_items`）：勾选 / 输入控件 / 类型
         self._aug_checks: dict[str, CheckBox] = {}
+        self._aug_controls: dict[str, QWidget] = {}
+        self._aug_kinds: dict[str, str] = {}
+        self._aug_task: str = ""
         # 参数键 → 字段行（按后端能力整行显隐，见 _apply_param_visibility）
         self._param_rows: dict[str, QWidget] = {}
         self._tile_values: dict[str, BodyLabel] = {}
@@ -517,14 +599,15 @@ class TrainTab(QWidget):
             "" if models else "暂无训练模型：点击「新建模型」创建"
         )
 
-    @staticmethod
-    def _variant_label_for(model: dict, live=None) -> str:
+    def _variant_label_for(self, model: dict, live=None) -> str:
         """模型卡片规格行：**实际用于训练的权重来源**。
 
-        预训练变体：显示变体**全名**（含任务后缀）+ 输入尺寸——分类 / 分割 /
-        旋转框的权重名带任务后缀（如 ``yolo11n-cls``），必须显示全名以免与
-        检测变体混淆。自定义权重：显示「自定义权重 · 文件名」（此时变体不参与
-        训练，显示变体名会误导）。
+        变体名按**任务后端**的候选表解析（`BackendAdapter.candidates` 的
+        label，与「模型与权重」下拉**同源**）：YOLO 族显示变体全名（含任务
+        后缀，如 ``yolo11n-cls``）+ 输入尺寸；异常检测 / 语义分割 / OCR 显示
+        算法 / 子模型名（Padim、U-Net、文本检测）。**不得**只按
+        `YOLO_MODEL_VARIANTS` 反查——异常检测的卡片会显示 YOLO11n（§4.80）。
+        自定义权重显示「自定义权重 · 文件名」（此时变体不参与训练）。
 
         ``live``：活动模型的活配置（快照要等「切换模型 / 开始训练」才回写，
         用活配置才能当场反映变体与权重来源的改动）。
@@ -539,16 +622,24 @@ class TrainTab(QWidget):
         if weights:
             return f"自定义权重 · {Path(weights).name}"
         key = str(read("model_key") or "")
-        base = base_variant_key(key)
+        task = str(getattr(self._vm.config, "task_type", "") or "detect")
+        backend = backend_for_task(task)
+        label = next(
+            (
+                str(item.get("label") or item.get("key") or "")
+                for item in backend.candidates(task)
+                if str(item.get("key")) == key
+            ),
+            "",
+        ) or key or "—"
+        if backend.key != "yolo":
+            return label          # 其余后端没有「输入尺寸」这一规格
         variant = next(
-            (v for v in YOLO_MODEL_VARIANTS if v["key"] == base), None
+            (v for v in YOLO_MODEL_VARIANTS if v["key"] == base_variant_key(key)),
+            None,
         )
-        if variant is None:
-            return key or "—"
-        suffix = key[len(base):] if key.startswith(base) else ""
-        size = int(variant.get("imgsz") or 0)
-        name = f"{variant['label']}{suffix}"
-        return f"{name} ({size}x{size})" if size else name
+        size = int((variant or {}).get("imgsz") or 0)
+        return f"{label} ({size}x{size})" if size else label
 
     # --------------------------------------------------- 模型管理交互
     def _on_model_selected(self, model_id: int) -> None:
@@ -657,10 +748,12 @@ class TrainTab(QWidget):
         # 无训练模型时整体禁用（参数属于所选模型，见 _refresh）
         self.settings_body = body
         # 两列紧凑排布（参照 Halcon DLT）：
-        #   左列 数据集拆分（环形图 ｜ 汇总表）→ 模型与权重 → 图像设置 → 设备配置
-        #   右列 类别分布（条形图，需整列宽）→ 训练参数（常用 / 高级 / 训练选项）
-        #        → 数据增强
-        # 卡片按内容自适应高度、控件按参数字符宽度收紧，不再一律纵向占满整行
+        #   左列 数据集拆分（环形图 ｜ 汇总表）→ 类别分布（条形图）→ 模型与权重
+        #        → 图像设置 → 设备配置
+        #   右列 训练参数（常用 / 高级 / 训练选项）→ 数据增强
+        # 「类别分布」紧跟「数据集拆分」：两张数据体检卡相邻（划分结果 → 类别构成），
+        # 且条形图需**整列宽**（不与其它卡片并排）；卡片按内容自适应高度、控件按
+        # 参数字符宽度收紧，不再一律纵向占满整行
         columns = QHBoxLayout(body)
         columns.setContentsMargins(T.SPACE_XXS, T.SPACE_XXS, T.SPACE_XXS, T.SPACE_XXS)
         columns.setSpacing(T.SPACE_ML)
@@ -669,15 +762,16 @@ class TrainTab(QWidget):
         right = QVBoxLayout()
         right.setSpacing(T.SPACE_ML)
 
-        # 左列：数据与输入侧（拆分卡内部「环形图 ｜ 汇总表」左右排列）
+        # 左列：数据与输入侧（拆分卡内部「环形图 ｜ 汇总表」左右排列）；
+        # 拆分之后紧接着看类别分布——两张数据体检卡相邻，条形图要整列宽才舒展
+        # （并排时只剩 ~120px，类别名与「数量（占比）」都会被省略号吃掉）
         left.addWidget(self._build_split_card())
+        left.addWidget(self._build_distribution_card())
         left.addWidget(self._build_model_card())
         left.addWidget(self._build_image_card())
         left.addWidget(self._build_device_card())
         left.addStretch(1)
-        # 右列：先看数据体检（类别分布图），再调训练参数与增强——图表要整列宽
-        # 才舒展（并排时只剩 ~120px，类别名与「数量（占比）」都会被省略号吃掉）
-        right.addWidget(self._build_distribution_card())
+        # 右列：训练参数（常用 / 高级 / 训练选项）→ 数据增强
         right.addWidget(self._build_param_card())
         right.addWidget(self._build_aug_card())
         right.addStretch(1)
@@ -741,6 +835,7 @@ class TrainTab(QWidget):
         self.pie.setToolTip("训练 / 验证 / 测试的占比")
 
         table = QGridLayout()
+        table.setContentsMargins(0, 0, 0, 0)
         table.setHorizontalSpacing(T.SPACE_MD)
         table.setVerticalSpacing(T.SPACE_SM)
         table.setColumnMinimumWidth(1, T.LABEL_MIN_W)
@@ -801,8 +896,12 @@ class TrainTab(QWidget):
 
         table_holder = QWidget(card)
         table_holder.setLayout(table)
-        # 表在右列、按内容宽度放置：拉满会把「图像 / 百分比」两列推到卡片两端
-        body.addWidget(table_holder, 1, Qt.AlignmentFlag.AlignVCenter)
+        self.split_table_holder = table_holder      # 供自检核对列距（不随宽度变）
+        # 表在右列、**按内容宽度**放置（不加 stretch）：拉伸会把「图像 / 百分比」
+        # 两列推到卡片两端，行距随卡片宽度铺散——富余宽度留给卡片右侧空白，
+        # 列间固定为栅格间距（与拆分页概览卡同口径，§18）
+        body.addWidget(table_holder, 0, Qt.AlignmentFlag.AlignVCenter)
+        body.addStretch(1)
         layout.addLayout(body)
         return card
 
@@ -1025,7 +1124,10 @@ class TrainTab(QWidget):
         common = ParamGroup("常用", card)
         self.opt_combo = ComboBox(common)
         self.opt_combo.addItems(OPTIMIZERS)
+        self.opt_combo.setToolTip(OPTIMIZER_TIP)
         self.opt_combo.currentIndexChanged.connect(self._on_param_changed)
+        # auto 时库自己挑求解器与学习率、动量（见 `_sync_optimizer_lock`）
+        self.opt_combo.currentIndexChanged.connect(self._sync_optimizer_lock)
         common_fields: list[tuple[str, QWidget]] = [("求解器", self.opt_combo)]
         common_fields += self._make_int_spins(
             common, _COMMON_INT_PARAMS, T.STEPPER_CHARS_NARROW, compact=True
@@ -1101,6 +1203,9 @@ class TrainTab(QWidget):
         for index, (key, label) in enumerate(_CHECK_PARAMS):
             box = CheckBox(label, options)
             box.stateChanged.connect(self._on_param_changed)
+            if key == "rect":
+                # 矩形训练与马赛克互斥（库对 mosaic 强制关闭）：见 `_sync_rect_mosaic`
+                box.stateChanged.connect(self._sync_rect_mosaic)
             check_grid.addWidget(box, index // 2, index % 2)
             self._checks[key] = box
         for column in range(2):
@@ -1283,32 +1388,47 @@ class TrainTab(QWidget):
         ).exec()
 
     def _apply_param_visibility(self) -> None:
-        """按**后端能力** + 任务 + 模型系列显隐参数：设了不生效就不显示（§23）。
+        """按**后端能力** + **任务** + 模型系列显隐参数：设了不生效就不显示（§23）。
 
-        三条口径：
+        四条口径：
         1. **后端消费范围**（`BackendAdapter.train_param_keys`）：自研 U-Net
            只吃轮数 / 批次 / 尺寸 / 学习率 / 种子，Anomalib 只吃轮数 / 批次 /
            种子——名单外的字段整行隐藏，整组都不支持时连组与「高级」入口一起
            隐藏（`build_args` 同样只传这些）；
-        2. **检测族**（`is_detection_family`）：「失衡权重」`cls_pw` 与
+        2. **任务专属参数**（`BackendAdapter.task_only_params`，§4.84）：`dropout`
+           只在分类生效（库注释写死 “classify only”）→ 检测 / 旋转框 / 实例分割
+           隐藏；`rect` 与 `close_mosaic` 只对检测族生效（分类数据集不读）→
+           分类隐藏；
+        3. **检测族**（`is_detection_family`）：「失衡权重」`cls_pw` 与
            「DFL 增益」只在这类任务的损失里生效（分类是无权重 CrossEntropy）；
-        3. **模型系列**：YOLO26 是 `reg_max=1` 的 L1 回归，`dfl` 被忽略。
+        4. **模型系列**：YOLO26 是 `reg_max=1` 的 L1 回归，`dfl` 被忽略。
         """
         task = str(self._vm.config.task_type or "detect")
         backend = backend_for_task(task)
         detection = is_detection_family(task)
 
         for key, row in self._param_rows.items():
-            row.setVisible(backend.supports_train_param(key))
+            row.setVisible(
+                backend.supports_train_param(key)
+                and backend.supports_task_param(key, task)
+            )
         self.options_group.setVisible(backend.supports_train_param("deterministic"))
-        self.aug_card.setVisible(backend.supports_train_param("augment"))
+        # 训练选项里的复选框同样按任务显隐（如 rect 只有检测族读；整组不支持时
+        # 上面一行已经把整组隐藏）
+        for key, box in self._checks.items():
+            box.setVisible(backend.supports_task_param(key, task))
+        # 数据增强卡：**该任务的增强项非空**才显示（U-Net / Anomalib / OCR 的
+        # 训练不吃增强参数 → 整卡隐藏，§4.83；与 train_param_keys 同一口径）
+        self.aug_card.setVisible(bool(backend.augment_keys(task)))
         self.image_card.setVisible(
             backend.supports_train_param("imgsz")
             or backend.supports_train_param("channels")
         )
-        # 高级组整组都无适用项时隐藏（U-Net / Anomalib 只保留常用与设备）
+        # 高级组整组都无适用项时隐藏（U-Net / Anomalib 只保留常用与设备；
+        # 任务专属项被隐藏的（分类的 dropout / close_mosaic）不计入）
         advanced_any = any(
             backend.supports_train_param(key)
+            and backend.supports_task_param(key, task)
             for key in ("patience", "close_mosaic", "workers", "weight_decay",
                         "momentum", "warmup_epochs", "dropout", "dfl")
         )
@@ -1320,70 +1440,190 @@ class TrainTab(QWidget):
             detection and uses_dfl(self._current_model_key())
             and backend.supports_train_param("dfl")
         )
+        # 求解器 / 矩形训练联动：auto 时学习率与动量由库决定（禁用）；
+        # 矩形训练开启时马赛克被库强制关闭（禁用）——见 §4.84
+        self._sync_optimizer_lock()
+        self._sync_rect_mosaic()
 
     def _build_aug_card(self) -> CardWidget:
-        """数据增强：全局开关 + **逐项启用**开关 + 数值（两列栅格）。
+        """数据增强：全局开关 + **按任务**的增强项（后端 `augment_keys`）。
 
-        每项 = 「勾选（是否启用）+ 数值（概率 / 幅度）」，两列排布：勾选列与
-        数值列各自按最长内容**取齐**，一眼能顺着列往下看（比流式折行整齐，也
-        不会把勾选文字压没，§1/§2）。取消勾选时该项按 0 下发（Ultralytics 里
-        0 = 关闭），**数值本身保留在配置里**，重新勾选即恢复——不会因为试一次
-        就丢掉调好的概率。
+        **显示哪些项由任务决定**（与训练真正消费的参数同源，§4.83）：
+        检测 / 旋转框 / 实例分割 = 翻转 + 几何 + HSV + 拼接（10 项）；
+        分类 = 翻转 + 缩放 + HSV + 随机增强 + 随机擦除（分类管线不消费
+        旋转、平移、马赛克、混合，故不显示）；语义分割 / 异常检测 / OCR
+        整卡隐藏（它们的训练不吃这些参数）。换任务时项集重建
+        （`_ensure_aug_items`）。
+
+        每项 = 「勾选（是否启用）+ 数值 / 下拉」，两列排布：勾选列与输入列各自
+        按最长内容**取齐**。**每一项的勾选与输入框是一个整体**——固定近距
+        （`SPACE_MD`，与训练参数卡字段行同口径），富余宽度留在项后，输入框
+        不会被推到列右缘去贴下一列的文字（§4.79）。概率型项按 **%** 显示
+        （库里是 0~1 的概率，「50 %」= 一半图片随机变换）。取消勾选时该项按
+        0 / none 下发（见 `TrainingConfig.augment_value` / `augment_auto`），
+        **数值本身保留在配置里**，重新勾选即恢复。
 
         参数含义 / 调参顺序（一次只改一项、先看预览再跑）在标题旁的「?」里
         （`train_help.AUGMENT_HELP`）。
         """
         card, layout = self._card("数据增强", AUGMENT_HELP)
         self.aug_card = card
-        self.augment_check = CheckBox("启用图像增强", card)
+        self._aug_card_layout = layout
+        self.augment_check = CheckBox("启用训练增强", card)
+        self.augment_check.setToolTip(
+            "训练期在线增强的总闸：关闭后所有增强项按 0 / none 下发，"
+            "并同时关掉验证 / 预测期的 TTA（Ultralytics augment）"
+        )
         self.augment_check.setChecked(True)
         self.augment_check.stateChanged.connect(self._on_augment_toggled)
         layout.addWidget(self.augment_check)
 
         self.aug_holder = QWidget(card)
-        grid = QGridLayout(self.aug_holder)
+        layout.addWidget(self.aug_holder)
+        self._ensure_aug_items(str(self._vm.config.task_type or "detect"))
+        return card
+
+    def _ensure_aug_items(self, task: str) -> None:
+        """按任务重建增强项（**项集与顺序来自后端 `augment_keys`**，§4.83）。
+
+        同一窗口内换项目（检测 ↔ 分类）时两套增强项不同，必须重建；重建后由
+        `_sync_aug_values` 按当前配置回填。任务不变时不重建——保住用户正在
+        编辑的控件与焦点。
+        """
+        task = str(task or "detect")
+        if getattr(self, "_aug_task", None) == task and self._aug_checks:
+            return
+        keys = [
+            key for key in backend_for_task(task).augment_keys(task)
+            if key in _AUG_SPECS
+        ]
+        old = getattr(self, "aug_holder", None)
+        holder = QWidget(self.aug_card)
+        if old is not None:
+            self._aug_card_layout.replaceWidget(old, holder)
+            old.setParent(None)
+            old.deleteLater()
+        self.aug_holder = holder
+        self._aug_task = task
+        self._aug_checks = {}
+        self._aug_controls = {}
+        self._aug_kinds = {}
+
+        grid = QGridLayout(holder)
         grid.setContentsMargins(0, 0, 0, 0)
         grid.setHorizontalSpacing(T.SPACE_LG)
         grid.setVerticalSpacing(T.SPACE_SM)
         boxes: list[CheckBox] = []
-        spins: list[SafeCompactDoubleSpinBox] = []
-        for key, label, minimum, maximum, default, step in _AUG_PARAMS:
-            spin = SafeCompactDoubleSpinBox(self.aug_holder)
-            spin.setRange(minimum, maximum)
-            spin.setSingleStep(step)
-            spin.setDecimals(3 if step < 0.01 else 2)
-            spin.setValue(default)
-            spin.setFixedWidth(T.field_width(spin, T.STEPPER_CHARS_NARROW))
-            spin.valueChanged.connect(self._on_param_changed)
-            self._aug_spins[key] = spin
-            spins.append(spin)
+        for key in keys:
+            spec = _AUG_SPECS[key]
+            box = CheckBox(str(spec["label"]), holder)
+            box.setToolTip(f"启用「{spec['label']}」")
+            box.toggled.connect(self._on_augment_item_toggled)
+            self._aug_checks[key] = box
+            self._aug_kinds[key] = str(spec["kind"])
+            self._aug_controls[key] = self._make_aug_control(holder, spec)
+            boxes.append(box)
+        # 勾选列按最长标签取齐（输入框本身已等宽），两列成列对齐。宽度取各勾选
+        # 控件**自身 sizeHint 的最大值**（含指示器开销，随字体 / DPI 自适应）；
+        # 离屏平台量不出 CJK 文字宽（§8），与度量下限取大以免列宽退化
+        label_width = max(
+            [box.sizeHint().width() for box in boxes]
+            + [T.label_width(holder, [box.text() for box in boxes]) + 24]
+        )
+        for index, key in enumerate(keys):
+            # 一项 = 「勾选 + 数值」**一个整体**（参照训练参数卡的字段行）：两控件
+            # 固定近距 `SPACE_MD`，富余宽度留在本项之后。直接把两个控件丢进栅格
+            # 不行——可扩张的勾选列会把富余宽度全吃掉，数值框被推到该列右缘、
+            # 紧贴下一列的勾选文字（看着像属于右边那一项，§2 / §23）
+            #
+            # 标签列宽由**容器**给（`label_cell`）：qf 的勾选控件被 QSS 写死了
+            # `min-width: 29px`，re-parent / 换主题的 re-polish 会把控件级
+            # `setMinimumWidth` 冲掉（实测 123 → 29），列宽只能由布局层保证
+            label_cell = QWidget(holder)
+            label_cell.setMinimumWidth(label_width)
+            cell_row = QHBoxLayout(label_cell)
+            cell_row.setContentsMargins(0, 0, 0, 0)
+            cell_row.addWidget(self._aug_checks[key])
 
-            box_check = CheckBox(label, self.aug_holder)
-            box_check.setToolTip(f"启用「{label}」")
-            box_check.toggled.connect(self._on_augment_item_toggled)
-            self._aug_checks[key] = box_check
-            boxes.append(box_check)
-        # 勾选列按最长标签取齐（数值框本身已等宽），两列成列对齐
-        label_width = T.label_width(self.aug_holder, [box.text() for box in boxes]) + 24
-        for index, (box_check, spin) in enumerate(zip(boxes, spins)):
-            box_check.setMinimumWidth(label_width)
-            column = (index % 2) * 2
-            grid.addWidget(box_check, index // 2, column)
-            grid.addWidget(spin, index // 2, column + 1)
-        grid.setColumnStretch(1, 1)
-        grid.setColumnStretch(3, 1)
-        layout.addWidget(self.aug_holder)
-        return card
+            pair = QWidget(holder)
+            pair_row = QHBoxLayout(pair)
+            pair_row.setContentsMargins(0, 0, 0, 0)
+            pair_row.setSpacing(T.SPACE_MD)
+            pair_row.addWidget(label_cell)
+            pair_row.addWidget(self._aug_controls[key])
+            pair_row.addStretch(1)
+            grid.addWidget(pair, index // 2, index % 2)
+        for column in range(2):
+            grid.setColumnStretch(column, 1)
+        self._sync_aug_values(self._vm.config)
+        self._sync_rect_mosaic()          # 新建的项要按「矩形训练」状态定可用性
+
+    def _make_aug_control(self, parent, spec: dict):
+        """建增强项的输入控件：概率型（按 % 显示）/ 幅度型数值 / 字符串下拉。"""
+        kind = str(spec["kind"])
+        if kind == "choice":
+            combo = ComboBox(parent)
+            for value, text in spec.get("options") or ():
+                combo.addItem(str(text), userData=str(value))
+            combo.setFixedWidth(T.field_width(combo, T.STEPPER_CHARS_NARROW))
+            combo.setToolTip(str(spec.get("tip") or ""))
+            combo.currentIndexChanged.connect(self._on_param_changed)
+            return combo
+        spin = SafeCompactDoubleSpinBox(parent)
+        if kind == "prob":
+            # 概率型：库里是 0~1，界面按 % 显示（0.5 → 「50 %」）
+            spin.setRange(0.0, _AUG_PROB_PERCENT)
+            spin.setSingleStep(_AUG_PROB_STEP)
+            spin.setDecimals(0)
+            spin.setSuffix(" %")
+        else:
+            spin.setRange(0.0, float(spec.get("maximum", 1.0)))
+            spin.setSingleStep(float(spec.get("step", 0.05)))
+            spin.setDecimals(int(spec.get("decimals", 2)))
+            if spec.get("suffix"):
+                spin.setSuffix(str(spec["suffix"]))
+        spin.setFixedWidth(T.field_width(spin, T.STEPPER_CHARS_NARROW))
+        spin.setToolTip(str(spec.get("tip") or ""))
+        spin.valueChanged.connect(self._on_param_changed)
+        return spin
+
+    def _sync_aug_values(self, config) -> None:
+        """按配置回填增强项（数值 / 下拉 + 启用勾选 + 可用性）。
+
+        概率型的配置值是 0~1（Ultralytics 口径），界面显示 ×100（%）；旧项目
+        没有 `augment_enabled` 标记时按「值 > 0 / ≠ none」推断（`augment_enabled_for`）。
+        调用方负责 `_syncing`，这里不触发写回。
+        """
+        self.augment_check.setChecked(bool(getattr(config, "augment", True)))
+        self.aug_holder.setEnabled(self.augment_check.isChecked())
+        for key, control in self._aug_controls.items():
+            kind = self._aug_kinds.get(key, "amount")
+            if kind == "choice":
+                value = str(getattr(config, key, "") or "none")
+                control.setCurrentIndex(max(0, control.findData(value)))
+            elif kind == "prob":
+                stored = float(getattr(config, key, 0.0) or 0.0)
+                control.setValue(round(stored * _AUG_PROB_PERCENT))
+            else:
+                control.setValue(float(getattr(config, key, 0.0) or 0.0))
+            enabled = bool(config.augment_enabled_for(key))
+            control.setEnabled(enabled)
+            box = self._aug_checks.get(key)
+            if box is not None:
+                box.setChecked(enabled)
 
     def _on_augment_item_toggled(self, _checked: bool) -> None:
-        """某一项增强的启用开关：联动数值框可用性与配置中的启用标记。"""
+        """某一项增强的启用开关：联动该项控件的可用性（数值保留在配置里）。"""
         if self._syncing:
             return
         sender = self.sender()
         for key, box in self._aug_checks.items():
             if box is sender:
-                self._aug_spins[key].setEnabled(box.isChecked())
+                control = self._aug_controls.get(key)
+                if control is not None:
+                    control.setEnabled(box.isChecked())
                 break
+        self._sync_rect_mosaic()          # 马赛克项还要看「矩形训练」的脸色
         self._on_param_changed()
 
     # --------------------------------------------------- 结果页
@@ -1626,6 +1866,44 @@ class TrainTab(QWidget):
         self.device_hint.setToolTip(help_text)
         self.device_combo.setToolTip(help_text)
 
+    def _sync_optimizer_lock(self, *_args) -> None:
+        """求解器 = auto 时禁用「学习率 / 动量」——库会忽略这两个值（§4.84）。
+
+        实测库日志：`optimizer=auto … ignoring 'lr0=…' and 'momentum=…'`，
+        留着可编辑就是「设了不生效」。禁用 + tooltip 说明原因，不隐藏（值仍在
+        配置里，换回具体求解器即生效）。
+        """
+        auto = self.opt_combo.currentText().strip().lower() == "auto"
+        for key in ("lr", "momentum"):
+            control = self._float_spins.get(key)
+            if control is None:
+                continue
+            control.setEnabled(not auto)
+            control.setToolTip(
+                "求解器为 auto 时由 Ultralytics 自动决定（忽略此值）" if auto else ""
+            )
+
+    def _sync_rect_mosaic(self, *_args) -> None:
+        """矩形训练开启时禁用「马赛克」项：库里两者互斥（rect 优先）。
+
+        `RandomPerspective` 对 `rect_shape` 有 assert「rect and mosaic are
+        mutually exclusive」、`build_transforms` 里 rect 时把 mosaic/mixup 置 0。
+        数值保留在配置里，取消矩形训练即恢复——不静默改写用户设置。
+        """
+        box = self._aug_checks.get("mosaic")
+        if box is None:
+            return
+        rect = self._checks.get("rect")
+        locked = bool(rect is not None and rect.isChecked())
+        box.setEnabled(not locked)
+        box.setToolTip(
+            "矩形训练开启时 Ultralytics 强制关闭马赛克（两者互斥）"
+            if locked else "启用「马赛克」"
+        )
+        control = self._aug_controls.get("mosaic")
+        if control is not None:
+            control.setEnabled(box.isChecked() and not locked)
+
     def _on_augment_toggled(self, _state: int) -> None:
         enabled = self.augment_check.isChecked()
         self.aug_holder.setEnabled(enabled)
@@ -1666,8 +1944,15 @@ class TrainTab(QWidget):
             values[key] = spin.value()
         for key, box in self._checks.items():
             values[key] = box.isChecked()
-        for key, spin in self._aug_spins.items():
-            values[key] = spin.value()
+        # 增强项：概率型按 % 显示 → 存回 0~1（Ultralytics 口径）；字符串型存下拉值
+        for key, control in self._aug_controls.items():
+            kind = self._aug_kinds.get(key, "amount")
+            if kind == "choice":
+                values[key] = str(control.currentData() or "none")
+            elif kind == "prob":
+                values[key] = float(control.value()) / _AUG_PROB_PERCENT
+            else:
+                values[key] = float(control.value())
         return values
 
     def _on_start(self) -> None:
@@ -1700,19 +1985,11 @@ class TrainTab(QWidget):
                 spin.setValue(float(getattr(config, key, spin.value()) or 0.0))
             for key, box in self._checks.items():
                 box.setChecked(bool(getattr(config, key, False)))
-            for key, spin in self._aug_spins.items():
-                spin.setValue(float(getattr(config, key, spin.value()) or 0.0))
-            self.augment_check.setChecked(bool(getattr(config, "augment", True)))
-            self.aug_holder.setEnabled(self.augment_check.isChecked())
-            # 逐项启用：旧项目没这个标记 → 按「值 > 0」推断
-            for key, box in self._aug_checks.items():
-                enabled = (
-                    config.augment_enabled_for(key)
-                    if hasattr(config, "augment_enabled_for")
-                    else float(getattr(config, key, 0.0) or 0.0) > 0.0
-                )
-                box.setChecked(bool(enabled))
-                self._aug_spins[key].setEnabled(bool(enabled))
+            # 增强项按任务重建（检测族与分类是两套项）后统一回填
+            self._ensure_aug_items(
+                str(getattr(config, "task_type", "detect") or "detect")
+            )
+            self._sync_aug_values(config)
 
             index = self.opt_combo.findText(str(getattr(config, "optimizer", "auto")))
             self.opt_combo.setCurrentIndex(max(0, index))

@@ -478,6 +478,12 @@ class DatasetService:
     ) -> dict[str, list[Path]]:
         """把图片分配到 train / val / test。
 
+        **张数口径为准**：目标张数由 `_split_targets`（比例 → 最大余数法）
+        折算，分层抽样只决定「各类别怎么分」，不改各子集的总张数——用户设
+        300/200/71 执行后就是 300/200/71（历史缺陷 §4.81：非分层按
+        `int(total * 比例)` 截断、分层逐组 trunc 后余数甩给测试集，结果
+        299/199/73）。
+
         stratified=True 时按分组键分层抽样，避免小类别整体落进同一子集；
         样本数少于 3 的组整体归入训练集，避免验证集出现单样本噪声。
 
@@ -509,37 +515,32 @@ class DatasetService:
                 buckets[sub].extend(allocated[sub])
         elif not stratified:
             rng.shuffle(items)
-            total = len(items)
-            n_train = int(total * split[0])
-            n_val = int(total * split[1])
-            buckets["train"].extend(items[:n_train])
-            buckets["val"].extend(items[n_train:n_train + n_val])
-            buckets["test"].extend(items[n_train + n_val:])
+            targets = DatasetService._split_targets(len(items), split)
+            cursor = 0
+            for sub in SPLIT_SUBDIRS:
+                buckets[sub].extend(items[cursor:cursor + targets[sub]])
+                cursor += targets[sub]
         else:
             groups: dict[tuple, list[Path]] = {}
             for image in items:
                 key = DatasetService._group_key(image, label_index, layout)
                 groups.setdefault(key, []).append(image)
 
-            for key in sorted(groups, key=lambda k: sorted(k)):
-                members = sorted(groups[key])
+            ordered = [
+                sorted(groups[key]) for key in sorted(groups, key=lambda k: sorted(k))
+            ]
+            for members in ordered:
                 rng.shuffle(members)
-                count = len(members)
-                if count >= 3:
-                    n_train = max(1, int(count * split[0]))
-                    n_val = max(1, int(count * split[1]))
-                    while n_train + n_val >= count:
-                        if n_val > 1:
-                            n_val -= 1
-                        elif n_train > 1:
-                            n_train -= 1
-                        else:
-                            break
-                else:
-                    n_train, n_val = count, 0
-                buckets["train"].extend(members[:n_train])
-                buckets["val"].extend(members[n_train:n_train + n_val])
-                buckets["test"].extend(members[n_train + n_val:])
+            # 目标张数在全体上定死，再按分组大小分摊到各组（合计严格相等）
+            targets = DatasetService._split_targets(len(items), split)
+            plan = DatasetService._stratified_sizes(
+                [len(members) for members in ordered], targets
+            )
+            for members, sizes in zip(ordered, plan):
+                cursor = 0
+                for sub in SPLIT_SUBDIRS:
+                    buckets[sub].extend(members[cursor:cursor + sizes[sub]])
+                    cursor += sizes[sub]
 
         # 2) 手工映射在算法归属**之上搬图**：只把被指定的图片挪到目标子集，
         #    其余图片原位不动。历史缺陷：把固定成员先从池子里摘掉再分配，
@@ -586,6 +587,134 @@ class DatasetService:
         for index in range(total - sum(sizes.values())):
             sizes[order[index % len(order)]] += 1
         return sizes
+
+    # 分层抽样的最小分组张数：小于它的类别整体进训练集（避免验证集单样本噪声）
+    _MIN_STRATUM = 3
+
+    @staticmethod
+    def _split_targets(
+        total: int, split: tuple[float, float, float]
+    ) -> dict[str, int]:
+        """**目标张数**：按比例折算成整数张（最大余数法，合计恒等于 total）。
+
+        比例是划分依据、张数是落位口径。**不得**用 `int(total * 比例)`——
+        浮点截断会少一张（历史缺陷 §4.81：设 300/200/71 执行后 299/199/73），
+        统一走最大余数法：与弹窗「数量 ↔ 百分比」联动、`_proportional_sizes`
+        同一套口径（比例取千分整数）。
+        """
+        weights = {
+            sub: max(0, int(round(float(split[index]) * 1000)))
+            for index, sub in enumerate(SPLIT_SUBDIRS)
+        }
+        sizes = DatasetService._proportional_sizes(int(total), weights)
+        gap = int(total) - sum(sizes.values())
+        if gap:
+            # 比例全为 0 等退化情形：剩余图片全部进训练集，绝不丢图
+            sizes["train"] = max(0, sizes.get("train", 0) + gap)
+        return sizes
+
+    @staticmethod
+    def _stratified_sizes(
+        group_sizes: list[int], targets: dict[str, int]
+    ) -> list[dict[str, int]]:
+        """分层抽样：把**全局目标张数**分摊到各分组（合计严格等于目标）。
+
+        规则：
+          * 小组（< `_MIN_STRATUM` 张）整组进训练集；
+          * 其余组按「剩余目标 × 组大小 / 剩余图片数」给理想份额，向下取整，
+            再用最大余数法把差额补回去（补位看小数部分大小、跳过放不下的组）；
+          * 组内优先给 训练 ≥ 1、验证 ≥ 1（≥ 3 张的组、指标允许时），
+            避免某个类别整体缺席验证集；
+          * 测试集拿组内剩余——Σ 测试 = 剩余指标，**各子集合计与输入张数
+            逐项一致**（历史缺陷 §4.81：逐组 trunc 后余数全甩给测试集）。
+        """
+        subs = list(SPLIT_SUBDIRS)
+        sizes = [{sub: 0 for sub in subs} for _ in group_sizes]
+        for index, count in enumerate(group_sizes):
+            if int(count) < DatasetService._MIN_STRATUM:
+                sizes[index]["train"] = int(count)
+        live = [
+            index for index, count in enumerate(group_sizes)
+            if int(count) >= DatasetService._MIN_STRATUM
+        ]
+        rest_images = sum(int(group_sizes[index]) for index in live)
+        if not rest_images:
+            return sizes
+        budget = DatasetService._remaining_targets(targets, sizes, rest_images)
+        for sub in ("train", "val"):
+            quota = {
+                index: group_sizes[index] * budget[sub] / rest_images
+                for index in live
+            }
+            base = {index: int(quota[index]) for index in live}
+            slack = budget[sub] - sum(base.values())
+            # 下限：整类不缺席（拿多余指标换，不超额）
+            for index in sorted(live, key=lambda i: (-(quota[i] - base[i]), i)):
+                if slack <= 0:
+                    break
+                if base[index] == 0 and DatasetService._room(
+                    sizes[index], group_sizes[index], sub, base[index]
+                ):
+                    base[index] = 1
+                    slack -= 1
+            # 最大余数法：差额按小数部分补齐，容量放不下的组跳过
+            while slack > 0:
+                moved = False
+                for index in sorted(
+                    live, key=lambda i: (-(quota[i] - base[i]), i)
+                ):
+                    if slack <= 0:
+                        break
+                    if DatasetService._room(
+                        sizes[index], group_sizes[index], sub, base[index]
+                    ):
+                        base[index] += 1
+                        slack -= 1
+                        moved = True
+                if not moved:
+                    break                     # 容量用尽（正常不会发生）
+            for index in live:
+                sizes[index][sub] = base[index]
+        for index in live:
+            sizes[index]["test"] = (
+                group_sizes[index] - sizes[index]["train"] - sizes[index]["val"]
+            )
+        return sizes
+
+    @staticmethod
+    def _remaining_targets(
+        targets: dict, sizes: list[dict], rest_images: int
+    ) -> dict[str, int]:
+        """扣掉小组已占用的指标，并把剩余指标对齐到剩余图片数（合计恒等）。
+
+        小组整组进训练集可能把训练指标吃穿：先钳到 0，再按剩余指标比例归一化，
+        保证「剩余指标之和 = 剩余图片数」——落位与输入张数总量一致。
+        """
+        budget = {
+            sub: max(
+                0, int(targets.get(sub, 0)) - sum(row[sub] for row in sizes)
+            )
+            for sub in SPLIT_SUBDIRS
+        }
+        total = int(rest_images)
+        if sum(budget.values()) == total:
+            return budget
+        if not any(budget.values()):
+            return {"train": total, "val": 0, "test": 0}
+        return DatasetService._proportional_sizes(total, budget)
+
+    @staticmethod
+    def _room(row: dict, count: int, sub: str, pending: int = 0) -> bool:
+        """该组还能不能再往 ``sub`` 放一张。
+
+        ``pending``：本次同批次已分给该子集、但还没写回 ``row`` 的张数——
+        判据必须带上它，否则「训练 2 + 验证 1」的组会被再加一张验证，
+        组内合计超过组张数、测试集被算成负数（自检抓到）。
+        约束：加一张后 训练 + 验证 ≤ 组张数（测试集非负）。
+        """
+        train = int(row["train"]) + (pending if sub == "train" else 0)
+        val = int(row["val"]) + (pending if sub == "val" else 0)
+        return train + val + 1 <= int(count)
 
     @staticmethod
     def _allocate_by_kind(
