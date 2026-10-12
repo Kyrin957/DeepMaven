@@ -117,14 +117,15 @@ _ADV_FLOAT_PARAMS = [
     ("dropout", "Dropout", 0.0, 0.9, 0.0, 0.05, 2),
     ("dfl", "DFL 增益", 0.0, 20.0, 1.5, 0.5, 2),
 ]
-# 图像设置：输入尺寸（`imgsz`）与通道数
-# 通道**不是**训练参数（`get_cfg` 会拒绝 `channels=`），它写进**数据配置**：
-# 数据集按 `channels` 加载图像——1 = 灰度（`cv2.IMREAD_GRAYSCALE`）、其余按
-# 彩色加载（见 §4.84）。因此只给 1 / 3 两档（步长 2），4 通道库并不支持。
+# 图像设置：输入尺寸（`imgsz`）
 _IMAGE_INT_PARAMS = [
     ("imgsz", "图像尺寸", 32, 2048, 640, 32, " px"),
-    ("channels", "通道", 1, 3, 3, 2, ""),
 ]
+# 通道**不是**训练参数（`get_cfg` 会拒绝 `channels=`），它写进**数据配置**：
+# 数据集按 `channels` 加载图像——1 = 灰度（`cv2.IMREAD_GRAYSCALE`）、其余按
+# 彩色加载（见 §4.84）。库只支持 1 / 3 两档，因此用**下拉**而不是数值框：
+# 手输 2 / 4 都是无效值（历史缺陷：数值框能填 2）。
+_CHANNEL_OPTIONS = ((1, "1（灰度）"), (3, "3（彩色）"))
 _CHECK_PARAMS = [
     ("deterministic", "使用确定性算法"),
     ("cos_lr", "余弦学习率调度"),
@@ -354,7 +355,12 @@ class _ModelCard(QFrame):
         head.addWidget(self.menu_btn)
         layout.addLayout(head)
 
-        layout.addWidget(CaptionLabel(variant_label or "—", self))
+        self.spec_label = CaptionLabel(variant_label or "—", self)
+        # 规格 = 权重来源 · **当前训练输入尺寸**（"图像设置"卡里改，不随变体默认值）
+        self.spec_label.setToolTip(
+            "权重来源 · 当前训练的输入尺寸（在「图像设置」卡调整）"
+        )
+        layout.addWidget(self.spec_label)
         state = self._state_text(model, running, paused)
         self.state_label = BodyLabel(state, self)
         self.state_label.setToolTip(state)
@@ -611,6 +617,10 @@ class TrainTab(QWidget):
 
         ``live``：活动模型的活配置（快照要等「切换模型 / 开始训练」才回写，
         用活配置才能当场反映变体与权重来源的改动）。
+
+        尺寸取**当前设置的输入尺寸**（`imgsz`，"图像设置"卡里改），而不是预训练
+        变体的原生尺寸——那是权重自带的默认值，用户改了图像尺寸后卡片必须
+        紧随变更（历史缺陷：尺寸恒等于变体默认，改图像尺寸卡片不动）。
         """
         config = live if live is not None else (model.get("config") or {})
         read = (
@@ -634,11 +644,17 @@ class TrainTab(QWidget):
         ) or key or "—"
         if backend.key != "yolo":
             return label          # 其余后端没有「输入尺寸」这一规格
-        variant = next(
-            (v for v in YOLO_MODEL_VARIANTS if v["key"] == base_variant_key(key)),
-            None,
-        )
-        size = int((variant or {}).get("imgsz") or 0)
+        # 当前设置的输入尺寸优先；配置里没有（老项目 / 快照缺字段）才退回变体默认
+        size = int(read("imgsz") or 0)
+        if not size:
+            variant = next(
+                (
+                    v for v in YOLO_MODEL_VARIANTS
+                    if v["key"] == base_variant_key(key)
+                ),
+                None,
+            )
+            size = int((variant or {}).get("imgsz") or 0)
         return f"{label} ({size}x{size})" if size else label
 
     # --------------------------------------------------- 模型管理交互
@@ -1216,16 +1232,30 @@ class TrainTab(QWidget):
         return card
 
     def _build_image_card(self) -> CardWidget:
-        """图像设置：输入尺寸、通道与「图像预览」（letterbox + 增强示意）。
+        """图像设置：输入尺寸、通道（下拉）与「图像预览」（letterbox + 增强示意）。
 
         尺寸与通道是图像侧的输入规格（Ultralytics 的 `imgsz` / `channels`），
         每次训练前通常要看一眼，因此独立成卡、与数据区放在一起。
+
+        通道用**下拉**（只 1 灰度 / 3 彩色）：库只认这两档，数值框能填出 2 / 4
+        这类无效值（`channels` 会写进数据配置，填错就是训练期报错）。
         """
         card, layout = self._card("图像设置", IMAGE_HELP)
         self.image_card = card
-        fields = self._make_int_spins(
+        fields: list[tuple[str, QWidget]] = self._make_int_spins(
             card, _IMAGE_INT_PARAMS, T.STEPPER_CHARS, compact=True
         )
+        self.channels_combo = ComboBox(card)
+        for value, text in _CHANNEL_OPTIONS:
+            self.channels_combo.addItem(text, userData=int(value))
+        self.channels_combo.setFixedWidth(T.CTRL_W_MD)
+        self.channels_combo.setToolTip(
+            "输入通道：1 = 灰度（按单通道加载）、3 = 彩色；"
+            "该项写进数据配置（Ultralytics 的 model.train 不接受 channels 参数）"
+        )
+        self.channels_combo.currentIndexChanged.connect(self._on_param_changed)
+        fields.append(("通道", self.channels_combo))
+
         holder = QWidget(card)
         grid = QGridLayout(holder)
         grid.setContentsMargins(0, 0, 0, 0)
@@ -1239,9 +1269,8 @@ class TrainTab(QWidget):
             rows.append(row)
         for column in range(2):
             grid.setColumnStretch(column, 1)
-        self._param_rows.update(dict(zip(
-            [key for key, *_rest in _IMAGE_INT_PARAMS], rows
-        )))
+        keys = [key for key, *_rest in _IMAGE_INT_PARAMS] + ["channels"]
+        self._param_rows.update(dict(zip(keys, rows)))
         layout.addWidget(holder)
 
         preview_row = QHBoxLayout()
@@ -1825,6 +1854,10 @@ class TrainTab(QWidget):
     def _update_variant_desc(self, key: str) -> None:
         """显示变体描述（key 可能带任务后缀，如分类的 yolo11n-cls）。
 
+        这里的尺寸是**预训练模型的原生分辨率**，与训练输入尺寸（"图像设置"
+        卡的 `imgsz`，模型卡规格行显示的那个）是两回事——标「原生」避免
+        两个数字对不上造成误解。
+
         下拉选中导入的权重时，下拉项文字就是文件名，不显示变体描述。
         """
         if self._selected_custom():
@@ -1833,7 +1866,8 @@ class TrainTab(QWidget):
         base = base_variant_key(key)
         variant = next((v for v in YOLO_MODEL_VARIANTS if v["key"] == base), None)
         self.variant_desc.setText(
-            f"{variant['desc']} · {variant['imgsz']}px" if variant is not None else ""
+            f"{variant['desc']} · 原生 {variant['imgsz']}px"
+            if variant is not None else ""
         )
 
     def _variant_index(self, key: str) -> int:
@@ -1931,6 +1965,8 @@ class TrainTab(QWidget):
             "device": str(self.device_combo.currentData() or "auto"),
             "anomaly_root": self.anomaly_edit.text().strip(),
             "anomaly_pretrained": self.anomaly_check.isChecked(),
+            # 通道是下拉（库只认 1 灰度 / 3 彩色），不属于 `_int_spins`
+            "channels": int(self.channels_combo.currentData() or 3),
             "augment": self.augment_check.isChecked(),
             # 逐项启用标记：取消勾选的项按 0 下发（见 TrainingConfig.augment_value），
             # 数值本身仍原样保存，重新勾选即恢复
@@ -1990,6 +2026,15 @@ class TrainTab(QWidget):
                 str(getattr(config, "task_type", "detect") or "detect")
             )
             self._sync_aug_values(config)
+
+            channels = int(getattr(config, "channels", 3) or 3)
+            channel_index = self.channels_combo.findData(channels)
+            if channel_index < 0:
+                # 旧项目 / 手改配置里的非标值（如 4）：原样列出，避免「显示 1、
+                # 配置里是 4」的不一致（§26：打开项目必须回填全部持久化字段）
+                self.channels_combo.addItem(str(channels), userData=channels)
+                channel_index = self.channels_combo.count() - 1
+            self.channels_combo.setCurrentIndex(channel_index)
 
             index = self.opt_combo.findText(str(getattr(config, "optimizer", "auto")))
             self.opt_combo.setCurrentIndex(max(0, index))
@@ -2051,7 +2096,7 @@ class TrainTab(QWidget):
             )
             if variant is not None:
                 self.variant_desc.setText(
-                    f"{variant['desc']} · {variant['imgsz']}px"
+                    f"{variant['desc']} · 原生 {variant['imgsz']}px"
                 )
         # 参数属于所选模型：无模型时设置页整体禁用（提示见状态栏）
         self.settings_body.setEnabled(self._vm.has_model())
