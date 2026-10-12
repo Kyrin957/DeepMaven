@@ -125,7 +125,7 @@ _IMAGE_INT_PARAMS = [
 # 数据集按 `channels` 加载图像——1 = 灰度（`cv2.IMREAD_GRAYSCALE`）、其余按
 # 彩色加载（见 §4.84）。库只支持 1 / 3 两档，因此用**下拉**而不是数值框：
 # 手输 2 / 4 都是无效值（历史缺陷：数值框能填 2）。
-_CHANNEL_OPTIONS = ((1, "1（灰度）"), (3, "3（彩色）"))
+_CHANNEL_OPTIONS = ((1, "1"), (3, "3"))
 _CHECK_PARAMS = [
     ("deterministic", "使用确定性算法"),
     ("cos_lr", "余弦学习率调度"),
