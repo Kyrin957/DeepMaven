@@ -7,18 +7,44 @@
       悬停标签有提示，点击任一标签 → **全部**标签展开为「训练 / 验证 / 测试」
       文字横条（再点收起）
     * 选中项高亮描边
+
+**万张级性能约定（§4.89，改动前先读本节）**：`QListWidget` 只承载**轻量条目
+数据**（路径 + 角标数据），像素解码与缩放**在绘制时按需进行**、结果落在有界
+LRU 缓存里：
+
+* **禁止**把解码后的 pixmap / QIcon 存进每个 item（历史实现每项常驻约 0.4 MB
+  —— 352px 主图 363 KB + 124px 图标 45 KB，1 万张约 **3.9 GB**，且每次进页
+  全量重解码 20+ 秒）；
+* tooltip **按需计算**（悬停时算一条，见 `viewportEvent`）——历史实现每次刷新
+  为 1 万个 item 重建 tooltip；
+* 解码走 `QImageReader.setScaledSize`（JPEG 可按比例快速降采样），**只缩不放**；
+* 可见区（含上下各一行余量）由 `_schedule_warm()` **在线程池里预热**：
+  解码产出 `QImage`（可跨线程），回到 GUI 线程转 `QPixmap` 入缓存——
+  滚动 / 筛选都不阻塞输入，过期代次的结果直接丢弃。
 """
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QPointF, QRectF, QSize, Qt, Signal
+from PySide6.QtCore import (
+    QEvent,
+    QObject,
+    QPointF,
+    QRectF,
+    QRunnable,
+    QSize,
+    Qt,
+    QThreadPool,
+    Signal,
+)
 from PySide6.QtGui import (
     QColor,
     QFont,
     QFontMetrics,
-    QIcon,
+    QImage,
+    QImageReader,
     QPainter,
     QPainterPath,
     QPen,
@@ -38,10 +64,9 @@ from src.utils.image_ops import adjust_pixmap, normalize_display
 from src.views.ui import BusyPopup
 from src.views.ui import tokens as T
 
-# 条目数据角色
+# 条目数据角色（**只存轻量数据**：路径 / 角标 / 类别名；不存 pixmap，见文件头）
 _PATH_ROLE = Qt.ItemDataRole.UserRole
 _ANNOTATED_ROLE = Qt.ItemDataRole.UserRole + 1
-_MASTER_ROLE = Qt.ItemDataRole.UserRole + 2
 _COLOR_ROLE = Qt.ItemDataRole.UserRole + 3      # 类别颜色（已标注角标用）
 _SUBSET_ROLE = Qt.ItemDataRole.UserRole + 4     # 所属数据集：T / V / E
 _MARKERS_ROLE = Qt.ItemDataRole.UserRole + 5    # 图像标记颜色列表
@@ -83,7 +108,6 @@ THUMB_MEDIUM = 124
 THUMB_LARGE = 176
 THUMB_XLARGE = 352         # 特大档：最大档再大一倍
 THUMB_STEPS = (THUMB_SMALL, THUMB_MEDIUM, THUMB_LARGE, THUMB_XLARGE)
-MASTER_SIZE = THUMB_XLARGE  # 缓存主图的边长（按最大档取，放大时不糊）
 
 # 配色
 _COLOR_BG = "#2B2B2B"
@@ -101,13 +125,110 @@ _COLOR_TAG_EMPTY = "#8A8A8A"   # 标记没有颜色时的色点颜色
 _COLOR_EVAL_OK = "#0F7B0F"
 _COLOR_EVAL_BAD = "#C42B1C"
 
-# 主图缓存：同一进程内复用已解码并缩放的缩略图，避免每次刷新都重新读盘解码
-# （主图按最大档尺寸缓存，条目较大，因此上限比早期版本收敛）
-_MASTER_CACHE: dict = {}
-_MASTER_CACHE_LIMIT = 192
+# 缩略图缓存：按「路径 + 档位」缓存**已缩到档位**的 pixmap，绘制时按需填充。
+# 键含档位 → 换档位不会串用旧尺寸；容量按**字节**上限 LRU 淘汰（外加条数上限
+# 兜底），因此 352px 大档也不会把内存吃满（历史实现：192 条上限 + 超限整表清空，
+# 1 万张下等于没有缓存）。
+_THUMB_CACHE_MAX_BYTES = 192 * 1024 * 1024
+_THUMB_CACHE_MAX_ITEMS = 4000
+_THUMB_CACHE: "OrderedDict[tuple[str, int], QPixmap]" = OrderedDict()
+_THUMB_CACHE_BYTES = 0
 
 # 显示增强（亮度 / 对比度）结果的缓存上限：按「图片 + 档位 + 参数」缓存
 _ADJUST_CACHE_LIMIT = 600
+
+
+def _pixmap_bytes(pixmap: QPixmap) -> int:
+    """位图占用的近似字节数（宽 × 高 × 4）。"""
+    return int(pixmap.width()) * int(pixmap.height()) * 4
+
+
+def _cache_get(key):
+    """取缓存（命中即刷新 LRU 位置）。"""
+    pixmap = _THUMB_CACHE.get(key)
+    if pixmap is None:
+        return None
+    _THUMB_CACHE.move_to_end(key)
+    return pixmap
+
+
+def _cache_put(key, pixmap: QPixmap) -> None:
+    """写缓存并按字节 / 条数上限淘汰最久未用的条目。"""
+    global _THUMB_CACHE_BYTES
+    if pixmap is None or pixmap.isNull():
+        return
+    old = _THUMB_CACHE.pop(key, None)
+    if old is not None:
+        _THUMB_CACHE_BYTES -= _pixmap_bytes(old)
+    _THUMB_CACHE[key] = pixmap
+    _THUMB_CACHE_BYTES += _pixmap_bytes(pixmap)
+    while _THUMB_CACHE and (
+        _THUMB_CACHE_BYTES > _THUMB_CACHE_MAX_BYTES
+        or len(_THUMB_CACHE) > _THUMB_CACHE_MAX_ITEMS
+    ):
+        _evicted_key, evicted = _THUMB_CACHE.popitem(last=False)
+        _THUMB_CACHE_BYTES -= _pixmap_bytes(evicted)
+
+
+def clear_thumb_cache() -> None:
+    """清空缩略图缓存（数据集整体更换 / 自检用）。"""
+    global _THUMB_CACHE_BYTES
+    _THUMB_CACHE.clear()
+    _THUMB_CACHE_BYTES = 0
+
+
+def load_thumb_image(path: str, size: int) -> "QImage":
+    """解码并缩放到指定档位，返回 `QImage`（**只缩不放**）。
+
+    走 `QImageReader.setScaledSize`：JPEG 可按比例快速降采样，避免「全尺寸解码
+    再 Smooth 缩放」的双重开销与峰值内存（原图 1920×1080 单张约 23 ms，降到
+    档位解码通常只要几毫秒）。不设置 `autoTransform`——与标注画布 / 原实现
+    （`QPixmap(path)`）保持同一取向，避免缩略图与画布方向不一致。
+
+    `QImage` 可在**工作线程**里构造（`QPixmap` 不行），后台预热走这个函数。
+    """
+    reader = QImageReader(str(path))
+    source = reader.size()
+    if source.isValid() and source.width() > 0 and source.height() > 0:
+        target = source.scaled(
+            QSize(int(size), int(size)), Qt.AspectRatioMode.KeepAspectRatio
+        )
+        if target.width() < source.width() or target.height() < source.height():
+            reader.setScaledSize(target)
+    return reader.read()
+
+
+def load_thumb(path: str, size: int) -> QPixmap:
+    """解码并缩放到指定档位（**只缩不放**；结果由调用方入缓存）。"""
+    image = load_thumb_image(path, size)
+    return QPixmap() if image.isNull() else QPixmap.fromImage(image)
+
+
+class _WarmSignals(QObject):
+    """后台解码结果的跨线程回传（`QRunnable` 自身不能带信号）。"""
+
+    decoded = Signal(str, int, int, object)     # 路径 / 档位 / 代次 / QImage
+
+
+class _DecodeJob(QRunnable):
+    """一次缩略图后台解码（只做 `QImage` 解码与缩放，不碰界面）。"""
+
+    def __init__(self, path: str, size: int, generation: int, signals: _WarmSignals):
+        super().__init__()
+        self._path = path
+        self._size = int(size)
+        self._generation = int(generation)
+        self._signals = signals
+
+    def run(self) -> None:  # noqa: D102 - QRunnable 约定
+        try:
+            image = load_thumb_image(self._path, self._size)
+        except Exception:  # noqa: BLE001 - 后台解码失败不该带崩线程池
+            image = None
+        if image is not None and not image.isNull():
+            self._signals.decoded.emit(
+                self._path, self._size, self._generation, image
+            )
 
 
 class ThumbnailDelegate(QStyledItemDelegate):
@@ -168,30 +289,44 @@ class ThumbnailDelegate(QStyledItemDelegate):
     def needs_display_adjust(self) -> bool:
         return bool(self.brightness or self.contrast)
 
-    def _display_pixmap(self, index) -> "QPixmap | None":
-        """按显示参数调整后的缩略图；未启用增强时返回 None（走默认图标绘制）。
+    def thumb_pixmap(self, index) -> "QPixmap | None":
+        """档位缩略图（**按需解码**，结果入有界 LRU；不做显示增强）。
 
-        结果按「图片 + 档位 + 参数」缓存，滚动时不会反复做整图运算。
+        条目里不再存 pixmap：绘制时按「路径 + 档位」取缓存，未命中才解码——
+        1 万张也只有可见的几十张会被解码。
         """
-        if not self.needs_display_adjust():
-            return None
-        master = index.data(_MASTER_ROLE)
-        if not isinstance(master, QPixmap) or master.isNull():
+        path = str(index.data(_PATH_ROLE) or "")
+        if not path:
             return None
         size = int(self.thumb)
+        key = (path, size)
+        cached = _cache_get(key)
+        if cached is not None:
+            return cached
+        pixmap = load_thumb(path, size)
+        if pixmap.isNull():
+            return None
+        _cache_put(key, pixmap)
+        return pixmap
+
+    def _display_pixmap(self, index) -> "QPixmap | None":
+        """绘制用缩略图：档位缩略图 + 可选显示增强（亮度 / 对比度）。
+
+        增强结果按「图片 + 档位 + 参数」缓存，滚动时不会反复做整图运算。
+        """
+        base = self.thumb_pixmap(index)
+        if base is None:
+            return None
+        if not self.needs_display_adjust():
+            return base
         key = (
-            str(index.data(_PATH_ROLE) or ""), size,
+            str(index.data(_PATH_ROLE) or ""), int(self.thumb),
             round(float(self.brightness), 3), round(float(self.contrast), 3),
         )
         cached = self._adjust_cache.get(key)
         if cached is not None:
             return cached
-        scaled = master.scaled(
-            size, size,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        adjusted = adjust_pixmap(scaled, self.brightness, self.contrast)
+        adjusted = adjust_pixmap(base, self.brightness, self.contrast)
         if len(self._adjust_cache) >= _ADJUST_CACHE_LIMIT:
             self._adjust_cache.clear()
         self._adjust_cache[key] = adjusted
@@ -246,10 +381,6 @@ class ThumbnailDelegate(QStyledItemDelegate):
                 ),
                 shot,
             )
-        else:
-            icon = index.data(Qt.ItemDataRole.DecorationRole)
-            if isinstance(icon, QIcon) and not icon.isNull():
-                icon.paint(painter, thumb_rect.toRect(), Qt.AlignmentFlag.AlignCenter)
 
         # 文件名（过长时中间省略）
         font = QFont(option.font)
@@ -510,12 +641,29 @@ class ThumbnailGrid(QListWidget):
     imageContextMenu = Signal(int, object)   # 右键：(行号, 全局坐标)
     thumbSizeChanged = Signal(int)      # Ctrl + 滚轮调整尺寸后广播（供页面同步滑杆）
 
+    #: 超过这个张数才给载入进度弹窗（小集合不该闪一下）
+    BUSY_THRESHOLD = 1500
+
+    #: 后台预热线程数（2 足够：按屏排队，滚动时才补下一屏）
+    _WARM_MAX_THREADS = 2
+    #: 一次最多排队的行数（防止快速滚动时把队列灌爆）
+    _WARM_MAX_JOBS = 80
+
     def __init__(self, parent=None):
         super().__init__(parent)
         # Ctrl + 滚轮缩放默认关闭，由需要它的页面打开（避免影响其它页面的固定尺寸）
         self._wheel_zoom = False
         # 本网格允许的缩放档位（页面可用 set_thumb_steps 收窄，与滑杆共用）
         self._steps: tuple[int, ...] = THUMB_STEPS
+        # 当前图片路径表（`paths()` 直接返回它，避免每次刷新重建 1 万个字符串）
+        self._paths: list[str] = []
+        # 可见区**后台**预热：解码在线程池（QImage 可跨线程），结果回到 GUI 线程
+        # 转 pixmap 入缓存；`_warm_generation` 用来丢弃滚动 / 换图后的过期结果
+        self._warm_generation = 0
+        self._warm_signals = _WarmSignals(self)
+        self._warm_signals.decoded.connect(self._on_warm_decoded)
+        self._warm_pool = QThreadPool(self)
+        self._warm_pool.setMaxThreadCount(self._WARM_MAX_THREADS)
         self._delegate = ThumbnailDelegate(self)
         self.setItemDelegate(self._delegate)
         self.setViewMode(QListView.ViewMode.IconMode)
@@ -560,23 +708,38 @@ class ThumbnailGrid(QListWidget):
             return values[index] if values and index < len(values) else default
 
         self.blockSignals(True)
-        self.clear()
-        for index, raw in enumerate(paths):
-            path = Path(raw)
-            master = self._load_master(path)
-            item = QListWidgetItem(self._icon(master), path.name)
-            item.setData(_PATH_ROLE, str(path))
-            item.setData(_MASTER_ROLE, master)
-            item.setData(_ANNOTATED_ROLE, bool(pick(annotated, index, False)))
-            item.setData(_COLOR_ROLE, str(pick(colors, index, "")))
-            item.setData(_SUBSET_ROLE, str(pick(subsets, index, "")))
-            item.setData(_MARKERS_ROLE, list(pick(markers, index, [])))
-            item.setData(_EVAL_ROLE, pick(evals, index, {}))
-            item.setData(_CLASS_ROLE, str(pick(classnames, index, "")))
-            item.setToolTip(self._tooltip(item))
-            self.addItem(item)
-        self.blockSignals(False)
+        self.setUpdatesEnabled(False)
+        # 大集合给进度反馈（弹窗自身有 150ms 延迟，小集合不会闪）：万张级下
+        # 「点一下没反应」最伤体验，哪怕只是建条目也要让用户看到在动（§4.89）
+        total = len(paths)
+        busy = (
+            BusyPopup.scope(self.window(), f"正在载入 {total} 张缩略图")
+            if total >= self.BUSY_THRESHOLD else None
+        )
+        try:
+            self.clear()
+            for index, raw in enumerate(paths):
+                path = Path(raw)
+                # 轻量条目：只有路径 + 角标数据；像素在绘制时按需解码（见文件头）
+                item = QListWidgetItem(path.name)
+                item.setData(_PATH_ROLE, str(path))
+                item.setData(_ANNOTATED_ROLE, bool(pick(annotated, index, False)))
+                item.setData(_COLOR_ROLE, str(pick(colors, index, "")))
+                item.setData(_SUBSET_ROLE, str(pick(subsets, index, "")))
+                item.setData(_MARKERS_ROLE, list(pick(markers, index, [])))
+                item.setData(_EVAL_ROLE, pick(evals, index, {}))
+                item.setData(_CLASS_ROLE, str(pick(classnames, index, "")))
+                self.addItem(item)
+                if busy is not None and index % 500 == 0:
+                    busy.step(index + 1, total)
+        finally:
+            if busy is not None:
+                busy.end()
+            self.setUpdatesEnabled(True)
+            self.blockSignals(False)
+        self._paths = [str(raw) for raw in paths]
         self.doItemsLayout()
+        self._schedule_warm()
 
     def set_annotated(
         self,
@@ -586,21 +749,32 @@ class ThumbnailGrid(QListWidget):
         subsets: list | None = None,
         classnames: list | None = None,
     ) -> None:
-        """就地更新角标（图片集合不变时用，避免重建全部缩略图）。"""
-        for index in range(self.count()):
-            item = self.item(index)
-            item.setData(
-                _ANNOTATED_ROLE, bool(flags[index]) if index < len(flags) else False
-            )
-            if colors is not None and index < len(colors):
-                item.setData(_COLOR_ROLE, str(colors[index]))
-            if markers is not None and index < len(markers):
-                item.setData(_MARKERS_ROLE, list(markers[index]))
-            if subsets is not None and index < len(subsets):
-                item.setData(_SUBSET_ROLE, str(subsets[index]))
-            if classnames is not None and index < len(classnames):
-                item.setData(_CLASS_ROLE, str(classnames[index]))
-            item.setToolTip(self._tooltip(item))
+        """就地更新角标（图片集合不变时用，避免重建全部缩略图）。
+
+        只写条目数据 + 整体重绘一次：**不重建 tooltip**（悬停时按需算，见
+        `viewportEvent`）——历史实现每次刷新为 1 万个 item 重建 tooltip，
+        单这一步就是秒级。
+        """
+        self.blockSignals(True)
+        self.setUpdatesEnabled(False)
+        try:
+            for index in range(self.count()):
+                item = self.item(index)
+                item.setData(
+                    _ANNOTATED_ROLE,
+                    bool(flags[index]) if index < len(flags) else False,
+                )
+                if colors is not None and index < len(colors):
+                    item.setData(_COLOR_ROLE, str(colors[index]))
+                if markers is not None and index < len(markers):
+                    item.setData(_MARKERS_ROLE, list(markers[index]))
+                if subsets is not None and index < len(subsets):
+                    item.setData(_SUBSET_ROLE, str(subsets[index]))
+                if classnames is not None and index < len(classnames):
+                    item.setData(_CLASS_ROLE, str(classnames[index]))
+        finally:
+            self.setUpdatesEnabled(True)
+            self.blockSignals(False)
         self.viewport().update()
 
     # -----------------------------------------------------------
@@ -641,7 +815,8 @@ class ThumbnailGrid(QListWidget):
         return str(item.data(_PATH_ROLE) or "") if item is not None else ""
 
     def paths(self) -> list[str]:
-        return [self.path_at(i) for i in range(self.count())]
+        """当前图片路径（缓存副本；`set_images` 时一次写好，刷新时不做 O(N) 遍历）。"""
+        return list(self._paths)
 
     def selected_indexes(self) -> list[int]:
         """当前选中的行号（没有选中时退化为当前项）。"""
@@ -739,7 +914,12 @@ class ThumbnailGrid(QListWidget):
     # 显示
     # -----------------------------------------------------------
     def set_thumb_size(self, size: int) -> None:
-        """调整缩略图尺寸档位，并重新缩放已有图标。"""
+        """调整缩略图尺寸档位（**O(1)**：条目里没有图标要重设）。
+
+        档位进缓存键，换档位后旧尺寸条目自然随 LRU 淘汰；这里只清显示增强缓存
+        （它按参数缓存，档位变了就作废）、重排布局并重绘可见区——历史实现在这里
+        为 1 万个 item 重设 QIcon（秒级卡顿 + BusyPopup）。
+        """
         size = int(size)
         if size == self._delegate.thumb:
             return
@@ -747,16 +927,9 @@ class ThumbnailGrid(QListWidget):
         self._delegate.clear_display_cache()      # 档位变了，旧的显示增强缓存作废
         self.setIconSize(QSize(size, size))
         self.setGridSize(self._grid_size())
-        count = self.count()
-        if count:
-            # 全量重设图标可能耗时：置顶弹窗报进度（快操作不会闪现）
-            with BusyPopup.scope(self.window(), "正在调整缩略图尺寸") as busy:
-                for index in range(count):
-                    master = self.item(index).data(_MASTER_ROLE)
-                    if isinstance(master, QPixmap) and not master.isNull():
-                        self.item(index).setIcon(self._icon(master))
-                    busy.step(index + 1, count)
         self.doItemsLayout()
+        self.viewport().update()
+        self._schedule_warm()
 
     def thumb_size(self) -> int:
         return self._delegate.thumb
@@ -859,13 +1032,21 @@ class ThumbnailGrid(QListWidget):
         return True
 
     def viewportEvent(self, event) -> bool:  # noqa: N802 - Qt 命名
-        """真实鼠标滚轮由视口接收，必须在这里拦截才生效。"""
+        """真实鼠标滚轮由视口接收，必须在这里拦截才生效。
+
+        悬停提示也在这里**按需**生成：先给类别 / 数据集标签的命中提示，否则给
+        该图片的路径 / 标注状态 / 数据集提示——条目上不再预存 tooltip。
+        """
         if self._handle_wheel(event):
             return True
         if event.type() == QEvent.Type.ToolTip:
             text = self._class_tooltip(event.pos()) or self._subset_tooltip(
                 event.pos()
             )
+            if not text:
+                item = self.itemAt(event.pos())
+                if item is not None:
+                    text = self._tooltip(item)
             if text:
                 QToolTip.showText(event.globalPos(), text, self)
                 return True
@@ -886,40 +1067,75 @@ class ThumbnailGrid(QListWidget):
     def _on_double_clicked(self, item) -> None:
         self.imageDoubleClicked.emit(self.row(item))
 
-    @staticmethod
-    def _load_master(path: Path) -> QPixmap:
-        """读取并按最高档位预缩放；命中缓存时直接复用（带容量上限）。"""
-        key = str(path)
-        cached = _MASTER_CACHE.get(key)
-        if cached is not None:
-            return cached
+    # -----------------------------------------------------------
+    # 可见区预热（分片，不阻塞输入）
+    # -----------------------------------------------------------
+    def _visible_rows(self, margin_rows: int = 3) -> list[int]:
+        """可见行的行号（上下各带几行余量：预热要**提前一屏**备好，滚动才顺）。"""
+        viewport = self.viewport().rect()
+        visible = []
+        for row in range(self.count()):
+            rect = self.visualItemRect(self.item(row))
+            if rect.bottom() < viewport.top() - rect.height() * margin_rows:
+                continue
+            if rect.top() > viewport.bottom() + rect.height() * margin_rows:
+                break
+            visible.append(row)
+        return visible
 
-        pixmap = QPixmap(key)
+    def _schedule_warm(self) -> None:
+        """安排可见区（含上下各一行余量）的后台解码。
+
+        解码放线程池（`QImage` 可跨线程；`QPixmap` 必须在 GUI 线程建），
+        因此滚动时**不占用主线程**。已缓存的行直接跳过；一次最多排
+        `_WARM_MAX_JOBS` 行，滚动时随窗口移动重新排队（旧代次的回包被丢弃）。
+        """
+        size = int(self._delegate.thumb)
+        jobs = 0
+        self._warm_generation += 1
+        generation = self._warm_generation
+        for row in self._visible_rows():
+            if jobs >= self._WARM_MAX_JOBS:
+                break
+            item = self.item(row)
+            if item is None:
+                continue
+            path = str(item.data(_PATH_ROLE) or "")
+            if not path or _cache_get((path, size)) is not None:
+                continue                        # 已缓存：无需再解码
+            self._warm_pool.start(_DecodeJob(path, size, generation, self._warm_signals))
+            jobs += 1
+
+    def _on_warm_decoded(
+        self, path: str, size: int, generation: int, image
+    ) -> None:
+        """后台解码完成（GUI 线程）：转 pixmap 入缓存并重绘。"""
+        if generation != self._warm_generation:
+            return                              # 滚动 / 换图后的过期结果
+        pixmap = QPixmap.fromImage(image)
         if pixmap.isNull():
-            return QPixmap()
-        master = pixmap.scaled(
-            MASTER_SIZE, MASTER_SIZE,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        if len(_MASTER_CACHE) >= _MASTER_CACHE_LIMIT:
-            _MASTER_CACHE.clear()
-        _MASTER_CACHE[key] = master
-        return master
+            return
+        _cache_put((str(path), int(size)), pixmap)
+        if int(size) == int(self._delegate.thumb):
+            self.viewport().update()
+
+    def scrollContentsBy(self, dx: int, dy: int) -> None:  # noqa: N802 - Qt 命名
+        """滚动时把预热批次换成新的可见行（滚动本身的绘制不受影响）。"""
+        super().scrollContentsBy(dx, dy)
+        self._schedule_warm()
+
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        """页面显示 / 隐藏时重排预热（不可见时不做无用解码）。"""
+        super().showEvent(event)
+        if self.isVisible():
+            self._schedule_warm()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        """视口尺寸变化（换档位 / 窗口缩放）后重排预热。"""
+        super().resizeEvent(event)
+        self._schedule_warm()
 
     @staticmethod
     def clear_cache() -> None:
         """清空缩略图缓存（数据集整体更换后调用，及时释放内存）。"""
-        _MASTER_CACHE.clear()
-
-    def _icon(self, master) -> QIcon:
-        if not isinstance(master, QPixmap) or master.isNull():
-            return QIcon()
-        size = self._delegate.thumb
-        return QIcon(
-            master.scaled(
-                size, size,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-        )
+        clear_thumb_cache()

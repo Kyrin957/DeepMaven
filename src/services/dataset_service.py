@@ -6,6 +6,7 @@ import hashlib
 import os
 import shutil
 import stat
+from functools import lru_cache
 from pathlib import Path
 
 from src.models.dataset import Dataset
@@ -436,13 +437,31 @@ class DatasetService:
     # -----------------------------------------------------------
     @staticmethod
     def _label_classes(label_path) -> set:
-        """读取标签文件中出现的类别 id 集合（用于分层）。"""
+        """读取标签文件中出现的类别 id 集合（用于分层 / 类别统计）。
+
+        带**按文件签名（mtime + 大小）**的缓存：万张级项目里图库 / 检查页每次
+        刷新会调用它 2-3 万次（类别名、类别颜色、分布统计各一遍），逐次读盘是
+        秒级开销（§4.89）；签名变化（标签被改写）即自动重新读取。
+        """
         if label_path is None:
             return set()
+        path = Path(label_path)
         try:
-            text = Path(label_path).read_text(encoding="utf-8")
+            info = path.stat()          # 注意别叫 stat：本模块导入了 stdlib 的 stat
         except OSError:
             return set()
+        return set(DatasetService._label_classes_cached(
+            str(path), info.st_mtime_ns, info.st_size
+        ))
+
+    @staticmethod
+    @lru_cache(maxsize=100_000)
+    def _label_classes_cached(path: str, _mtime_ns: int, _size: int) -> frozenset:
+        """按文件签名缓存的标签类别集合（签名只用于让缓存失效，不参与解析）。"""
+        try:
+            text = Path(path).read_text(encoding="utf-8")
+        except OSError:
+            return frozenset()
         result: set[int] = set()
         for line in text.splitlines():
             parts = line.split()
@@ -452,7 +471,7 @@ class DatasetService:
                 result.add(int(float(parts[0])))
             except ValueError:
                 continue
-        return result
+        return frozenset(result)
 
     @staticmethod
     def _group_key(image: Path, label_index: dict, layout: str) -> tuple:

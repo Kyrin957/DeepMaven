@@ -230,17 +230,24 @@ class ReviewTab(QWidget):
         self.grid.prewarm_visible()
 
     def _render_grid(self) -> None:
-        """真正绘制缩略图（仅在页面可见时调用）。"""
+        """真正绘制缩略图（仅在页面可见时调用）。
+
+        图片集合与网格一致时**只更角标**（与图库页同一口径）：万张级下重建
+        条目虽已很便宜，但没必要每次都做（§4.89）。
+        """
         pairs = self._pending_pairs or []
         paths = [path for path, _ in pairs]
         colors, subsets = self._vm.decorations_for(paths)
-        self.grid.set_images(
-            paths,
-            [flag for _, flag in pairs],
-            colors,
-            subsets,
-            classnames=self._vm.class_names_for(paths),
-        )
+        flags = [flag for _, flag in pairs]
+        names = self._vm.class_names_for(paths)
+        if paths and [str(p) for p in paths] == self.grid.paths():
+            self.grid.set_annotated(
+                flags, colors, subsets=subsets, classnames=names
+            )
+        else:
+            self.grid.set_images(
+                paths, flags, colors, subsets, classnames=names
+            )
         # 没有选中项时默认选中第一张，保证详情面板不是空的
         if pairs and self.grid.current_index() < 0:
             self.grid.set_current_index(0)
@@ -310,13 +317,11 @@ class ReviewTab(QWidget):
             return
 
         image = Path(path)
-        images = self._vm.images()
+        # 位置与「已标注」都走索引：历史实现每次点击用 `images.index()` 线性查找
+        # （万张级下每次点击多花几十毫秒），见《开发文档》§4.89
+        position = self._vm.image_position(image)
         flags = self._vm.annotated_flags()
-        annotated = False
-        if image in images:
-            position = images.index(image)
-            if position < len(flags):
-                annotated = flags[position]
+        annotated = bool(flags[position]) if 0 <= position < len(flags) else False
 
         self.detail_name.setText(image.name)
         self.detail_path.setText(f"路径：{image.parent}")

@@ -80,8 +80,8 @@ class DatasetViewModel(QObject):
         self._resolved_source: Path | None = None
         # 来源目录列表缓存（避免逐张图片调用时反复解析路径）
         self._roots_cache: list[Path] | None = None
-        # 已有图片的内容哈希缓存（导入去重时避免重复读取大图）
-        self._hash_cache: dict[str, str] | None = None
+        # 已有图片的「文件大小 → {路径: (mtime, 内容哈希)}」索引（导入去重用）
+        self._media_index: dict[int, dict[str, tuple[int, str]]] | None = None
         # 图片清单与标签索引缓存（数据量大，避免每次刷新都重新扫盘）
         self._images: list[Path] | None = None
         self._label_index: dict | None = None
@@ -90,6 +90,16 @@ class DatasetViewModel(QObject):
         # 标注页推送的未落盘标注状态（{图片绝对路径: 是否已标注}）——
         # 让缩略图角标与「已标注」统计与内存中尚未保存的改动保持一致
         self._pending_annotations: dict[str, bool] = {}
+        # 元数据索引（万张级刷新不再逐图读盘 / stat，见《开发文档》§4.89）：
+        # `_meta_revision` 是「元数据可能已变」的版本号，所有按版本缓存的索引
+        # 都存 (revision, 值)，失效只需 +1（比逐处清缓存更不容易漏）
+        self._meta_revision = 0
+        self._class_index: tuple[int, dict[str, str]] | None = None
+        self._annotated_index: tuple[int, list[bool]] | None = None
+        self._known_names_index: tuple[int, set[str]] | None = None
+        # 位置索引（清单对象 + 路径→行号，检查页切图用）与相对键索引（标记用）
+        self._position_index: tuple | None = None
+        self._key_index: tuple | None = None
 
     @property
     def dataset(self) -> Dataset | None:
@@ -183,10 +193,10 @@ class DatasetViewModel(QObject):
         if not merged_roots:
             merged_roots = [Path(root) for root in roots]
 
-        # 3) 去重：批内重复 + 与图库已有图片内容重复（SHA256）
+        # 3) 去重：批内重复 + 与图库已有图片内容重复（SHA256；先按文件大小预筛，
+        #    只对撞大小的候选算哈希，见 `_filter_duplicates`）
         dedupe = bool(options.get("dedupe", True))
-        known = self._known_hashes() if dedupe else {}
-        accepted, skipped, hashes = self._filter_duplicates(ordered, dedupe, known)
+        accepted, skipped, _hashes = self._filter_duplicates(ordered, dedupe)
         if not accepted:
             self.message.emit(
                 "warning",
@@ -288,8 +298,7 @@ class DatasetViewModel(QObject):
         elif annotate is False:
             notice += "，未标注"
         self._set_dataset(dataset, notice=notice)
-        if dedupe:
-            self._hash_cache = {**known, **hashes}
+        # 去重索引由 `_filter_duplicates` 就地更新（新图片带哈希），这里不再回写
         logger.info(
             "导入数据集 %s: 新增 %s 张，跳过重复 %s 张，合计 %s 张",
             dataset.name, len(accepted), skipped, dataset.image_count,
@@ -297,9 +306,13 @@ class DatasetViewModel(QObject):
         return dataset
 
     def _filter_duplicates(
-        self, images: list, dedupe: bool, known: dict
+        self, images: list, dedupe: bool, _known: dict | None = None
     ) -> tuple[list[Path], int, dict]:
-        """按内容哈希过滤重复图片。
+        """按内容哈希过滤重复图片（**先按文件大小预筛**，只对撞大小的候选算哈希）。
+
+        内容相同的文件大小必然相同，因此「与图库已有图片重复」只可能发生在
+        大小相同的候选里；万张级项目据此把「导入前对全库算一遍 SHA256」
+        （实测 ≈ 数秒）降到几乎为零（§4.89）。
 
         Returns:
             (可导入的图片, 跳过的张数, 新图片的 {路径: 哈希})。
@@ -307,12 +320,37 @@ class DatasetViewModel(QObject):
         if not dedupe:
             return [Path(p) for p in images], 0, {}
 
-        seen = set(known.values())
+        known: dict[int, dict[str, tuple[int, str]]] = self._existing_media()
+        seen = {
+            digest for group in known.values()
+            for _mtime, digest in group.values() if digest
+        }
         accepted: list[Path] = []
         hashes: dict[str, str] = {}
         skipped = 0
         for image in images:
             path = Path(image)
+            try:
+                info = path.stat()
+            except OSError as exc:
+                logger.warning("读取失败 %s: %s", path, exc)
+                continue
+            size = int(info.st_size)
+            group = known.get(size)
+            if group is None:
+                # 图库里没有同尺寸的图片 → 不可能是重复内容，免算哈希
+                accepted.append(path)
+                continue
+            # 同一路径且签名未变 → 这张图**本来就在图库里**（同一份文件），
+            # 直接判为重复、连哈希都不用算：「重新导入同一批图片」不再把几万个
+            # 文件重读一遍（§4.89）。
+            # 注：已从数据集移除的图片会随 `_media_index` 一起作废，因此「移除后
+            # 再导入」仍能重新进来。
+            entry = group.get(str(path))
+            if entry is not None and entry[0] == int(info.st_mtime_ns):
+                skipped += 1
+                continue
+            # 撞大小但签名不同（改了内容 / 换了文件）：算哈希按内容判重
             try:
                 digest = self._service.file_sha256(path)
             except OSError as exc:
@@ -322,21 +360,43 @@ class DatasetViewModel(QObject):
                 skipped += 1
                 continue
             seen.add(digest)
+            group[str(path)] = (int(info.st_mtime_ns), digest)
             accepted.append(path)
             hashes[str(path)] = digest
         return accepted, skipped, hashes
 
-    def _known_hashes(self) -> dict[str, str]:
-        """已有图片的 {路径: 内容哈希}（带缓存，导入去重用）。"""
-        if self._hash_cache is None:
-            cached: dict[str, str] = {}
+    def _existing_media(self) -> dict[int, dict[str, tuple[int, str]]]:
+        """已有图片按**文件大小**分组：{字节数: {路径: (mtime_ns, 内容哈希)}}。
+
+        只做 `stat`（不读内容）；哈希按需填充（撞大小才需要），并缓存在实例上，
+        导入多次不会重复算（§4.89）。
+        """
+        if self._media_index is None:
+            index: dict[int, dict[str, tuple[int, str]]] = {}
             for image in self.images():
                 try:
-                    cached[str(image)] = self._service.file_sha256(image)
+                    info = image.stat()
                 except OSError:
                     continue
-            self._hash_cache = cached
-        return self._hash_cache
+                index.setdefault(int(info.st_size), {})[str(image)] = (
+                    int(info.st_mtime_ns), ""
+                )
+            self._media_index = index
+        return self._media_index
+
+    def _known_hashes(self) -> dict[str, str]:
+        """已有图片的 {路径: 内容哈希}（按需补齐；导入去重已不依赖它）。"""
+        result: dict[str, str] = {}
+        for group in self._existing_media().values():
+            for path, (mtime_ns, digest) in list(group.items()):
+                if not digest:
+                    try:
+                        digest = self._service.file_sha256(path)
+                    except OSError:
+                        continue
+                    group[path] = (mtime_ns, digest)
+                result[path] = digest
+        return result
 
     @staticmethod
     def _inherit_settings(dataset: Dataset, previous: Dataset | None) -> None:
@@ -938,7 +998,7 @@ class DatasetViewModel(QObject):
         """打开 / 新建项目后，从项目数据恢复数据集状态。"""
         self._resolved_source = None
         self._roots_cache = None
-        self._hash_cache = None
+        self._media_index = None
         self._images = None
         self._subsets = None
         dataset = getattr(project, "dataset", None) if project is not None else None
@@ -1046,7 +1106,7 @@ class DatasetViewModel(QObject):
         self._dataset = None
         self._resolved_source = None
         self._roots_cache = None
-        self._hash_cache = None
+        self._media_index = None
         self._images = None
         self._label_index = None
         self._subsets = None
@@ -1226,10 +1286,53 @@ class DatasetViewModel(QObject):
         """来源目录变化后清空各类缓存。"""
         self._resolved_source = None
         self._roots_cache = None
-        self._hash_cache = None
+        self._media_index = None
         self._images = None
         self._label_index = None
         self._subsets = None
+        self._position_index = None
+        self._key_index = None
+        self._touch_meta()
+
+    def _touch_meta(self) -> None:
+        """标记「元数据可能已变」：让按版本缓存的索引（类别 / 已标注 / 类别名）
+
+        在下次读取时重建。调用点覆盖全部可能改变元数据的通道——图片集合变化
+        （导入 / 移除）、类别覆盖值 / 标记 / 拆分归属改动（`_commit_meta`）、
+        标注页推送的 pending 状态（含落盘后的推送）、数据集对象更替。
+        """
+        self._meta_revision += 1
+
+    def _class_map(self) -> dict[str, str]:
+        """图片路径 → 原始类别名（一次建好，按元数据版本复用）。
+
+        万张级项目里图库 / 检查页一次刷新要多次取「每张图的类别」（分布统计、
+        类别颜色、类别名标签、筛选），历史实现每次都重新判定一遍（含标签读盘）
+        ——索引化后这些遍历只剩字典查找（§4.89）。
+        """
+        revision = self._meta_revision
+        cached = self._class_index
+        if cached is not None and cached[0] == revision:
+            return cached[1]
+        mapping = {
+            str(image): self.image_class(image) for image in self.images()
+        }
+        self._class_index = (revision, mapping)
+        return mapping
+
+    def image_position(self, image) -> int:
+        """图片在清单中的位置（-1 = 不在清单里）。
+
+        检查页每次点击 / 方向键切图都要定位当前图，历史实现用
+        `images.index()`（O(N)），万张级下每次点击多花几十毫秒。
+        """
+        images = self.images()
+        cached = self._position_index
+        if cached is not None and cached[0] is images:
+            return cached[1].get(str(image), -1)
+        mapping = {str(item): index for index, item in enumerate(images)}
+        self._position_index = (images, mapping)
+        return mapping.get(str(image), -1)
 
     def images(self, refresh: bool = False) -> list[Path]:
         """当前数据集的图片清单（带缓存，已排除从数据集移除的图片）。"""
@@ -1263,6 +1366,10 @@ class DatasetViewModel(QObject):
         if incoming == self._pending_annotations:
             return
         self._pending_annotations = incoming
+        # pending 变化会影响「已标注」判定；标注**落盘**后也是走这条路推送
+        # （`annotate_vm.save()` → `_sync_pending_flags`），因此标签文件改写
+        # 带来的类别 / 已标注变化在这里一并失效
+        self._touch_meta()
 
     def is_annotated(self, image) -> bool:
         """单张图片是否「已标注」（与 :meth:`annotated_flags` 同一判定口径）。
@@ -1303,14 +1410,32 @@ class DatasetViewModel(QObject):
         )
 
     def annotated_flags(self) -> list[bool]:
-        """每张图片是否「已标注」（判定口径见 :meth:`is_annotated`）。"""
-        return [self.is_annotated(image) for image in self.images()]
+        """每张图片是否「已标注」（判定口径见 :meth:`is_annotated`）。
+
+        按元数据版本缓存：一次刷新里图库 / 检查页会取它两三次（角标、计数、
+        筛选），万张级下每次都是 N 次判定 + N 次 stat（§4.89）。
+        """
+        revision = self._meta_revision
+        cached = self._annotated_index
+        if cached is not None and cached[0] == revision:
+            return list(cached[1])
+        flags = [self.is_annotated(image) for image in self.images()]
+        self._annotated_index = (revision, flags)
+        return list(flags)
 
     def annotated_count(self) -> int:
         return sum(1 for flag in self.annotated_flags() if flag)
 
     def _known_class_names(self) -> set[str]:
-        """已知类别名：数据集统计到的类别 ∪ 项目类别表。"""
+        """已知类别名：数据集统计到的类别 ∪ 项目类别表（按元数据版本缓存）。
+
+        分类 / 异常检测项目里 `image_class` 每张图都会问它一次，历史实现每次
+        重建两个集合并做并集（万张级下就是上万次冗余集合运算）。
+        """
+        revision = self._meta_revision
+        cached = self._known_names_index
+        if cached is not None and cached[0] == revision:
+            return set(cached[1])
         names = {
             str(item) for item in (getattr(self._dataset, "class_names", []) or [])
         }
@@ -1318,7 +1443,9 @@ class DatasetViewModel(QObject):
         names.update(
             str(item.name) for item in (getattr(project, "classes", []) or [])
         )
-        return {name for name in names if name}
+        result = {name for name in names if name}
+        self._known_names_index = (revision, result)
+        return set(result)
 
     def _is_source_root(self, directory: Path) -> bool:
         """目录是否为数据集来源目录（多来源导入时就是各个类别目录）。"""
@@ -1351,7 +1478,10 @@ class DatasetViewModel(QObject):
         flags = self.annotated_flags()
         pairs = list(zip(self.images(), flags))
         if class_name:
-            pairs = [(p, f) for p, f in pairs if self.image_class(p) == class_name]
+            classes = self._class_map()          # 索引化：不再逐图判定类别
+            pairs = [
+                (p, f) for p, f in pairs if classes.get(str(p), "") == class_name
+            ]
         if mode == "annotated":
             return [(path, True) for path, flag in pairs if flag]
         if mode == "unannotated":
@@ -1359,10 +1489,9 @@ class DatasetViewModel(QObject):
         return pairs
 
     def class_distribution(self) -> dict[str, int]:
-        """各类别的实际图片数（按当前判定口径统计）。"""
+        """各类别的实际图片数（按当前判定口径统计，走类别索引）。"""
         counts: dict[str, int] = {}
-        for image in self.images():
-            name = self.image_class(image)
+        for name in self._class_map().values():
             counts[name] = counts.get(name, 0) + 1
         return counts
 
@@ -1396,7 +1525,8 @@ class DatasetViewModel(QObject):
             str(cls.name): str(cls.color)
             for cls in (project.classes if project is not None else [])
         }
-        return [palette.get(self.image_class(image), "") for image in self.images()]
+        classes = self._class_map()          # 索引化：不再逐图判定类别
+        return [palette.get(name, "") for name in classes.values()]
 
     def subset_labels(self) -> list[str]:
         """每张图片所属的数据集子集：T=训练 / V=验证 / E=测试 / 空=未划分。
@@ -1464,13 +1594,12 @@ class DatasetViewModel(QObject):
 
         供缩略图网格的「类别色角标」与「右下角数据集标记」使用。
         """
-        position = {str(path): index for index, path in enumerate(self.images())}
         colors = self.image_colors()
         subsets = self.subset_labels()
 
         def value(series: list, path) -> str:
-            index = position.get(str(path))
-            if index is None or index >= len(series):
+            index = self.image_position(path)      # O(1)，不重建全表字典
+            if index < 0 or index >= len(series):
                 return ""
             return str(series[index])
 
@@ -1480,12 +1609,16 @@ class DatasetViewModel(QObject):
         )
 
     def class_names_for(self, paths: list) -> list[str]:
-        """给定图片序列 → 每张图的类别名（缩略图右上角标签展开时显示）。"""
-        names = {
-            str(image): self._class_name_of(self.image_class(image))
-            for image in self.images()
-        }
-        return [names.get(str(path), "") for path in paths]
+        """给定图片序列 → 每张图的类别名（缩略图右上角标签展开时显示）。
+
+        取缓存好的类别名（`_class_name_of` 只是数字 id → 名称的映射，逐条算也
+        很便宜），**不再为每张图重新判定类别**（历史实现即使只要几打路径，
+        也会对全部图片各判定一次 + 读标签）。
+        """
+        classes = self._class_map()
+        return [
+            self._class_name_of(classes.get(str(path), "")) for path in paths
+        ]
 
     def gallery_decorations(self, paths: list) -> dict:
         """一次性取出缩略图需要的全部装饰（避免多次 O(n) 复算）。
@@ -1493,19 +1626,18 @@ class DatasetViewModel(QObject):
         Returns:
             {"annotated": [...], "colors": [...], "subsets": [...], "markers": [[...]]}
         """
-        images = self.images()
-        position = {str(path): index for index, path in enumerate(images)}
         flags = self.annotated_flags()
         colors = self.image_colors()
         subsets = self.subset_labels()
         markers = self.marker_colors()
-        names = [
-            self._class_name_of(self.image_class(image)) for image in images
-        ]
+        classes = self._class_map()          # 索引：不再逐图判定类别
+        names = {
+            key: self._class_name_of(value) for key, value in classes.items()
+        }
 
         def value(series: list, path, default):
-            index = position.get(str(path))
-            if index is None or index >= len(series):
+            index = self.image_position(path)
+            if index < 0 or index >= len(series):
                 return default
             return series[index]
 
@@ -1514,7 +1646,8 @@ class DatasetViewModel(QObject):
             "colors": [str(value(colors, p, "")) for p in paths],
             "subsets": [str(value(subsets, p, "")) for p in paths],
             "markers": [list(value(markers, p, [])) for p in paths],
-            "classnames": [str(value(names, p, "")) for p in paths],
+            # 类别名是「路径 → 名称」映射（不是按行号的下标序列）
+            "classnames": [str(names.get(str(p), "")) for p in paths],
         }
 
     # -----------------------------------------------------------
@@ -1562,14 +1695,35 @@ class DatasetViewModel(QObject):
         return list(self.tag_map().get(self._image_key(image), []))
 
     def marker_colors(self) -> list[list[str]]:
-        """每张图片的标记颜色列表（供缩略图左下角色点）。"""
+        """每张图片的标记颜色列表（供缩略图左下角色点）。
+
+        批量走相对键索引（`_key_map`）：历史实现逐图算 `_image_key`，万张级下
+        每次刷新都要重复一遍（§4.89）。
+        """
         mapping = self.tag_map()
         palette = {item["name"]: item["color"] for item in self.image_tag_defs()}
-        colors: list[list[str]] = []
-        for image in self.images():
-            names = mapping.get(self._image_key(image), [])
-            colors.append([palette.get(name, "") for name in names][:4])
-        return colors
+        return [
+            [palette.get(name, "") for name in mapping.get(key, [])][:4]
+            for key in self._key_map().values()
+        ]
+
+    def _key_map(self) -> dict[str, str]:
+        """图片路径 → 项目内相对键（一次建好，随图片清单对象复用）。"""
+        images = self.images()
+        cached = self._key_index
+        if cached is not None and cached[0] is images:
+            return cached[1]
+        roots = self._source_roots()
+        mapping = {
+            str(image): self._relative_key(image, roots) for image in images
+        }
+        self._key_index = (images, mapping)
+        return mapping
+
+    def _tag_lists(self) -> list[list[str]]:
+        """每张图片的标记名列表（批量；`filter_images` 用）。"""
+        mapping = self.tag_map()
+        return [list(mapping.get(key, [])) for key in self._key_map().values()]
 
     def add_image_tag(self, name: str, color: str = "") -> bool:
         """新增图像标记定义。"""
@@ -1982,8 +2136,8 @@ class DatasetViewModel(QObject):
             return []
         flags = self.annotated_flags()
         subsets = self.subset_labels()
-        classes = [self.image_class(image) for image in images]
-        tags = [self.image_tag_names_of(image) for image in images]
+        classes = list(self._class_map().values())   # 索引：不再逐图判定类别
+        tags = self._tag_lists()                     # 批量：不再逐图算相对键
         keyword = text.strip().lower()
         annotated_wanted = _filter_list(label)
         class_wanted = _filter_list(class_name)
@@ -2065,10 +2219,9 @@ class DatasetViewModel(QObject):
         excludes.extend(str(target) for target in gone)
         self._set_excludes(excludes)
 
-        # 内容哈希缓存里也要摘掉，否则重新导入时会被当成「重复图片」而跳过
-        if self._hash_cache is not None:
-            for target in gone:
-                self._hash_cache.pop(str(target), None)
+        # 去重索引整份作废（下面 `invalidate_images()` 里置空）：被移除的图片
+        # 若留在索引里，重新导入时会被当成「重复图片」而跳过
+        self._media_index = None
 
         # 同步数据集统计（概览 / 类别数的图片数都要跟着变）
         self._refresh_stats(project)
@@ -2165,10 +2318,14 @@ class DatasetViewModel(QObject):
         self.message.emit("success", text)
 
     def invalidate_images(self) -> None:
-        """图片发生变化（新增标注 / 重新划分）后清空清单缓存。"""
+        """图片发生变化（新增标注 / 重新划分）后清空清单缓存与元数据索引。"""
         self._images = None
         self._label_index = None
         self._subsets = None
+        self._position_index = None
+        self._key_index = None
+        self._media_index = None
+        self._touch_meta()
 
     # -----------------------------------------------------------
     # 拆分名称（决定划分产物的目录名）
@@ -2259,10 +2416,11 @@ class DatasetViewModel(QObject):
         self._dataset = dataset
         self._resolved_source = None
         self._roots_cache = None
-        self._hash_cache = None
+        self._media_index = None
         self._images = None
         self._label_index = None
         self._subsets = None
+        self._touch_meta()
         self._sync_class_stats(dataset)
         # 项目直接持有同一份 Dataset 对象，并即时保存，避免忘记保存导致数据丢失
         project = self._project_vm.project if self._project_vm else None

@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QGridLayout,
@@ -151,6 +151,9 @@ class FilterBar(CardWidget):
     filterChanged = Signal()
     textChanged = Signal(str)
 
+    #: 搜索框去抖（毫秒）：停止输入后才发一次筛选（§4.89）
+    SEARCH_DEBOUNCE_MS = 250
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._annotated: list[str] = []   # 已标注 / 未标注（空 = 全部）
@@ -183,8 +186,17 @@ class FilterBar(CardWidget):
         self.search = SearchLineEdit(self)
         self.search.setPlaceholderText("输入筛选文本")
         self.search.setFixedWidth(T.CTRL_W_XL)
-        self.search.textChanged.connect(lambda _t: self.textChanged.emit(self.text()))
-        self.search.searchSignal.connect(lambda _t: self.textChanged.emit(self.text()))
+        # 逐字符刷新在万张级项目里就是「每敲一个字重算一遍全库」（历史实测
+        # 1.27 s/键，§4.89）——这里做 250ms 去抖：停止输入后才发出一次筛选；
+        # 回车（searchSignal）立即生效，不等去抖
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(self.SEARCH_DEBOUNCE_MS)
+        self._search_timer.timeout.connect(
+            lambda: self.textChanged.emit(self.text())
+        )
+        self.search.textChanged.connect(lambda _t: self._search_timer.start())
+        self.search.searchSignal.connect(self._on_search_committed)
         flow.addWidget(ToolGroup(self.search, parent=self))
 
         self.summary = CaptionLabel("", self)
@@ -196,6 +208,11 @@ class FilterBar(CardWidget):
     # -----------------------------------------------------------
     # 下拉菜单（多选）
     # -----------------------------------------------------------
+    def _on_search_committed(self, _text: str = "") -> None:
+        """回车 / 点搜索图标：立即筛选（不等去抖计时器）。"""
+        self._search_timer.stop()
+        self.textChanged.emit(self.text())
+
     def _menu_button(self, title: str, icon, which: str) -> DropDownPushButton:
         button = DropDownPushButton(f"{title}：全部", self)
         button.setIcon(icon)

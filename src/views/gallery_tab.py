@@ -39,7 +39,7 @@ from src.views.data_widgets import ClassCard, ImportCard, StatsCard, side_column
 from src.views.dialogs import ImportImagesDialog, TagEditDialog
 from src.views.dialogs.tag_edit_dialog import DEFAULT_TAG_COLOR
 from src.views.gallery_widgets import FilterBar, SplitMapCard, TagCard
-from src.views.ui import DisplayDock
+from src.views.ui import BusyPopup, DisplayDock
 from src.views.ui import tokens as T
 from src.views.widgets import THUMB_STEPS, ThumbnailGrid
 
@@ -236,15 +236,17 @@ class GalleryTab(QWidget):
         self._update_side_state()
 
     def _update_side_state(self) -> None:
-        """刷新拆分映射与标记面板（依赖图片集合、选中项与已挂标记数）。"""
+        """刷新拆分映射与标记面板（依赖图片集合、选中项与已挂标记数）。
+
+        选中项的行号走 `image_position()`（O(1)）——历史实现每次刷新与每次
+        选中变化都重建一份「路径 → 行号」全表字典（§4.89）。
+        """
         labels = self._vm.subset_labels()
-        images = self._vm.images()
-        position = {str(path): index for index, path in enumerate(images)}
         current = ""
         selected = self.grid.selected_paths()
         if selected:
-            index = position.get(str(selected[0]))
-            if index is not None and index < len(labels):
+            index = self._vm.image_position(selected[0])
+            if 0 <= index < len(labels):
                 current = labels[index]
         self.split_map_card.set_state(
             self._vm.split_name_label(),
@@ -491,12 +493,23 @@ class GalleryTab(QWidget):
             return
 
         data = dialog.result_data()
-        if str(data.get("mode")) == "folder":
-            paths = list(data.get("paths") or [])
-            if paths:
-                self._vm.import_images(paths[0], data)
-        else:
-            self._vm.import_files(list(data.get("paths") or []), data)
+        # 导入是同步长操作（扫描 → 去重哈希 → 重建统计 → 各页刷新），万张级下
+        # 会给「没反应」的错觉：用置顶进度弹窗给出反馈（弹窗自身有 150ms 延迟，
+        # 小批量不会闪）；真正的后台导入需要把整条链路搬进 worker（见 §4.89 遗留）
+        count = len(list(data.get("files") or data.get("paths") or []))
+        with BusyPopup.scope(
+            self.window(),
+            f"正在导入 {count} 张图片" if count else "正在导入图片",
+        ) as busy:
+            busy.step(0, 0)
+            if str(data.get("mode")) == "folder":
+                paths = list(data.get("paths") or [])
+                if paths:
+                    self._vm.import_images(paths[0], data)
+            else:
+                self._vm.import_files(list(data.get("paths") or []), data)
+            busy.step()
+        self.refresh()
 
     def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         if event.mimeData().hasUrls():

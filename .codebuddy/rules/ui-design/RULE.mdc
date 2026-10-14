@@ -359,6 +359,29 @@ $env:QT_QPA_PLATFORM="offscreen"
 - 悬停时各自给专属 tooltip（「类别：缺陷（点击展开全部标签）」/
   「数据集：train（训练）（……）」），标签以外按 §10 走整卡提示。
 - 新增同类角标时扩展 `ThumbnailDelegate` 并按本标准接入，不要在页面里另画。
+- **万张级性能契约（§4.89 定稿，改网格 / 图库 / 检查页前先读）**：
+  - `QListWidget` 的条目**只存轻量数据**（路径 + 角标 + 类别名），**禁止**把
+    解码后的 `QPixmap` / `QIcon` 存进 item（历史实现每项 408 KB → 1 万张
+    ≈ 3.9 GB，每次进页全量重解码 22 s）；像素在 `ThumbnailDelegate.paint`
+    里按需取，走 `_THUMB_CACHE`（键 = 路径 + 档位，**字节上限 192 MB 的 LRU**，
+    超限逐条淘汰，**禁止**整表 clear）；
+  - 解码用 `load_thumb_image()`（`QImageReader.setScaledSize`，只缩不放）：
+    1920×1080 降到 124px 档约 5 ms（全解码 + Smooth 缩放为 23 ms）；
+  - `set_thumb_size()` 必须 **O(1)**（改档位 + 重排 + 重绘），**禁止**再逐项
+    重设图标；`set_images()` / `set_annotated()` 要 `setUpdatesEnabled(False)`
+    + `blockSignals` 包裹，tooltip **按需生成**（`viewportEvent` 里算）；
+  - 可见区（含上下各 3 行余量）由 `_schedule_warm()` 在**线程池**里预热
+    （工作线程只产出 `QImage`，GUI 线程转 `QPixmap`；用代次号丢弃过期结果），
+    超过 `BUSY_THRESHOLD`（1500）张的载入给 `BusyPopup` 进度；
+  - 页面侧：**过滤 / 计数 / 类别 / 标记 / 行号一律走 `DatasetViewModel` 的
+    索引**（`_class_map` / `_annotated_flags` / `_tag_lists` / `image_position`，
+    按 `_meta_revision` 失效），**禁止**在刷新链路里逐图 `image_class()` /
+    `is_annotated()` / `images.index()`；搜索框必须去抖（`SEARCH_DEBOUNCE_MS`）；
+  - **失效要精确**：`invalidate_images()` / `_commit_meta()` / `set_pending_annotations()`
+    （含标注落盘后的推送）会 `_touch_meta()`；新增元数据缓存时**必须**在这些
+    入口挂上，否则「改一张图 → 显示不变」；
+  - 标签文件内容按**文件签名（mtime + 大小）**缓存（`DatasetService._label_classes`）；
+    导入去重先按**文件大小预筛**、同路径且签名未变直接判重（禁止对全库重算 SHA256）。
 
 ## 14. 未保存保护：全局「未保存」模型 + 关闭 / 切换前必须询问
 
@@ -726,6 +749,10 @@ $env:QT_QPA_PLATFORM="offscreen"
     （torchvision `ImageFolder`）**不消费 `channels`**（恒按 RGB 加载）。
     子进程只对**文件型** data（检测族 data.yaml）写副本，目录一律原样返回；
     配置读不出来时**保持原路径**，绝不产出「只写了 channels」的半成品副本；
+    **回退要捕全异常类型**：`yaml.YAMLError`（`ParserError` / `ScannerError` /
+    `ReaderError` …）**不是** `ValueError`，只写 `except (OSError, ValueError)`
+    会让「损坏的 data.yaml」直接抛未处理异常、把回退整个绕过（历史缺陷 §4.88：
+    语法未闭合 / 非法写法 / 控制字符三种损坏全部绕过回退）；
   - **字符串枚举下发前必须按库的合法集合归一化**（§4.86）：界面上的「未启用」
     在配置里存可读值（如 `auto_augment="none"`），**下发前要翻成库认的值**
     ——分类的 `auto_augment` 只认 `"randaugment"` / `"augmix"` /
@@ -733,7 +760,7 @@ $env:QT_QPA_PLATFORM="offscreen"
     `classify_augmentations` 判为非法策略、训练在建数据集时就崩
     （`ValueError: Invalid auto_augment policy: none…`）。凡"界面文案 ↔ 库取值"
     不一致的枚举，都要有一处显式的翻译函数（`train_worker.auto_augment_value`）；
-  - **通道用下拉框，不用数值框**（§4.85）：两档枚举值就该是**下拉**
+  - **通道用下拉框，不用数值框**（§4.87）：两档枚举值就该是**下拉**
     （`_CHANNEL_OPTIONS`，选项文案就是「1」/「3」、`userData` 存 int）——
     数值框能填出 2 / 4 这类无效值，而它会被写进数据配置、到训练期才报错；
     灰度 / 彩色的**含义走 tooltip**，不塞进选项文字（§10）；
@@ -832,7 +859,7 @@ $env:QT_QPA_PLATFORM="offscreen"
     （快照要等「切换模型 / 开始训练」才回写，否则改完不刷新）；
   - 规格行的尺寸 = **当前设置的输入尺寸**（`config.imgsz`，「图像设置」卡的
     那个，随其变更**立刻刷新**）——**禁止**取预训练变体的原生尺寸（历史缺陷
-    §4.85：卡片尺寸恒等于变体默认 640，用户改了图像尺寸卡片不动）；
+    §4.87：卡片尺寸恒等于变体默认 640，用户改了图像尺寸卡片不动）；
     「模型与权重」卡的变体描述里的尺寸是**权重原生分辨率**，必须标
     「原生 640px」以示区分（同一界面出现两个尺寸时不得都写成 `640px`）；
     **模型 key 必须与任务对齐**：打开项目时 `TrainViewModel` 做迁移

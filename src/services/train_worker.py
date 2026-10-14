@@ -52,9 +52,13 @@ def prepare_data_path(args) -> str:
 
     try:
         payload = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, yaml.YAMLError) as exc:
         # 读不出来就**保持原路径**：让库报它自己的数据集错误，别被我们的
-        # 半成品副本掩盖（历史缺陷 §4.85：副本里只剩 channels: 1）
+        # 半成品副本掩盖（历史缺陷 §4.85：副本里只剩 channels: 1）。
+        # `yaml.YAMLError` 必须显式列上：语法未闭合（ParserError）、非法写法
+        # （ScannerError）、控制字符（ReaderError）都**不是** ValueError
+        # （YAMLError 直接继承 Exception），漏捕就会在训练启动时抛未处理异常
+        # 把回退逻辑整个绕过（历史缺陷 §4.88）。
         emit({"type": "log", "text": f"数据配置读取失败（{exc}），沿用原路径"})
         return str(args.data)
     if not isinstance(payload, dict):
