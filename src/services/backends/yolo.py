@@ -45,18 +45,22 @@ CLASSIFY_AUGMENT_KEYS = (
     "hsv_h", "hsv_s", "hsv_v", "auto_augment", "erasing",
 )
 
-# 任务专属训练参数：Ultralytics **只在特定任务里消费**（§4.84 —— 设了不生效的
-# 参数既不在界面显示、也不下发）：
+# 任务专属训练参数：Ultralytics **只在特定任务里消费**（§4.84 / §4.85 —— 设了
+# 不生效的参数既不在界面显示、也不下发）：
 #   * dropout —— 库注释写死 “dropout for classification head (classify only)”，
 #     检测 / 旋转框 / 实例分割模型的头部不读它；
 #   * rect —— 检测族 dataloader 的矩形批次（`rect_shape`，与 mosaic 互斥），
 #     分类数据集不读；
 #   * close_mosaic —— 只有 `YOLODataset` 有 `close_mosaic`（分类数据集没有
-#     → `_close_dataloader_mosaic` 直接跳过，属无效项）。
+#     → `_close_dataloader_mosaic` 直接跳过，属无效项）；
+#   * channels —— 由 `YOLODataset` 从 data.yaml 读；分类走 torchvision
+#     `ImageFolder`（类源码里没有 channels，恒按 RGB 加载），且分类的 `data`
+#     必须是**目录**、不能是 yaml 副本（否则库直接 ValueError，§4.85）。
 TASK_ONLY_PARAMS: dict[str, tuple[str, ...]] = {
     "dropout": ("classify",),
     "rect": ("detect", "obb", "segment"),
     "close_mosaic": ("detect", "obb", "segment"),
+    "channels": ("detect", "obb", "segment"),
 }
 
 
@@ -118,7 +122,6 @@ class YoloBackend(BackendAdapter):
             "--epochs", str(config.epochs),
             "--batch", str(config.batch),
             "--imgsz", str(config.imgsz),
-            "--channels", str(config.channels),
             "--lr", str(config.lr),
             "--optimizer", config.optimizer,
             "--weight-decay", str(config.weight_decay),
@@ -155,8 +158,12 @@ class YoloBackend(BackendAdapter):
             "--pause-file", str(pause_file(config)),
         ]
         # 任务专属参数（§4.84）：库只在对应任务里消费（dropout 分类专属、
-        # rect / close_mosaic 检测族专属），其余任务**不传**，界面也不显示
+        # rect / close_mosaic / channels 检测族专属），其余任务**不传**，
+        # 界面也不显示
         task = str(config.task_type or "detect")
+        if self.supports_task_param("channels", task):
+            # 通道走数据配置：检测族由子进程写进运行目录的 data-ch<N>.yaml
+            args += ["--channels", str(config.channels)]
         if self.supports_task_param("dropout", task):
             args += ["--dropout", str(config.dropout)]
         if self.supports_task_param("rect", task):

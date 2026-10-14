@@ -715,11 +715,24 @@ $env:QT_QPA_PLATFORM="offscreen"
     **只在检测族显示**（分类数据集不读 rect，且没有 `close_mosaic` 方法）；
     **训练选项里的复选框同样按任务显隐**（rect）。`build_args` 一并只传这些
     —— 分类不下发 rect / close-mosaic，检测族不下发 dropout；
-  - **`channels` 属于数据配置，不是训练参数**（§4.84）：`get_cfg` 会以
-    “'channels' is not a valid YOLO argument” **拒绝** `channels=` 透传；训练
-    子进程把它写进运行目录的 `data-ch<N>.yaml`（`YOLODataset` 读 data.yaml 的
-    `channels`），界面只给 1（灰度）/ 3（彩色）两档——库只有「1 = 灰度 /
-    其余按彩色」两种分支，4 通道不支持；
+  - **`channels` 属于数据配置、且只对检测族有效**（§4.84 / §4.85）：`get_cfg`
+    会以 “'channels' is not a valid YOLO argument” **拒绝** `channels=` 透传；
+    检测族的训练子进程把它写进运行目录的 `data-ch<N>.yaml`（`YOLODataset` 读
+    data.yaml 的 `channels`），界面只给 1（灰度）/ 3（彩色）两档——库只有
+    「1 = 灰度 / 其余按彩色」两种分支，4 通道不支持；
+    **分类任务既不在界面显示、也不下发，更不得改写 data 路径**：分类的 `data`
+    必须是数据集**目录**（传 yaml 会被库判为非法：`Classification datasets
+    must be a directory (data="path/to/dir") not a file`），且分类管线
+    （torchvision `ImageFolder`）**不消费 `channels`**（恒按 RGB 加载）。
+    子进程只对**文件型** data（检测族 data.yaml）写副本，目录一律原样返回；
+    配置读不出来时**保持原路径**，绝不产出「只写了 channels」的半成品副本；
+  - **字符串枚举下发前必须按库的合法集合归一化**（§4.86）：界面上的「未启用」
+    在配置里存可读值（如 `auto_augment="none"`），**下发前要翻成库认的值**
+    ——分类的 `auto_augment` 只认 `"randaugment"` / `"augmix"` /
+    `"autoaugment"` 或 **`None`**，传字符串 `"none"` 会被
+    `classify_augmentations` 判为非法策略、训练在建数据集时就崩
+    （`ValueError: Invalid auto_augment policy: none…`）。凡"界面文案 ↔ 库取值"
+    不一致的枚举，都要有一处显式的翻译函数（`train_worker.auto_augment_value`）；
   - **通道用下拉框，不用数值框**（§4.85）：两档枚举值就该是**下拉**
     （`_CHANNEL_OPTIONS`，选项文案就是「1」/「3」、`userData` 存 int）——
     数值框能填出 2 / 4 这类无效值，而它会被写进数据配置、到训练期才报错；

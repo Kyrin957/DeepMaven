@@ -29,7 +29,7 @@ _ITERATION_INTERVAL = 0.5
 
 
 def prepare_data_path(args) -> str:
-    """数据配置路径：`channels != 3` 时写一份带 `channels` 的**运行期副本**。
+    """数据配置路径：检测族 + `channels != 3` 时写一份带 `channels` 的运行期副本。
 
     `channels` **不是**训练参数——它属于**数据集配置**：`YOLODataset` 从
     `data.yaml` 读 `channels`（1 = 灰度 / 其余按彩色加载，见
@@ -37,23 +37,29 @@ def prepare_data_path(args) -> str:
     argument” **直接拒绝**把 `channels=…` 传给 `model.train()`（历史缺陷
     §4.84：参数透传非法，训练一启动就报错）。
 
-    因此需要改通道时：把通道写进 `<project>/<name>/data-ch<N>.yaml`（模型自己的
-    产物目录，不动拆分产物里的 data.yaml——多套模型可以各自选通道），并把该
-    副本交给 `model.train(data=…)`。
+    **只有检测族**（detect / obb / segment）能这样改写：那时 `data` 是
+    data.yaml 文件。分类任务的 `data` 必须是**目录**（库会明说
+    `Classification datasets must be a directory (data="path/to/dir") not a
+    file`），且分类管线（torchvision `ImageFolder`）**根本不消费 `channels`**
+    —— 目录一律原样返回（历史缺陷 §4.85：分类项目把「通道」设成 1 后，
+    训练一启动就被库拒掉）。
     """
     channels = int(getattr(args, "channels", 3) or 3)
-    if channels == 3:
-        return str(args.data)
+    source = Path(str(args.data))
+    if channels == 3 or not source.is_file():
+        return str(args.data)      # 无需改写；目录（分类 / 异常）不适用
     import yaml
 
-    source = Path(str(args.data))
-    payload: dict = {}
     try:
         payload = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
-    except (OSError, ValueError):
-        payload = {}
+    except (OSError, ValueError) as exc:
+        # 读不出来就**保持原路径**：让库报它自己的数据集错误，别被我们的
+        # 半成品副本掩盖（历史缺陷 §4.85：副本里只剩 channels: 1）
+        emit({"type": "log", "text": f"数据配置读取失败（{exc}），沿用原路径"})
+        return str(args.data)
     if not isinstance(payload, dict):
-        payload = {}
+        emit({"type": "log", "text": "数据配置内容异常，沿用原路径"})
+        return str(args.data)
     payload["channels"] = channels
     target_dir = Path(str(args.project)) / str(args.name)
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -64,6 +70,19 @@ def prepare_data_path(args) -> str:
     )
     emit({"type": "log", "text": f"数据配置（{channels} 通道）：{target.name}"})
     return str(target)
+
+
+def auto_augment_value(value) -> str | None:
+    """把界面上的「随机增强策略」翻成库接受的取值。
+
+    库只认 `"randaugment"` / `"augmix"` / `"autoaugment"` 或 **`None`**（关闭）
+    ——`classify_augmentations` 对别的字符串直接抛
+    `ValueError: Invalid auto_augment policy: none…`。界面上的「未启用」是字符串
+    `"none"`（配置里保持可读），**下发前必须翻成 `None`**（历史缺陷 §4.86：
+    分类项目一关增强，训练就在建数据集时崩掉）。
+    """
+    text = str(value or "").strip()
+    return None if text.lower() in {"", "none"} else text
 
 
 def train_kwargs(args, total: int, extra: dict | None = None) -> dict:
@@ -110,8 +129,9 @@ def train_kwargs(args, total: int, extra: dict | None = None) -> dict:
         "hsv_v": args.hsv_v,
         "mosaic": args.mosaic,
         "mixup": args.mixup,
-        # 分类专属：Ultralytics 接受 "none"/"randaugment"/"autoaugment"
-        "auto_augment": args.auto_augment,
+        # 分类专属：库接受 "randaugment"/"augmix"/"autoaugment" 或 **None**
+        # （关闭）——"none" 是**非法值**，见 `auto_augment_value`
+        "auto_augment": auto_augment_value(args.auto_augment),
         "erasing": args.erasing,
     }
     kwargs.update(extra or {})
