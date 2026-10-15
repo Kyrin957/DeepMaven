@@ -459,6 +459,9 @@ class MainWindow(FluentWindow):
         self.annotate_tab = AnnotateTab(self.annotate_vm, self.category_vm, self)
         self.annotate_tab.setObjectName("annotateTab")
         self._add_page(PAGE_ANNOTATE, self.annotate_tab, FluentIcon.BRUSH, "图像标注")
+        # 数据 VM 的重活（执行拆分 / 数据质检）按**磁盘标签文件**工作：
+        # 开始前必须把标注页内存里的未保存标注落盘（历史缺陷 §4.91）
+        self.dataset_vm.set_flush_annotations(self.annotate_tab.flush_pending)
 
         self.review_tab = ReviewTab(self.dataset_vm, self.category_vm, self)
         self.review_tab.setObjectName("reviewTab")

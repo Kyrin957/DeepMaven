@@ -326,10 +326,23 @@ $env:QT_QPA_PLATFORM="offscreen"
 - 显示类参数（亮度 / 对比度 / 缩略图尺寸）**走 `DisplayDock` 的去抖广播**
   （~80ms）：滑杆与读数即时响应，重活停稳后只做一次；不要在 `valueChanged`
   里直接做重活，需要同步生效时用 `display_dock.flush()`。
+- **秒级但可等待的后台任务**（执行拆分、数据质检）：走 `FunctionWorker` /
+  `ThreadTask`（`utils/workers.py`，接口一致）+ **本组件接管进度**——页面在
+  `taskStarted(任务名)` 时 `BusyPopup(...).begin()`、`taskProgress` 时
+  `step(percent, 100)` 并改 `popup.label` 文案、`taskFinished / taskFailed`
+  时 `end()` 并恢复按钮；**按任务名过滤**，不要接管别的任务（执行拆分 =
+  `_SPLIT_TASK_NAME`）。期间禁用会重复触发该任务的按钮。**工作线程里绝不
+  碰 Qt 对象**：输入用**纯数据快照**传进去，结果回 GUI 线程再写状态、发信号
+  （§4.90）。
+  - **文件操作密集**的任务用 `ThreadTask`（标准库线程）：本机实测主线程跑
+    Qt 事件循环时，QThread 里的文件调用被拖慢 ~1000×（`os.stat` 155 ms/次
+    vs 标准库线程 39 µs/次，历史排查 §4.90）；`ThreadTask` 的信号仍由 Qt
+    队列连接回 GUI 线程，用法与 `FunctionWorker` 完全相同。
 - 后台任务（训练 / 推理 / 导出）继续用 worker 进程 + 页面内进度条，
   不用本组件。
 - 参考接入点：`ThumbnailGrid.set_thumb_size`（尺寸切换）、
-  `ThumbnailGrid.prewarm_visible`（显示增强预热）、画布显示增强下发。
+  `ThumbnailGrid.prewarm_visible`（显示增强预热）、画布显示增强下发、
+  `SplitTab._on_task_started`（执行拆分的进度接管）。
 
 ## 13. 缩略图角标与标签（点亮即展开）
 
@@ -554,6 +567,22 @@ $env:QT_QPA_PLATFORM="offscreen"
   （左 → 右）：**取消 / 创建拆分并执行分配**（编辑模式为「保存拆分并
   重新分配」）——**确认即执行拆分**，不设「仅创建 / 仅保存」中间选项；
   左栏不放参数编辑控件、**不设「执行拆分」按钮**（历史按钮已删）。
+- **执行拆分在后台线程跑**（§4.90，万张级 15k 文件落盘是秒级重活）：
+  `DatasetViewModel.apply_split()` 只做**输入快照**（图片清单 / 标签索引 /
+  拆分参数 / 手工映射的纯数据副本）交给 `_start_worker`，worker 里做
+  「预检查 + 落盘 + 读配置」，结果回 GUI 线程写拆分 / 数据集字段并发信号；
+  **worker 里绝不碰 Qt 对象**。页面在 `taskStarted("执行拆分")` 时弹
+  `BusyPopup`、`taskProgress` 时 `step()`（worker 每 200 个文件报一次）、
+  `taskFinished / taskFailed` 时收起并恢复按钮，期间**禁用**新建 / 编辑 /
+  复制 / 删除按钮（§12）。
+- **落盘是「换位式」的**（`DatasetService.split_dataset`）：新产物先写
+  ``<产物目录>.new``，写完把旧产物目录改名 ``.trash-<时间戳>``、新目录改名
+  到位，`.trash-*` 交**后台线程**删（实测 1.5 万文件：rmtree 8.7 s 而整目录
+  rename < 1 ms，§4.90）；启动 / 下次执行拆分时 `_sweep_trash` 清理遗留。
+  **取消 / 失败时旧产物原样保留**（新产物整份丢弃，`SplitCancelled`）。
+- **归档只读数据配置**：执行完只把 `data.yaml`（+ 封面）写进项目文件，
+  **禁止**再把整个产物目录读成归档项（历史实现读 1.5 万个文件的字节只为
+  筛出 config，万张级白扫 1.7 s，§4.90）。
 - **异常检测项目的弹窗走单独的分配表**（传 `anomaly={"totals", "plan"}`）：
   两组列——「良好图像 (n)」与「异常图像 (m)」，各带**数量 / 百分比**，
   组间一条竖分隔线；行的名称列仍是色块 + 训练 / 验证 / 测试；环形图按
@@ -658,6 +687,20 @@ $env:QT_QPA_PLATFORM="offscreen"
   拆分执行一次拆分即被误锁）。旧项目在 `ensure_splits` 迁移时一次性固化。
 - 图库 / 标注页的拒绝提示按原因区分：「该拆分正在训练中，无法更改」/
   「该拆分已用于训练，无法更改」。
+- **标注落盘必须衔接拆分 / 质检（§4.91 的严重缺陷）**：标注改动先留在内存
+  （`AnnotateViewModel._pending`），而「执行拆分」与「数据质检」都按**磁盘上的
+  标签文件**工作——两者开始前必须先落盘：`DatasetViewModel` 暴露
+  `set_flush_annotations(回调)`（MainWindow 装配时接
+  `annotate_tab.flush_pending`），`apply_split()` / `run_quality_check()`
+  开头调用，随后 `label_index(refresh=True)` **强制重建**索引。禁止假设
+  「用户已经逐张保存过」。
+- **数据 VM 的缓存失效必须闭环**（§4.89 索引化的前提）：`_touch_meta()` 除了
+  升元数据版本，还要**失效标签索引**（标注落盘走的就是 pending 推送，标签
+  文件在两次推送之间可能新增 / 改写）；`load_from_project()` 必须清空**全部**
+  缓存（标签 / 位置 / 相对键 / 类别 / 已标注 / 已知类别名 / 预览 / pending
+  标注）并 `_touch_meta()`——不清就会把上一个项目（或上一次会话）的判定
+  套到新项目上（历史缺陷 §4.91：重开后类别 / 已标注沿用陈旧索引）。新增
+  任何「按版本缓存」的索引时，同步检查这两个失效入口。
 
 ## 20. 弹窗按钮行：等大、qf 组件、最小宽度
 

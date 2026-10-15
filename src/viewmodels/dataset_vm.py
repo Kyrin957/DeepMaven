@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
+from typing import Callable
 
 from PySide6.QtCore import QObject, Signal
 
@@ -12,7 +13,7 @@ from src.models.split import Split
 from src.services.annotation_service import AnnotationService
 from src.services.category_service import CategoryService
 from src.services.quality_service import QualityService
-from src.services.dataset_service import DatasetService
+from src.services.dataset_service import DatasetService, SplitCancelled
 from src.services.project_service import ProjectService
 from src.utils.constants import (
     COVER_ENTRY_NAME,
@@ -25,7 +26,7 @@ from src.utils.constants import (
 )
 from src.utils.logger import get_logger
 from src.utils.tasks import dataset_layout
-from src.utils.workers import FunctionWorker
+from src.utils.workers import ThreadTask
 from src.viewmodels.project_vm import ProjectViewModel
 
 logger = get_logger("dataset_vm")
@@ -75,7 +76,10 @@ class DatasetViewModel(QObject):
         self._service = DatasetService()
         self._project_vm = project_vm
         self._dataset: Dataset | None = None
-        self._worker: FunctionWorker | None = None
+        self._worker: ThreadTask | None = None
+        # 「未保存标注落盘」回调（MainWindow 装配时接标注页）：执行拆分 /
+        # 质检这类要按**标签文件**工作的流程，必须先把内存里的标注写盘
+        self._flush_annotations: Callable[[], None] | None = None
         # 源目录不可用时，从项目归档释放出来的工作目录
         self._resolved_source: Path | None = None
         # 来源目录列表缓存（避免逐张图片调用时反复解析路径）
@@ -100,6 +104,8 @@ class DatasetViewModel(QObject):
         # 位置索引（清单对象 + 路径→行号，检查页切图用）与相对键索引（标记用）
         self._position_index: tuple | None = None
         self._key_index: tuple | None = None
+        # 划分预览结果缓存（签名 = 元数据版本 + 清单 + 拆分参数，见 preview_split）
+        self._preview_cache: tuple | None = None
 
     @property
     def dataset(self) -> Dataset | None:
@@ -845,7 +851,13 @@ class DatasetViewModel(QObject):
         )
 
     def apply_split(self) -> None:
-        """执行数据集划分：落盘为 YOLO 结构 + 生成 data.yaml + 归档进项目。"""
+        """执行数据集划分：**后台线程**落盘 + 生成 data.yaml + 归档进项目。
+
+        万张级下「算法 + 1.5 万文件落盘」是秒级重活（实测首次 14.6 s、二次
+        15.3 s 全在主线程），改为 worker + 进度：主线程只做输入快照与结果写入，
+        页面接 `taskProgress` 显示进度、`taskFinished` 后刷新（§4.90）。
+        失败 / 取消时旧产物保持不动（新产物整份丢弃）。
+        """
         source = self.resolved_source()
         if self._dataset is None or source is None:
             self.message.emit("warning", "请先导入数据集")
@@ -858,131 +870,245 @@ class DatasetViewModel(QObject):
             self.message.emit("warning", "请先在拆分列表新建一套拆分")
             return
 
+        if self._worker is not None and self._worker.isRunning():
+            self.message.emit("warning", "已有任务在运行，请稍候")
+            return
+
+        # 未保存的标注**先落盘**：拆分产物按「主干 → 标签文件」配对，内存里的
+        # pending 不写盘就会整批丢标签（历史缺陷 §4.91：标注 → 拆分 → 产物
+        # 一个标签都没有）；回调由 MainWindow 装配时接标注页
+        if self._flush_annotations is not None:
+            self._flush_annotations()
+
         mprj = Path(project.params.get("path", ""))
         # 产物写进项目文件夹的 dataset 子目录（删除项目时一并清理）
         out_dir = ProjectService.dataset_dir(mprj) / self.split_name()
-        split = (
-            self._dataset.split_train,
-            self._dataset.split_val,
-            self._dataset.split_test,
-        )
         # 分类任务输出 train/<类别>/ 目录结构，检测/分割输出 images+labels 结构
         layout = self.split_layout()
         # 图库可能由多个文件夹累加而成，划分按界面上看到的图片清单进行
         library = self.images()
-        label_index = self.label_index()
+        # 标注刚落盘 → **强制重建**标签索引（缓存在落盘前就建好的话是空的）
+        label_index = self.label_index(refresh=True)
         # 异常检测：按「良好 / 异常」分配，训练集只放良好图
         kinds, counts = self._anomaly_inputs()
         # 手工拆分映射：图库 / 标注页指定的图片优先落位（与预览同口径）
         split_overrides = self._resolved_overrides("split_overrides", library)
 
+        # 输入一律**快照**成纯数据：worker 在线程里跑算法与落盘，不碰 VM / Qt
+        # 对象（万张级下这是秒级重活，主线程只留信号与状态写入，见 §4.90）
+        context = {
+            "source": str(source),
+            "roots": [str(item) for item in self._source_roots()],
+            "out_dir": str(out_dir),
+            "library": [str(path) for path in library],
+            "label_index": {
+                str(stem): str(path) for stem, path in (label_index or {}).items()
+            },
+            "split": (
+                self._dataset.split_train,
+                self._dataset.split_val,
+                self._dataset.split_test,
+            ),
+            "seed": int(self._dataset.seed),
+            "stratified": bool(self._dataset.stratified),
+            "layout": layout,
+            "kinds": dict(kinds or {}),
+            "counts": {
+                str(kind): dict(rows) for kind, rows in (counts or {}).items()
+            },
+            "overrides": dict(split_overrides or {}),
+            "class_fallback": [
+                str(name) for name in (project.class_names or self._dataset.class_names)
+            ],
+        }
+        self._start_worker(
+            lambda progress, is_cancelled: self._split_job(
+                context, progress, is_cancelled
+            ),
+            "执行拆分",
+            on_done=self._apply_split_result,
+        )
+
+    @staticmethod
+    def _split_job(context: dict, progress, is_cancelled) -> dict:
+        """worker：预检查 + 落盘 + 归档项（**纯数据 / 文件系统，不碰界面**）。
+
+        「执行拆分」是秒级重活（万张级：算法 ~0.1 s + 1.5 万文件落盘 ~3 s），
+        放在后台线程跑，主线程只接进度与结果（§4.90）。
+        """
+        service = DatasetService
+        source = Path(context["source"])
+        out_dir = Path(context["out_dir"])
+        layout = str(context["layout"])
+        library = [Path(path) for path in context["library"]]
+        label_index = {
+            str(stem): Path(path)
+            for stem, path in (context["label_index"] or {}).items()
+        }
+        kinds = dict(context["kinds"] or {})
+        counts = dict(context["counts"] or {})
+        overrides = dict(context["overrides"] or {})
+        split = tuple(context["split"])
+        if is_cancelled():
+            return {"cancelled": True}
+
         # 预检查：验证集为空时后端会直接失败（val=None），这里提前拦住
         try:
-            buckets = DatasetService.split_members(
+            buckets = service.split_members(
                 library,
                 {} if layout == "classify" else label_index,
-                split=split,
-                seed=self._dataset.seed,
-                stratified=self._dataset.stratified,
-                layout=layout,
-                kinds=kinds,
-                counts=counts,
-                overrides=split_overrides,
+                split=split, seed=int(context["seed"]),
+                stratified=bool(context["stratified"]), layout=layout,
+                kinds=kinds or None, counts=counts or None,
+                overrides=overrides or None,
             )
         except (OSError, ValueError):
             buckets = {}
         if buckets and (not buckets["train"] or not buckets["val"]):
-            self.message.emit(
-                "warning",
-                "训练集或验证集为空，请调整分配数量或增加图片"
-                if kinds else "验证集为空，请调整拆分比例或增加图片",
-            )
-            return
+            return {
+                "warning": "训练集或验证集为空，请调整分配数量或增加图片"
+                if kinds else "验证集为空，请调整拆分比例或增加图片"
+            }
+
+        def report(done: int, total: int) -> None:
+            percent = int(done * 100 / total) if total else 0
+            progress(percent, f"正在写入 {done} / {total}")
+
         try:
-            stats = self._service.split_dataset(
+            stats = service.split_dataset(
                 source, out_dir,
                 # seed 必须与预览 / 预检查同源：不传时 split_dataset 走默认 0，
                 # 自定义种子的拆分就会出现「概览（按种子 N）与落盘产物（按 0）」
                 # 成员不同的隐性错位（张数相同、分到各子集的图片不同）
-                split=split, seed=self._dataset.seed,
-                stratified=self._dataset.stratified, layout=layout,
-                images=library, label_index=label_index,
-                kinds=kinds, counts=counts,
-                overrides=split_overrides,
+                split=split, seed=int(context["seed"]),
+                stratified=bool(context["stratified"]), layout=layout,
+                images=library, label_index=label_index or None,
+                kinds=kinds or None, counts=counts or None,
+                overrides=overrides or None,
+                progress=report, cancel=is_cancelled,
             )
-            if stats["total"] == 0:
-                self.message.emit("warning", "来源目录中未找到图片")
-                return
+        except SplitCancelled:
+            return {"cancelled": True}
+        except (OSError, ValueError) as exc:
+            logger.warning("数据集划分失败: %s", exc)
+            return {"error": str(exc)}
+        if stats.get("cancelled"):
+            return {"cancelled": True}
+        if stats["total"] == 0:
+            return {"warning": "来源目录中未找到图片"}
 
-            if layout == "classify":
-                # 分类任务：Ultralytics 直接以数据集目录作为 --data，按子目录扫描
-                classes = list(self._service.child_class_dirs_multi(self._source_roots()))
-                config_path: Path = out_dir
-            elif layout == "anomaly_folder":
-                # 异常检测没有 YAML：产物目录本身即数据集
-                # （normal / normal_test / abnormal，Anomalib Folder 约定）
-                classes = []
-                config_path = out_dir
-            else:
-                classes = self._service.load_class_names(source)
-                if not classes:
-                    # 回退：优先用项目类别定义，其次用数据集中观察到的类别 id
-                    classes = project.class_names or self._dataset.class_names
-                config_path = self._service.write_data_yaml(
-                    out_dir, classes, "images/train", "images/val", "images/test"
+        if layout == "classify":
+            # 分类任务：Ultralytics 直接以数据集目录作为 --data，按子目录扫描
+            classes = [
+                str(item)
+                for item in service.child_class_dirs_multi(
+                    [Path(root) for root in context["roots"]]
                 )
+            ]
+            config_path: Path = out_dir
+        elif layout == "anomaly_folder":
+            # 异常检测没有 YAML：产物目录本身即数据集
+            # （normal / normal_test / abnormal，Anomalib Folder 约定）
+            classes = []
+            config_path = out_dir
+        else:
+            classes = [str(name) for name in service.load_class_names(source)]
+            if not classes:
+                # 回退：优先用项目类别定义，其次用数据集中观察到的类别 id
+                classes = [str(name) for name in context["class_fallback"]]
+            config_path = Path(service.write_data_yaml(
+                out_dir, classes, "images/train", "images/val", "images/test"
+            ))
 
-            # 划分结果写进当前拆分（一个项目可有多套），并镜像到 Dataset
-            split = self.active_split()
-            if split is not None:
-                split.layout = layout
-                split.mark_generated(out_dir, config_path, stats, classes)
-                # 异常检测：训练数据目录指向本拆分产物，训练 / 评估直接用这一套
-                self._sync_anomaly_root(split)
-            self._dataset.output_path = str(out_dir)
-            self._dataset.data_yaml = str(config_path)
-            self._dataset.class_names = classes
-            project.training.data_yaml = str(config_path)
-            project.training.split_id = split.split_id if split else 0
-            project.training.split_name = split.name if split else ""
-            # 项目文件只保存项目自身的数据（配置 / 标注 / 模型）：
-            # 图像与标签留在磁盘数据集目录（硬链接，不额外占盘），
-            # 不再把整份图像库复制进 .mprj —— 否则项目体积会翻倍且无必要。
-            project.files = [
-                record for record in project.files
-                if not record.virtual_path.startswith("dataset/")
-            ]
-            project.touch()
-            items = [
-                item for item in self._collect_archive_items(out_dir)
-                if item[0] == "config"
-            ]
-            # 顺便生成项目封面（最近项目卡片用），随本次保存一起写进 .mprj
-            images = self.images()
-            cover = self._service.make_cover(images[0]) if images else None
-            if cover:
-                items.append(("other", COVER_ENTRY_NAME, cover))
+        # 归档项只取**数据配置**（data.yaml）：历史实现把整个产物目录读成归档项
+        # （1.5 万个文件、含每张图的字节）再筛掉 image / label，万张级白扫 1.7 s
+        config_item = None
+        if config_path.is_file():
+            try:
+                relative = config_path.relative_to(out_dir).as_posix()
+            except ValueError:
+                relative = config_path.name
+            config_item = ("config", f"dataset/{relative}", config_path.read_bytes())
+        # 顺便生成项目封面（最近项目卡片用），随本次保存一起写进 .mprj
+        cover = service.make_cover(library[0]) if library else None
+        return {
+            "stats": stats,
+            "classes": classes,
+            "config_path": str(config_path),
+            "out_dir": str(out_dir),
+            "layout": layout,
+            "config_item": config_item,
+            "cover": cover,
+        }
+
+    def _apply_split_result(self, payload: dict) -> None:
+        """worker 结果回**主线程**：写拆分 / 数据集字段、归档配置、发信号。"""
+        if payload.get("cancelled"):
+            self.message.emit("warning", "已取消执行拆分")
+            return
+        if payload.get("warning"):
+            self.message.emit("warning", str(payload["warning"]))
+            return
+        if payload.get("error"):
+            self.message.emit("error", f"数据集划分失败：{payload['error']}")
+            return
+
+        project = self._project_vm.project if self._project_vm else None
+        if project is None or self._dataset is None:
+            return
+        stats = dict(payload.get("stats") or {})
+        classes = list(payload.get("classes") or [])
+        config_path = Path(str(payload.get("config_path") or ""))
+        out_dir = Path(str(payload.get("out_dir") or ""))
+        layout = str(payload.get("layout") or "")
+
+        # 划分结果写进当前拆分（一个项目可有多套），并镜像到 Dataset
+        split = self.active_split()
+        if split is not None:
+            split.layout = layout
+            split.mark_generated(out_dir, config_path, stats, classes)
+            # 异常检测：训练数据目录指向本拆分产物，训练 / 评估直接用这一套
+            self._sync_anomaly_root(split)
+        self._dataset.output_path = str(out_dir)
+        self._dataset.data_yaml = str(config_path)
+        self._dataset.class_names = classes
+        project.training.data_yaml = str(config_path)
+        project.training.split_id = split.split_id if split else 0
+        project.training.split_name = split.name if split else ""
+        # 项目文件只保存项目自身的数据（配置 / 标注 / 模型）：
+        # 图像与标签留在磁盘数据集目录（硬链接，不额外占盘），
+        # 不再把整份图像库复制进 .mprj —— 否则项目体积会翻倍且无必要。
+        project.files = [
+            record for record in project.files
+            if not record.virtual_path.startswith("dataset/")
+        ]
+        project.touch()
+        items: list[tuple[str, str, bytes]] = []
+        if payload.get("config_item"):
+            items.append(tuple(payload["config_item"]))
+        if payload.get("cover"):
+            items.append(("other", COVER_ENTRY_NAME, payload["cover"]))
+        try:
             if items:
                 self._project_vm.service.add_files(project, items, save=True)
             else:
                 self._project_vm.save_project()
         except (OSError, ValueError) as exc:
-            logger.warning("数据集划分失败: %s", exc)
-            self.message.emit("error", f"数据集划分失败：{exc}")
-            return
+            logger.warning("划分产物归档失败: %s", exc)
 
+        # 子集归属：产物已生成，**立刻按新产物算一次并缓存**——否则执行完的
+        # 各页刷新会各自复算一遍（万张级每次 ~0.26 s，§4.90）
         self._subsets = None
+        self.subset_labels()
         self.datasetChanged.emit(self._dataset)
         self._project_vm.notify_changed()
         self.splitsChanged.emit(self.splits_ready())
         self.datasetReady.emit(str(config_path))
 
-        linked = int(stats.get("linked", 0))
-        copied = int(stats.get("copied", 0))
         # 存储明细只进日志：界面反馈只讲结果与各子集张数（UI 规则 §10）
         logger.info(
             "划分产物落盘：链接 %s 张 / 复制 %s 张（跨盘或权限不足时复制）",
-            linked, copied,
+            int(stats.get("linked", 0)), int(stats.get("copied", 0)),
         )
         # 与拆分概览 / 拆分列表同一口径（实际张数），便于对照
         self.message.emit(
@@ -995,12 +1121,26 @@ class DatasetViewModel(QObject):
         )
 
     def load_from_project(self, project) -> None:
-        """打开 / 新建项目后，从项目数据恢复数据集状态。"""
+        """打开 / 新建项目后，从项目数据恢复数据集状态。
+
+        **缓存必须全部作废**（含跨项目残留）：标签索引、位置 / 相对键 / 类别 /
+        已标注 / 已知类别名索引、划分预览缓存，以及上一项目的 pending 标注
+        ——它们都可能是上一个项目（或上一次会话）的状态，不清就会把 A 项目
+        的判定套到 B 项目上（历史缺陷 §4.91）。
+        """
         self._resolved_source = None
         self._roots_cache = None
         self._media_index = None
         self._images = None
         self._subsets = None
+        self._label_index = None
+        self._position_index = None
+        self._key_index = None
+        self._class_index = None
+        self._annotated_index = None
+        self._known_names_index = None
+        self._preview_cache = None
+        self._pending_annotations = {}
         dataset = getattr(project, "dataset", None) if project is not None else None
         if dataset is None or not (dataset.image_count or dataset.source_path):
             self._dataset = None
@@ -1016,6 +1156,7 @@ class DatasetViewModel(QObject):
                 project.params["split_name"] = split.name
             self._mirror_split(split)
             self.splitsChanged.emit(self.splits_ready())
+        self._touch_meta()               # 索引全部作废后统一升版本
         self.datasetChanged.emit(self._dataset)
 
     def _source_roots(self) -> list[Path]:
@@ -1065,6 +1206,9 @@ class DatasetViewModel(QObject):
         if not images:
             self.message.emit("warning", "请先导入数据集")
             return
+        # 质检按**磁盘上的标签文件**校验：内存里的未保存标注先落盘（§4.91）
+        if self._flush_annotations is not None:
+            self._flush_annotations()
         label_index = self.source_label_index()
         # 项目任务决定标签校验口径（分类 / 异常检测无 YOLO 标签体系，
         # 分割按多边形点列、旋转框按四角点校验——见 QualityService）
@@ -1300,8 +1444,14 @@ class DatasetViewModel(QObject):
         在下次读取时重建。调用点覆盖全部可能改变元数据的通道——图片集合变化
         （导入 / 移除）、类别覆盖值 / 标记 / 拆分归属改动（`_commit_meta`）、
         标注页推送的 pending 状态（含落盘后的推送）、数据集对象更替。
+
+        **标签索引一并失效**：标注落盘走的就是 pending 推送这条路，标签文件
+        在两次推送之间可能新增 / 改写——不清的话「主干 → 标签」索引还是旧的
+        （历史缺陷 §4.91：标注后执行拆分，产物按陈旧索引配对，一个标签都
+        拷不进去，看起来就是「标签丢了」）。
         """
         self._meta_revision += 1
+        self._label_index = None
 
     def _class_map(self) -> dict[str, str]:
         """图片路径 → 原始类别名（一次建好，按元数据版本复用）。
@@ -1353,6 +1503,14 @@ class DatasetViewModel(QObject):
         if refresh or self._label_index is None:
             self._label_index = self.source_label_index()
         return self._label_index
+
+    def set_flush_annotations(self, flush: Callable[[], None] | None) -> None:
+        """注入「未保存标注落盘」回调（MainWindow 装配时接标注页）。
+
+        执行拆分 / 数据质检这类按**标签文件**工作的流程，开始前必须把标注页
+        内存里的 pending 标注写盘，否则它们不参与（历史缺陷 §4.91）。
+        """
+        self._flush_annotations = flush
 
     def set_pending_annotations(self, mapping: dict | None) -> None:
         """接收标注页推送的未落盘标注状态（{绝对路径: 是否已标注}）。
@@ -2384,8 +2542,24 @@ class DatasetViewModel(QObject):
             return {}
         layout = self.split_layout()
         kinds, counts = self._anomaly_inputs()
+        # 同一份输入（元数据版本 + 图片清单 + 拆分参数 + 覆盖）只算一次：
+        # 执行拆分后的各页刷新会各自求一次预览，万张级每次 ~0.2 s（§4.90）
+        signature = (
+            self._meta_revision,
+            len(images),
+            str(images[0]) if images else "",
+            str(images[-1]) if images else "",
+            layout,
+            self._dataset.split_train,
+            self._dataset.split_val,
+            self._dataset.split_test,
+            int(self._dataset.seed),
+            bool(self._dataset.stratified),
+        )
+        if self._preview_cache is not None and self._preview_cache[0] == signature:
+            return dict(self._preview_cache[1])
         try:
-            return DatasetService.preview_split(
+            result = DatasetService.preview_split(
                 self.resolved_source(),
                 split=(
                     self._dataset.split_train,
@@ -2408,6 +2582,8 @@ class DatasetViewModel(QObject):
         except (OSError, ValueError) as exc:
             logger.warning("划分预览失败: %s", exc)
             return {}
+        self._preview_cache = (signature, result)
+        return dict(result)
 
     # -----------------------------------------------------------
     # 内部
@@ -2518,8 +2694,14 @@ class DatasetViewModel(QObject):
     # 后台任务
     # -----------------------------------------------------------
     def _start_worker(self, job, name: str, on_done=None) -> None:
-        """启动后台任务，并把进度 / 结果 / 错误转到界面。"""
-        worker = FunctionWorker(job, self)
+        """启动后台任务，并把进度 / 结果 / 错误转到界面。
+
+        用 `ThreadTask`（标准库线程）而不是 QThread：本数据 VM 的后台任务
+        （执行拆分 / 数据质检）都是**文件操作密集**的，某些环境下 QThread
+        里的文件调用会被拖慢 4000×（155 ms/次 stat，§4.90 的历史排查）；
+        标准库线程无此问题，接口与 QThread 版一致。
+        """
+        worker = ThreadTask(job, self)
         worker.progress.connect(self.taskProgress.emit)
         worker.finishedOk.connect(
             lambda payload: self._on_task_done(name, payload, on_done)

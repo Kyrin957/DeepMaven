@@ -42,6 +42,7 @@ from src.views.dialogs import (
     SAVE_APPLY,
     SplitEditDialog,
 )
+from src.views.ui import BusyPopup
 from src.views.ui import tokens as T
 from src.views.ui.icons import icon
 from src.views.widgets import PieChart, StackedBarChart
@@ -49,6 +50,10 @@ from src.views.widgets import PieChart, StackedBarChart
 # 拆分列表行数据：锁定原因（"" / running / used）——被训练引用的拆分
 # 在行右端绘制锁图标（见 _SplitListDelegate），按钮同步禁用
 _LOCKED_ROLE = Qt.ItemDataRole.UserRole + 1
+
+# 执行拆分的后台任务名（与 `DatasetViewModel.apply_split` 的 `_start_worker`
+# 一致；页面据此只接管自己的任务，不干扰数据质检等其它后台任务）
+_SPLIT_TASK_NAME = "执行拆分"
 
 
 class _SplitListDelegate(QStyledItemDelegate):
@@ -82,6 +87,9 @@ class SplitTab(QWidget):
         self._vm = dataset_vm
         self._category_vm = category_vm
         self._syncing = False
+        # 执行拆分的进度弹窗（后台任务期间存在，见 _on_task_started）
+        self._split_popup = None
+        self._split_locked_buttons = False
         self._build_ui()
         self._bind()
         self.refresh()
@@ -269,13 +277,54 @@ class SplitTab(QWidget):
         self._vm.datasetChanged.connect(lambda _d: self.refresh())
         self._vm.taskFinished.connect(lambda _t: self.refresh())
         self._vm.splitsChanged.connect(lambda _rows: self.refresh())
+        # 「执行拆分」在后台 worker 里跑（万张级秒级重活）：接进度与收尾，
+        # 期间置顶进度弹窗 + 禁用拆分操作（§4.90）
+        self._vm.taskStarted.connect(self._on_task_started)
+        self._vm.taskProgress.connect(self._on_task_progress)
+        self._vm.taskFinished.connect(self._on_task_finished)
+        self._vm.taskFailed.connect(self._on_task_failed)
+
+    def _on_task_started(self, name: str) -> None:
+        """开始执行拆分：置顶进度弹窗 + 禁用拆分操作（其它任务不接管）。"""
+        if name != _SPLIT_TASK_NAME:
+            return
+        self._split_popup = BusyPopup(self.window(), "正在执行拆分").begin()
+        for button in (
+            self.add_split_btn, self.edit_split_btn,
+            self.copy_split_btn, self.del_split_btn,
+        ):
+            button.setEnabled(False)
+        self._split_locked_buttons = True
+
+    def _on_task_progress(self, percent: int, text: str) -> None:
+        popup = self._split_popup
+        if popup is None:
+            return
+        popup.step(int(percent), 100)
+        if text:
+            popup.label.setText(text)
+
+    def _on_task_finished(self, _text: str) -> None:
+        self._end_split_popup()
+
+    def _on_task_failed(self, _text: str) -> None:
+        self._end_split_popup()
+
+    def _end_split_popup(self) -> None:
+        """收尾：关掉进度弹窗并按当前状态恢复按钮（刷新由 taskFinished 触发）。"""
+        if self._split_popup is not None:
+            self._split_popup.end()
+            self._split_popup = None
+        if getattr(self, "_split_locked_buttons", False):
+            self._split_locked_buttons = False
+            self.add_split_btn.setEnabled(True)
+            self.copy_split_btn.setEnabled(True)
 
     # -----------------------------------------------------------
     # 刷新
     # -----------------------------------------------------------
     def refresh(self) -> None:
         self._refresh_splits()
-        self._apply_lock_state()
         self._refresh_preview()
 
     # -----------------------------------------------------------
@@ -455,11 +504,6 @@ class SplitTab(QWidget):
             self._vm.remove_split(active.split_id)
             self.refresh()
 
-    def _apply_lock_state(self) -> None:
-        """已被训练使用的拆分：参数只读（编辑 / 删除按钮见 _refresh_splits）。"""
-        if self._vm.split_locked():
-            for spin in self.anomaly_spins.values():
-                spin.setEnabled(False)
 
     def _refresh_preview(self) -> None:
         # 没有拆分时不预览：预览基于 Dataset 的下沉比例计算，会显示成
